@@ -2,9 +2,8 @@
 name = "luajit-ripper"
 version = "0.1.0"
 edition = "2024"
-description = "A LuaJIT 2.1 bytecode decompiler library"
+description = "A LuaJIT bytecode decompiler"
 license = "GPL-3.0-only"
-publish = false
 
 [dependencies]
 oxc_allocator = "0.150.0"

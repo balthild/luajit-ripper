@@ -12,9 +12,7 @@ let source = decompile(&dump, &Options::default()).expect("the chunk should deco
 print!("{source}");
 ```
 
-The crate is a port of [LJD](https://github.com/Night-witch/ljd), the
-LuaJIT raw bytecode decompiler. It is laid out as a pipeline of independent
-stages, each of which can be used on its own:
+The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecode decompiler written in Python. It is laid out as a pipeline of independent stages, each of which can be used on its own:
 
 | Module | What it does |
 | --- | --- |
@@ -33,36 +31,31 @@ stages, each of which can be used on its own:
 | `show_slot_ids` | `false` | Let unnamed registers carry the ids of the definitions they may refer to. |
 | `function_definition_sugar` | `false` | Write `t.f = function() end` as `function t.f() end`. |
 
-## Limits
+## Limitations
 
-Rebuilding source from bytecode is not always possible, because a jump target
-does not record which construct produced it. Two shapes of input fall outside
-what the passes can recover:
+Rebuilding source from bytecode is not always possible, because a jump target does not record which construct produced it. Two shapes of input fall outside what the passes can recover:
 
-* A branch whose two arms only meet again through a chain of empty jumps cannot
-  be told from straight line code.
-* A few graphs come back as statements Lua will not parse, such as a `return`
-  that ends up in front of the statements that follow it. Nothing detects this,
-  so the result has to be compiled to be sure of it.
+* A branch whose two arms only meet again through a chain of empty jumps cannot be told from straight line code.
+* A few graphs come back as statements Lua will not parse, such as a `return` that ends up in front of the statements that follow it. Nothing detects this, so the result has to be compiled to be sure of it.
 
 Both are inherited from the original decompiler.
 
-`OnFunctionError::Mark` turns the first case from a failure into a warning: the
-region is written as the statements it holds and pointed out with a
-`-- Decompilation error in this vicinity:` comment. The recovered code is
-usually right, but a branch that could not be told apart loses the arm that was
-not taken. A function that could not be finished at all is replaced by an
-`error("Decompilation failed")` call instead, so the rest of the chunk stays
-usable.
+`OnFunctionError::Mark` turns the first case from a failure into a warning: the region is written as the statements it holds and pointed out with a `-- Decompilation error in this vicinity:` comment. The recovered code is usually right, but a branch that could not be told apart loses the arm that was not taken. A function that could not be finished at all is replaced by an `error("Decompilation failed")` call instead, so the rest of the chunk stays usable.
 
 ## Examples
 
 ```text
 cargo run --release --example decompile_file -- chunk.ljbc [--spaces] [--slots]
-cargo run --release --example decompile_dir  -- <input dir> <output dir> [--mark-errors]
-cargo run --release --example listing       -- chunk.ljbc
+cargo run --release --example decompile_dir -- <input dir> <output dir> [--mark-errors]
+cargo run --release --example listing -- chunk.ljbc
 ```
 
 ## License
 
 GPL-3.0-only. See `LICENSE` and `NOTICE.md`.
+
+## AI Usage Disclosure
+
+This project is my first fully vibe-coded project. I do not understand what the program does in detail and I let LLM models to do almost all the work.
+
+Despite this, the resulting product works well for my needs. I have been using it in reverse-engineering work over a real-world luajit application containing ~20000 files.
