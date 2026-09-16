@@ -1,0 +1,6 @@
+/target
+
+# Scratch corpora and harnesses. These live outside version control on purpose:
+# they are local datasets and measurements, not part of the library.
+_ignored/
+_ignored_*.*

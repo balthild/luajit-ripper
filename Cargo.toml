@@ -1,0 +1,14 @@
+[package]
+name = "luajit-ripper"
+version = "0.1.0"
+edition = "2024"
+description = "A LuaJIT 2.1 bytecode decompiler library"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+thiserror = "2"
+
+[lib]
+name = "luajit_ripper"
+path = "src/lib.rs"
