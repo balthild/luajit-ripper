@@ -4,9 +4,8 @@
 //! each of which rewrites every statement list in the tree. The final step
 //! glues the remaining blocks together into a flat statement list.
 //!
-//! Steps that are not ported yet report [`Error::Unsupported`] as soon as they
-//! would have to do something, so that a partially unwarped tree is never
-//! mistaken for a finished one.
+//! A graph the passes cannot structure is reported as an [`Error::Internal`],
+//! the same way the original asserts on it.
 
 mod expressions;
 mod ifs;
@@ -80,10 +79,6 @@ fn run_step(root: &NodeRef, step: impl Fn(Vec<NodeRef>) -> Result<Vec<NodeRef>>)
     }
 
     Ok(())
-}
-
-fn unsupported(what: &str) -> Error {
-    Error::Unsupported(format!("{what} (unwarper step not implemented yet)"))
 }
 
 /// A state the pass cannot make sense of, which means a limitation of the
@@ -424,7 +419,7 @@ pub fn cleanup_ast(mut blocks: Vec<NodeRef>) -> Result<Vec<NodeRef>> {
         }
 
         if traverse::position(&blocks, &source) != Some(index - 1) {
-            return Err(unsupported(
+            return Err(internal(
                 "fallthrough edge that does not lead to the next block",
             ));
         }
@@ -499,14 +494,14 @@ pub fn glue_flows(root: &NodeRef) -> Result<()> {
             }
 
             let warp =
-                traverse::block_warp(&block).ok_or_else(|| unsupported("block without a warp"))?;
+                traverse::block_warp(&block).ok_or_else(|| internal("block without a warp"))?;
             if !traverse::is_flow(&warp.borrow()) {
-                return Err(unsupported("control flow that could not be structured"));
+                return Err(internal("control flow that could not be structured"));
             }
             let target = traverse::jump_target(&warp.borrow())
-                .ok_or_else(|| unsupported("flow warp without a target"))?;
+                .ok_or_else(|| internal("flow warp without a target"))?;
             if !Rc::ptr_eq(&target, &blocks[index + 1]) {
-                return Err(unsupported("fallthrough edge that skips a block"));
+                return Err(internal("fallthrough edge that skips a block"));
             }
 
             let mut merged = traverse::block_contents(&block);

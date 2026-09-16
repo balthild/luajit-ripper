@@ -1,5 +1,8 @@
 //! Prints the disassembly of a bytecode dump, in LuaJIT's `-bl` format.
 //!
+//! The output is byte for byte what `luajit -bl` writes, which is what makes it
+//! useful for checking a dump against the compiler that produced it.
+//!
 //! Usage: `cargo run --example listing -- <file.ljbc>`
 
 use std::process::ExitCode;

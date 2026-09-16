@@ -1,9 +1,9 @@
 //! Tests for control flow reconstruction.
 //!
-//! The unwarper is still incomplete: it rebuilds straight line code, and
-//! reports everything else as unsupported. These tests pin down both halves of
-//! that boundary so that finishing the port cannot silently break what already
-//! works.
+//! Every kind of control flow LuaJIT emits should come back out of the
+//! unwarper as the statement it was written as. These tests cover each shape
+//! on its own, so that a change to one of the passes cannot silently break
+//! another.
 
 mod support;
 
