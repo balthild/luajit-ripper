@@ -96,6 +96,101 @@ fn bit_operations_can_be_written_as_library_calls() {
 }
 
 #[test]
+fn recovering_does_not_change_a_chunk_that_already_decompiles() {
+    let Some(luajit) = luajit() else {
+        eprintln!("luajit not found, skipping");
+        return;
+    };
+
+    // Recovery only engages where the strict mode gives up, so for input the
+    // strict mode can handle the two modes have to agree exactly. Anything else
+    // would mean the output depends on a flag that is only meant to be a
+    // fallback.
+    let sources = [
+        (
+            "quiet",
+            "local function f(t)\n\tif t.a then\n\t\treturn 1\n\tend\n\treturn 2\nend\nreturn f\n",
+        ),
+        (
+            "loops",
+            concat!(
+                "local function f(t)\n",
+                "\tlocal total = 0\n",
+                "\tfor i = 1, #t do\n",
+                "\t\ttotal = total + t[i]\n",
+                "\tend\n",
+                "\tfor key, value in pairs(t) do\n",
+                "\t\ttotal = total + value\n",
+                "\tend\n",
+                "\twhile total > 0 do\n",
+                "\t\ttotal = total - 1\n",
+                "\tend\n",
+                "\trepeat\n",
+                "\t\ttotal = total + 1\n",
+                "\tuntil total > 3\n",
+                "\treturn total\n",
+                "end\n",
+                "return f\n",
+            ),
+        ),
+        (
+            "expressions",
+            concat!(
+                "local function f(t)\n",
+                "\tlocal mode = t.a and \"x\" or t.b and \"y\" or \"z\"\n",
+                "\tif t.n == 0 or t.n > 10 then\n",
+                "\t\tmode = mode .. \"!\"\n",
+                "\tend\n",
+                "\treturn mode\n",
+                "end\n",
+                "return f\n",
+            ),
+        ),
+        (
+            "short_circuits",
+            concat!(
+                "local function f(t)\n",
+                "\tif t.a ~= nil or t.b then\n",
+                "\t\treturn true\n",
+                "\tend\n",
+                "\tif (t.c or 0) > 0 then\n",
+                "\t\treturn true\n",
+                "\tend\n",
+                "\tif t.d ~= nil then\n",
+                "\t\treturn true\n",
+                "\tend\n",
+                "\treturn false\n",
+                "end\n",
+                "return f\n",
+            ),
+        ),
+    ];
+
+    for (name, source) in sources {
+        let dump = compile_source(&luajit, name, source, true);
+
+        let strict = luajit_ripper::decompile(&dump, &Default::default())
+            .expect("the snippet must decompile");
+
+        let options = luajit_ripper::Options {
+            on_function_error: luajit_ripper::OnFunctionError::Mark,
+            ..Default::default()
+        };
+        let recovering = luajit_ripper::decompile(&dump, &options)
+            .expect("recovering must not fail where the strict mode does not");
+
+        assert_eq!(
+            strict, recovering,
+            "{name}: recovering changed the output of a chunk that already decompiled"
+        );
+        assert!(
+            !recovering.contains("Decompilation error"),
+            "{name}: nothing should have been marked: {recovering}"
+        );
+    }
+}
+
+#[test]
 fn a_malformed_dump_is_reported_as_an_error() {
     let error = luajit_ripper::decompile(b"not a dump", &Default::default())
         .expect_err("garbage must not decompile");

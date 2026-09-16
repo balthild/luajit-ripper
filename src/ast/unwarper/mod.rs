@@ -23,19 +23,62 @@ pub use expressions::unwarp_expressions;
 pub use ifs::unwarp_ifs;
 pub use loops::{fix_loops, unwarp_loops};
 
+/// How the passes react to a graph they cannot structure.
+///
+/// Some control flow graphs cannot be turned back into statements: a jump does
+/// not record which construct produced it, so a branch whose two arms only meet
+/// again through a chain of empty jumps has no unambiguous shape. The original
+/// decompiler is asked to carry on in that case, and this is what selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Recovery {
+    /// Stop at the first region that cannot be structured and report it.
+    #[default]
+    Off,
+    /// Point the region out and keep going.
+    ///
+    /// The region is written as straight line code and the node it starts at is
+    /// marked, so that the writer can say so. What is recovered this way is
+    /// usually right but not always: a branch that could not be told apart
+    /// loses the arm that was not taken.
+    On,
+}
+
 /// Rebuilds structured control flow for one function definition.
 ///
 /// Only the statement lists that belong to this function are rewritten; the
 /// functions nested inside it are left for their own call.
-pub fn unwarp(function: &NodeRef) -> Result<()> {
-    run_step(function, |blocks| fix_loops(blocks, false))?;
-    run_step(function, |blocks| fix_loops(blocks, true))?;
-    run_step(function, unwarp_expressions)?;
-    run_step(function, unwarp_expressions)?;
-    run_step(function, |blocks| unwarp_loops(blocks, false))?;
-    run_step(function, |blocks| unwarp_loops(blocks, true))?;
-    run_step(function, unwarp_ifs)?;
-    run_step(function, cleanup_ast)?;
+pub fn unwarp(function: &NodeRef, recovery: Recovery) -> Result<()> {
+    recoverable(recovery, || {
+        run_step(function, |blocks| fix_loops(blocks, false))
+    })?;
+    recoverable(recovery, || {
+        run_step(function, |blocks| fix_loops(blocks, true))
+    })?;
+
+    // Under some conditions unwarping expressions makes new assignments become
+    // expressions themselves; running it twice saves the bookkeeping that would
+    // otherwise be needed to notice.
+    recoverable(recovery, || {
+        run_step(function, |blocks| unwarp_expressions(blocks, recovery))
+    })?;
+    recoverable(recovery, || {
+        run_step(function, |blocks| unwarp_expressions(blocks, recovery))
+    })?;
+
+    recoverable(recovery, || {
+        run_step(function, |blocks| unwarp_loops(blocks, false))
+    })?;
+    recoverable(recovery, || {
+        run_step(function, |blocks| unwarp_loops(blocks, true))
+    })?;
+    recoverable(recovery, || {
+        run_step(function, |blocks| unwarp_ifs(blocks, recovery))
+    })?;
+    recoverable(recovery, || run_step(function, cleanup_ast))?;
+
+    // From here on the tree has to be sound for the output to be usable, so a
+    // failure is reported even when recovering: leaving blocks behind would
+    // write bytecode structure into the source.
     glue_flows(function)?;
     trim_redundant_returns(function)?;
 
@@ -46,16 +89,27 @@ pub fn unwarp(function: &NodeRef) -> Result<()> {
     Ok(())
 }
 
+/// Runs a step, recording the failure instead of reporting it when recovering.
+fn recoverable(recovery: Recovery, step: impl FnOnce() -> Result<()>) -> Result<()> {
+    match step() {
+        Ok(()) => Ok(()),
+        Err(error) => match recovery {
+            Recovery::Off => Err(error),
+            Recovery::On => Ok(()),
+        },
+    }
+}
+
 /// Rebuilds the control flow of every function of a chunk.
 ///
 /// The nested functions are done first, so that a function is finished before
 /// the one that contains it is looked at.
-pub fn unwarp_chunk(root: &NodeRef) -> Result<()> {
+pub fn unwarp_chunk(root: &NodeRef, recovery: Recovery) -> Result<()> {
     let mut functions = traverse::functions(root);
     functions.reverse();
 
     for function in functions {
-        unwarp(&function)?;
+        unwarp(&function, recovery)?;
     }
 
     Ok(())
@@ -487,10 +541,24 @@ pub fn glue_flows(root: &NodeRef) -> Result<()> {
             continue;
         }
 
+        // A block that was given up on is about to be emptied into the one
+        // after it, so the mark moves to the statement that ends up carrying it
+        // forward; otherwise the loss would go unnoticed.
+        let mut error_pending = false;
+
         for index in 0..blocks.len() - 1 {
             let block = blocks[index].clone();
+            if has_error(&block) {
+                error_pending = true;
+            }
             if traverse::block_contents(&block).is_empty() {
                 continue;
+            }
+            if error_pending {
+                if let Some(first) = traverse::block_contents(&block).first() {
+                    mark_error(first);
+                }
+                error_pending = false;
             }
 
             let warp =

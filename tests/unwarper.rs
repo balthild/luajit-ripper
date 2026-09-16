@@ -21,7 +21,7 @@ fn build_and_unwarp(
     chunk: &luajit_ripper::bytecode::Chunk,
 ) -> Result<NodeRef, luajit_ripper::Error> {
     let root = prepare(chunk)?;
-    luajit_ripper::ast::unwarper::unwarp_chunk(&root)?;
+    luajit_ripper::ast::unwarper::unwarp_chunk(&root, luajit_ripper::ast::unwarper::Recovery::Off)?;
     Ok(root)
 }
 

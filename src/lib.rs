@@ -20,13 +20,16 @@
 //! # Limits
 //!
 //! Rebuilding source from bytecode is not always possible, because a jump
-//! target does not record which construct produced the jump. Two shapes of
-//! input are known to fall outside what the passes can recover:
+//! target does not record which construct produced it. Two shapes of input are
+//! known to fall outside what the passes can recover:
 //!
 //! * A branch whose two arms only meet again through a chain of empty jumps
-//!   cannot be turned back into an `if`. [`Options::on_function_error`] decides
-//!   whether the whole chunk fails or only that function is replaced by a call
-//!   to `error`, which keeps the rest of the chunk usable.
+//!   cannot be told from straight line code. [`Options::on_function_error`]
+//!   decides what happens: the chunk fails, or the region is written as the
+//!   statements it holds and pointed out with a
+//!   `-- Decompilation error in this vicinity:` comment. The recovered code is
+//!   usually right, but a branch that could not be told apart loses the arm that
+//!   was not taken.
 //! * A few control flow graphs are reconstructed into statements that Lua will
 //!   not parse, such as a `return` that ends up in front of the statements that
 //!   follow it. Nothing detects this case, so the result has to be compiled to
@@ -61,6 +64,11 @@ pub enum OnFunctionError {
     Fail,
     /// Write an `error("Decompilation failed")` call into the function and
     /// carry on with the rest of the chunk.
+    ///
+    /// The regions a pass gives up on are written as the statements they hold
+    /// and pointed out with a comment, so that as much of the function as
+    /// possible is still usable. The call is only written for a function that
+    /// could not be finished at all.
     Mark,
 }
 
@@ -147,8 +155,19 @@ fn unwarp_chunk(root: &NodeRef, options: &Options) -> Result<()> {
     let mut functions = traverse::functions(root);
     functions.reverse();
 
+    // Recovering is asked for when the caller wants the chunk to come out
+    // whole: a function that cannot be structured is then written as far as it
+    // got instead of being reported.
+    let recovery = match options.on_function_error {
+        OnFunctionError::Fail => ast::unwarper::Recovery::Off,
+        OnFunctionError::Mark => ast::unwarper::Recovery::On,
+    };
+
     for function in functions {
-        if let Err(error) = ast::unwarper::unwarp(&function) {
+        // Recovering already handles the regions a pass gives up on, so the
+        // fallback is only reached by a function that could not be written at
+        // all, such as one whose control flow never got structured.
+        if let Err(error) = ast::unwarper::unwarp(&function, recovery) {
             match options.on_function_error {
                 OnFunctionError::Fail => return Err(error),
                 OnFunctionError::Mark => mark_function_failed(&function),

@@ -1158,6 +1158,14 @@ impl<'a> Writer<'a> {
         self.skipped.push(HashSet::new());
         self.path.push(node.clone());
 
+        // A node a pass gave up on is pointed out, so that the code around it
+        // is not mistaken for a faithful rendering.
+        if has_error(node) {
+            self.end_line();
+            self.write("-- Decompilation error in this vicinity:");
+            self.end_line();
+        }
+
         self.dispatch(node);
 
         self.path.pop();

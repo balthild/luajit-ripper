@@ -30,7 +30,7 @@ use super::super::traverse;
 use super::*;
 
 /// Replaces every short circuit region of a block list with an expression.
-pub fn unwarp_expressions(blocks: Vec<NodeRef>) -> Result<Vec<NodeRef>> {
+pub fn unwarp_expressions(blocks: Vec<NodeRef>, recovery: Recovery) -> Result<Vec<NodeRef>> {
     let mut blocks = blocks;
     let mut pack: Vec<Expression> = Vec::new();
     let mut packed: HashSet<usize> = HashSet::new();
@@ -84,7 +84,21 @@ pub fn unwarp_expressions(blocks: Vec<NodeRef>) -> Result<Vec<NodeRef>> {
         }
 
         let mut known_blocks: HashSet<usize> = HashSet::new();
-        let (expressions, unused) = find_expressions(&start, &body, &end, 0, &mut known_blocks)?;
+        let found = find_expressions(&start, &body, &end, 0, &mut known_blocks);
+
+        // A region the matcher cannot read is left as it is and stepped over:
+        // whatever it holds is written as plain statements rather than as an
+        // expression of the enclosing one.
+        let (expressions, unused) = match found {
+            Ok(found) => found,
+            Err(error) => {
+                if recovery == Recovery::Off {
+                    return Err(error);
+                }
+                mark_error(&start);
+                (Vec::new(), Vec::new())
+            }
+        };
 
         if expressions.is_empty() {
             start_index += 1;
@@ -127,7 +141,7 @@ pub fn unwarp_expressions(blocks: Vec<NodeRef>) -> Result<Vec<NodeRef>> {
         start_index = end_index;
     }
 
-    unwarp_expressions_pack(&mut blocks, &pack)?;
+    unwarp_expressions_pack(&mut blocks, &pack, recovery)?;
     Ok(blocks)
 }
 
@@ -655,7 +669,11 @@ fn get_terminators(body: &[NodeRef]) -> (Option<NodeRef>, Option<NodeRef>, Vec<N
 ///
 /// The parts are processed in reverse, because replacing an expression changes
 /// the graph the outer ones refer to.
-fn unwarp_expressions_pack(blocks: &mut Vec<NodeRef>, pack: &[Expression]) -> Result<()> {
+fn unwarp_expressions_pack(
+    blocks: &mut Vec<NodeRef>,
+    pack: &[Expression],
+    recovery: Recovery,
+) -> Result<()> {
     let mut replacements: Vec<(NodeRef, NodeRef)> = Vec::new();
     let lookup = |replacements: &[(NodeRef, NodeRef)], node: &NodeRef| -> NodeRef {
         for (from, to) in replacements {
@@ -766,7 +784,14 @@ fn unwarp_expressions_pack(blocks: &mut Vec<NodeRef>, pack: &[Expression]) -> Re
             continue;
         }
 
-        unwarp_logical_expression(&start, &end, &body)?;
+        if let Err(error) = unwarp_logical_expression(&start, &end, &body) {
+            // The subexpression is left as it was found, so what it holds is
+            // written as separate statements.
+            if recovery == Recovery::Off {
+                return Err(error);
+            }
+            mark_error(&start);
+        }
 
         if is_special {
             let contents = traverse::block_contents(&start);

@@ -22,8 +22,8 @@ use super::expressions::{compile_expression, invert};
 use super::*;
 
 /// Rebuilds the `if` statements of one block list.
-pub fn unwarp_ifs(blocks: Vec<NodeRef>) -> Result<Vec<NodeRef>> {
-    unwarp_if_region(blocks, None, None)
+pub fn unwarp_ifs(blocks: Vec<NodeRef>, recovery: Recovery) -> Result<Vec<NodeRef>> {
+    unwarp_if_region(blocks, None, None, recovery)
 }
 
 /// Rebuilds the `if` statements of a region.
@@ -35,6 +35,7 @@ fn unwarp_if_region(
     blocks: Vec<NodeRef>,
     _top_end: Option<NodeRef>,
     topmost_end: Option<NodeRef>,
+    recovery: Recovery,
 ) -> Result<Vec<NodeRef>> {
     let mut boundaries: Vec<(usize, usize)> = Vec::new();
 
@@ -87,7 +88,8 @@ fn unwarp_if_region(
             abort_loop = true;
         }
 
-        if !abort_loop && let Err(error) = unwarp_if_statement(&start, &body, &end, &end) {
+        if !abort_loop && let Err(error) = unwarp_if_statement(&start, &body, &end, &end, recovery)
+        {
             if std::env::var("LJR_DEBUG_IF").is_ok() {
                 eprintln!(
                     "--- if start {} end {}",
@@ -103,7 +105,15 @@ fn unwarp_if_region(
                 }
                 eprintln!("{out}");
             }
-            return Err(error);
+
+            // The region cannot be told apart from straight line code, so it is
+            // written as such: the condition keeps its statements and the body
+            // is dropped, which is what the block bookkeeping below does. The
+            // block is marked so that the loss is visible in the output.
+            if recovery == Recovery::Off {
+                return Err(error);
+            }
+            mark_error(&start);
         }
 
         if is_end {
@@ -188,6 +198,7 @@ fn unwarp_if_statement(
     body: &[NodeRef],
     end: &NodeRef,
     topmost_end: &NodeRef,
+    recovery: Recovery,
 ) -> Result<()> {
     let (expression, body, false_target) = extract_if_expression(start, body, end, topmost_end)?;
 
@@ -225,6 +236,7 @@ fn unwarp_if_statement(
             then_body.clone(),
             then_body.last().cloned(),
             Some(topmost_end.clone()),
+            recovery,
         )?;
 
         set_end(else_body.last().expect("checked above"), false);
@@ -232,6 +244,7 @@ fn unwarp_if_statement(
             else_body.clone(),
             else_body.last().cloned(),
             Some(topmost_end.clone()),
+            recovery,
         )?;
 
         let so_far = statements(then_blocks.clone());
@@ -295,6 +308,7 @@ fn unwarp_if_statement(
             body.to_vec(),
             body.last().cloned(),
             Some(topmost_end.clone()),
+            recovery,
         )?;
 
         if let Node::If(inner) = &mut *if_node.borrow_mut() {

@@ -29,12 +29,9 @@ stages, each of which can be used on its own:
 | --- | --- | --- |
 | `indent` | `Indent::Tabs` | Tabs, or a chosen number of spaces. |
 | `bitop_style` | `BitOpStyle::Operator` | `a & b`, or `bit.band(a, b)`. |
-| `on_function_error` | `OnFunctionError::Fail` | Stop at the first function that cannot be decompiled, or leave an `error("Decompilation failed")` call in its place and carry on. |
+| `on_function_error` | `OnFunctionError::Fail` | Stop at the first region that cannot be structured, or recover it. |
 | `show_slot_ids` | `false` | Let unnamed registers carry the ids of the definitions they may refer to. |
 | `function_definition_sugar` | `false` | Write `t.f = function() end` as `function t.f() end`. |
-
-`OnFunctionError::Mark` is what makes a whole chunk decompile even when one
-function cannot be; the rest of the chunk stays usable.
 
 ## Limits
 
@@ -43,13 +40,20 @@ does not record which construct produced it. Two shapes of input fall outside
 what the passes can recover:
 
 * A branch whose two arms only meet again through a chain of empty jumps cannot
-  be turned back into an `if`. `OnFunctionError` decides whether the chunk fails
-  or only that function is marked.
+  be told from straight line code.
 * A few graphs come back as statements Lua will not parse, such as a `return`
   that ends up in front of the statements that follow it. Nothing detects this,
   so the result has to be compiled to be sure of it.
 
 Both are inherited from the original decompiler.
+
+`OnFunctionError::Mark` turns the first case from a failure into a warning: the
+region is written as the statements it holds and pointed out with a
+`-- Decompilation error in this vicinity:` comment. The recovered code is
+usually right, but a branch that could not be told apart loses the arm that was
+not taken. A function that could not be finished at all is replaced by an
+`error("Decompilation failed")` call instead, so the rest of the chunk stays
+usable.
 
 ## Examples
 

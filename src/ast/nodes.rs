@@ -25,11 +25,21 @@ pub type NodeRef = Rc<RefCell<Node>>;
 pub struct Meta {
     pub addr: u32,
     pub line: u32,
+    /// Whether a pass gave up on this node.
+    ///
+    /// The writer points such a node out with a comment, so that a reader knows
+    /// the code around it is not to be trusted. Only the unwarper's recovery
+    /// mode ever sets it; see [`crate::ast::unwarper::Recovery`].
+    pub error_here: bool,
 }
 
 impl Meta {
     pub fn new(addr: u32, line: u32) -> Self {
-        Meta { addr, line }
+        Meta {
+            addr,
+            line,
+            error_here: false,
+        }
     }
 }
 
@@ -197,34 +207,72 @@ impl Node {
     /// synthesised function header and is never attached to a node, so it is
     /// reported as "no address".
     pub fn addr(&self) -> Option<u32> {
-        let meta = match self {
-            Node::Assignment(inner) => inner.meta,
-            Node::FunctionCall(inner) => inner.meta,
-            Node::Return(inner) => inner.meta,
-            Node::NoOp(inner) => inner.meta,
-            Node::If(inner) => inner.meta,
-            Node::ElseIf(inner) => inner.meta,
-            Node::While(inner) => inner.meta,
-            Node::RepeatUntil(inner) => inner.meta,
-            Node::NumericFor(inner) => inner.meta,
-            Node::IteratorFor(inner) => inner.meta,
-            Node::FunctionDefinition(inner) => inner.meta,
-            Node::Identifier(inner) => inner.meta,
-            Node::TableElement(inner) => inner.meta,
-            Node::Constant(inner) => inner.meta,
-            Node::TableConstructor(inner) => inner.meta,
-            Node::BinaryOperator(inner) => inner.meta,
-            Node::UnaryOperator(inner) => inner.meta,
-            Node::ArrayRecord(inner) => inner.meta,
-            Node::TableRecord(inner) => inner.meta,
-            Node::UnconditionalWarp(inner) => inner.meta,
-            Node::ConditionalWarp(inner) => inner.meta,
-            Node::IteratorWarp(inner) => inner.meta,
-            Node::NumericLoopWarp(inner) => inner.meta,
-            Node::EndWarp(inner) => inner.meta,
-            _ => return None,
-        };
-        (meta.addr != 0).then_some(meta.addr)
+        let addr = self.meta()?.addr;
+        (addr != 0).then_some(addr)
+    }
+
+    /// The metadata of this node, if it carries any.
+    ///
+    /// List nodes and `Primitive` carry none.
+    pub fn meta(&self) -> Option<&Meta> {
+        match self {
+            Node::Assignment(inner) => Some(&inner.meta),
+            Node::FunctionCall(inner) => Some(&inner.meta),
+            Node::Return(inner) => Some(&inner.meta),
+            Node::NoOp(inner) => Some(&inner.meta),
+            Node::If(inner) => Some(&inner.meta),
+            Node::ElseIf(inner) => Some(&inner.meta),
+            Node::While(inner) => Some(&inner.meta),
+            Node::RepeatUntil(inner) => Some(&inner.meta),
+            Node::NumericFor(inner) => Some(&inner.meta),
+            Node::IteratorFor(inner) => Some(&inner.meta),
+            Node::FunctionDefinition(inner) => Some(&inner.meta),
+            Node::Identifier(inner) => Some(&inner.meta),
+            Node::TableElement(inner) => Some(&inner.meta),
+            Node::Constant(inner) => Some(&inner.meta),
+            Node::TableConstructor(inner) => Some(&inner.meta),
+            Node::BinaryOperator(inner) => Some(&inner.meta),
+            Node::UnaryOperator(inner) => Some(&inner.meta),
+            Node::ArrayRecord(inner) => Some(&inner.meta),
+            Node::TableRecord(inner) => Some(&inner.meta),
+            Node::UnconditionalWarp(inner) => Some(&inner.meta),
+            Node::ConditionalWarp(inner) => Some(&inner.meta),
+            Node::IteratorWarp(inner) => Some(&inner.meta),
+            Node::NumericLoopWarp(inner) => Some(&inner.meta),
+            Node::EndWarp(inner) => Some(&inner.meta),
+            _ => None,
+        }
+    }
+
+    /// The metadata of this node, for mutation.
+    pub fn meta_mut(&mut self) -> Option<&mut Meta> {
+        match self {
+            Node::Assignment(inner) => Some(&mut inner.meta),
+            Node::FunctionCall(inner) => Some(&mut inner.meta),
+            Node::Return(inner) => Some(&mut inner.meta),
+            Node::NoOp(inner) => Some(&mut inner.meta),
+            Node::If(inner) => Some(&mut inner.meta),
+            Node::ElseIf(inner) => Some(&mut inner.meta),
+            Node::While(inner) => Some(&mut inner.meta),
+            Node::RepeatUntil(inner) => Some(&mut inner.meta),
+            Node::NumericFor(inner) => Some(&mut inner.meta),
+            Node::IteratorFor(inner) => Some(&mut inner.meta),
+            Node::FunctionDefinition(inner) => Some(&mut inner.meta),
+            Node::Identifier(inner) => Some(&mut inner.meta),
+            Node::TableElement(inner) => Some(&mut inner.meta),
+            Node::Constant(inner) => Some(&mut inner.meta),
+            Node::TableConstructor(inner) => Some(&mut inner.meta),
+            Node::BinaryOperator(inner) => Some(&mut inner.meta),
+            Node::UnaryOperator(inner) => Some(&mut inner.meta),
+            Node::ArrayRecord(inner) => Some(&mut inner.meta),
+            Node::TableRecord(inner) => Some(&mut inner.meta),
+            Node::UnconditionalWarp(inner) => Some(&mut inner.meta),
+            Node::ConditionalWarp(inner) => Some(&mut inner.meta),
+            Node::IteratorWarp(inner) => Some(&mut inner.meta),
+            Node::NumericLoopWarp(inner) => Some(&mut inner.meta),
+            Node::EndWarp(inner) => Some(&mut inner.meta),
+            _ => None,
+        }
     }
 
     /// The contents of a list node.
@@ -291,35 +339,21 @@ pub fn push(node: &NodeRef, child: NodeRef) {
 ///
 /// Nodes that carry no metadata of their own are left alone.
 pub fn set_meta(node: &NodeRef, meta: Meta) {
-    let mut borrowed = node.borrow_mut();
-    let target = match &mut *borrowed {
-        Node::Assignment(inner) => &mut inner.meta,
-        Node::FunctionCall(inner) => &mut inner.meta,
-        Node::Return(inner) => &mut inner.meta,
-        Node::NoOp(inner) => &mut inner.meta,
-        Node::If(inner) => &mut inner.meta,
-        Node::ElseIf(inner) => &mut inner.meta,
-        Node::While(inner) => &mut inner.meta,
-        Node::RepeatUntil(inner) => &mut inner.meta,
-        Node::NumericFor(inner) => &mut inner.meta,
-        Node::IteratorFor(inner) => &mut inner.meta,
-        Node::FunctionDefinition(inner) => &mut inner.meta,
-        Node::Identifier(inner) => &mut inner.meta,
-        Node::TableElement(inner) => &mut inner.meta,
-        Node::Constant(inner) => &mut inner.meta,
-        Node::TableConstructor(inner) => &mut inner.meta,
-        Node::BinaryOperator(inner) => &mut inner.meta,
-        Node::UnaryOperator(inner) => &mut inner.meta,
-        Node::ArrayRecord(inner) => &mut inner.meta,
-        Node::TableRecord(inner) => &mut inner.meta,
-        Node::UnconditionalWarp(inner) => &mut inner.meta,
-        Node::ConditionalWarp(inner) => &mut inner.meta,
-        Node::IteratorWarp(inner) => &mut inner.meta,
-        Node::NumericLoopWarp(inner) => &mut inner.meta,
-        Node::EndWarp(inner) => &mut inner.meta,
-        _ => return,
-    };
-    *target = meta;
+    if let Some(target) = node.borrow_mut().meta_mut() {
+        *target = meta;
+    }
+}
+
+/// Records that a pass gave up on `node`.
+pub fn mark_error(node: &NodeRef) {
+    if let Some(meta) = node.borrow_mut().meta_mut() {
+        meta.error_here = true;
+    }
+}
+
+/// Whether a pass gave up on `node`.
+pub fn has_error(node: &NodeRef) -> bool {
+    node.borrow().meta().is_some_and(|meta| meta.error_here)
 }
 
 /// `local x = 1` versus `x = 1`.
