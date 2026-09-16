@@ -1,9 +1,11 @@
 [package]
 name = "luajit-ripper"
 version = "0.1.0"
-edition = "2024"
 description = "A LuaJIT bytecode decompiler"
 license = "GPL-3.0-only"
+documentation = "https://docs.rs/luajit-ripper"
+repository = "https://github.com/balthild/luajit-ripper"
+edition = "2024"
 
 [features]
 default = []
@@ -29,3 +31,9 @@ required-features = ["cli"]
 name = "cli"
 path = "tests/cli.rs"
 required-features = ["cli"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
