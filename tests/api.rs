@@ -5,11 +5,9 @@
 
 mod support;
 
-use support::*;
-
 #[test]
 fn a_chunk_decompiles_to_source_that_compiles_again() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -34,7 +32,7 @@ fn a_chunk_decompiles_to_source_that_compiles_again() {
         "return M\n",
     );
 
-    let dump = compile_source(&luajit, "chunk", source, true);
+    let dump = support::compile_source(&luajit, "chunk", source, true);
     let text =
         luajit_ripper::decompile(&dump, &Default::default()).expect("the chunk must decompile");
 
@@ -49,19 +47,19 @@ fn a_chunk_decompiles_to_source_that_compiles_again() {
     );
 
     // The result has to be Lua the same compiler accepts.
-    let recompiled = compile_source(&luajit, "chunk_again", &text, false);
-    parse_dump(&recompiled);
+    let recompiled = support::compile_source(&luajit, "chunk_again", &text, false);
+    support::parse_dump(&recompiled);
 }
 
 #[test]
 fn the_indentation_of_the_output_can_be_chosen() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local function f(a)\n\tif a then\n\t\tg()\n\tend\nend\nreturn f\n";
-    let dump = compile_source(&luajit, "indent", source, true);
+    let dump = support::compile_source(&luajit, "indent", source, true);
 
     let options = luajit_ripper::Options {
         indent: luajit_ripper::Indent::Spaces(2),
@@ -74,13 +72,13 @@ fn the_indentation_of_the_output_can_be_chosen() {
 
 #[test]
 fn bit_operations_can_be_written_as_library_calls() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local function f(a, b)\n\treturn a & b\nend\nreturn f\n";
-    let dump = compile_source(&luajit, "bitop", source, true);
+    let dump = support::compile_source(&luajit, "bitop", source, true);
 
     let operators =
         luajit_ripper::decompile(&dump, &Default::default()).expect("the snippet must decompile");
@@ -96,7 +94,7 @@ fn bit_operations_can_be_written_as_library_calls() {
 
 #[test]
 fn recovering_does_not_change_a_chunk_that_already_decompiles() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -166,7 +164,7 @@ fn recovering_does_not_change_a_chunk_that_already_decompiles() {
     ];
 
     for (name, source) in sources {
-        let dump = compile_source(&luajit, name, source, true);
+        let dump = support::compile_source(&luajit, name, source, true);
 
         let strict = luajit_ripper::decompile(&dump, &Default::default())
             .expect("the snippet must decompile");
@@ -201,7 +199,7 @@ fn a_malformed_dump_is_reported_as_an_error() {
 
 #[test]
 fn a_called_function_literal_is_wrapped_in_parentheses() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -221,7 +219,7 @@ fn a_called_function_literal_is_wrapped_in_parentheses() {
         "end\n",
         "return pick\n",
     );
-    let dump = compile_source(&luajit, "called_literal", source, true);
+    let dump = support::compile_source(&luajit, "called_literal", source, true);
     let text =
         luajit_ripper::decompile(&dump, &Default::default()).expect("the snippet must decompile");
 
@@ -234,5 +232,5 @@ fn a_called_function_literal_is_wrapped_in_parentheses() {
         "an unwrapped function literal cannot be called: {text}"
     );
 
-    compile_source(&luajit, "called_literal_again", &text, false);
+    support::compile_source(&luajit, "called_literal_again", &text, false);
 }

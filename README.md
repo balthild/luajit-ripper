@@ -1,8 +1,60 @@
 # luajit-ripper
 
-A LuaJIT 2.1 bytecode decompiler, as a Rust library.
+A LuaJIT 2.1 bytecode decompiler.
 
-It takes a raw LuaJIT bytecode dump and gives back Lua source:
+The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecode decompiler written in Python, and it is laid out as a pipeline of independent stages, each of which can be used on its own.
+
+## Usage
+
+### As a CLI Tool
+
+```shell
+# install from prebuilt binary
+cargo binstall luajit-ripper
+
+# or compile from source
+cargo install luajit-ripper --features cli
+```
+
+```shell
+luajit-ripper --input <dump.ljbc> [--output <file.lua>]
+luajit-ripper --input <dir of dumps> --output <dir> [--module-structure]
+```
+
+A single dump without `--output` is written to stdout. A directory of dumps is decompiled into an output directory with one worker per core (`--threads` changes that), and every worker keeps an allocator of its own, which is reset after each dump instead of unwinding what the passes built.
+
+#### Options
+
+| Option | Effect |
+| --- | --- |
+| `-i`, `--input <PATH>` | Dump, or directory of dumps, to read. |
+| `-o`, `--output <PATH>` | Where to write. Left out, a single dump goes to stdout. |
+| `--module-structure` | Name every output after the chunk name in its dump. |
+| `-j`, `--threads <N>` | How many dumps to decompile at once; `0` picks a number. |
+| `--indent`, `--indent-width` | Tabs, or a chosen number of spaces per level. |
+| `--slots` | Let unnamed registers carry the ids of the definitions they may refer to. |
+| `--syntactic-sugar` | Write `t.f = function() end` as `function t.f() end`. |
+| `--bit-library` | Write `bit.band(a, b)` instead of `a & b`. |
+| `--mark-errors` | Write the regions that cannot be structured as code instead of failing their chunk. |
+
+#### Where the output goes
+
+A dump keeps the name of the file it was compiled from, such as `@modules/logic/rouge/map/Foo.lua`. With `--module-structure` that name becomes the path below the output directory, leading `@` and all, which turns a flat collection of hashed dumps back into the tree it was built from. A dump whose name is missing (a stripped dump) or unusable keeps the path of its input file instead, and the run says so.
+
+Without it, the layout of the input is mirrored: `sub/a.ljbc` becomes `sub/a.lua`.
+
+Paths are created on the way, but only where that cannot invent a directory by accident:
+
+* A single file input never creates a folder. An `--output` that is a directory, or whose parent does not exist, is refused.
+* A directory input creates `--output` when it is missing, but only if its parent already exists. Below the output directory, `--module-structure` and mirrored subdirectories are made as needed.
+
+### As a Library
+
+```shell
+cargo add luajit-ripper
+```
+
+`decompile` runs the whole pipeline: it parses the dump, builds a control flow graph, rewrites the graph back into statements and writes the source. A chunk is decompiled in one call, and the result is a complete chunk, so it can be compiled again as it is:
 
 ```rust
 use luajit_ripper::{Options, decompile};
@@ -12,7 +64,16 @@ let source = decompile(&dump, &Options::default()).expect("the chunk should deco
 print!("{source}");
 ```
 
-The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecode decompiler written in Python. It is laid out as a pipeline of independent stages, each of which can be used on its own:
+The stages are public as well, so a caller that wants a disassembly, or wants to work on the graph itself, can stop halfway. Every stage reads and writes the same arena, which the caller owns and releases in one go:
+
+```rust
+use oxc_allocator::Allocator;
+use luajit_ripper::{bytecode, listing};
+
+let alloc = Allocator::new();
+let chunk = bytecode::parse(&alloc, &dump).expect("the dump should parse");
+print!("{}", listing::dump(&chunk));
+```
 
 | Module | What it does |
 | --- | --- |
@@ -21,7 +82,9 @@ The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecod
 | `ast` | Builds a control flow graph and rewrites it back into structured statements. |
 | `lua` | Renders the structured AST as source text. |
 
-## Options
+#### Options
+
+`Options` is what changes the output; `decompile_ast` takes the same options when the graph is being driven by hand.
 
 | Field | Default | Effect |
 | --- | --- | --- |
@@ -30,6 +93,15 @@ The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecod
 | `on_function_error` | `OnFunctionError::Fail` | Stop at the first region that cannot be structured, or recover it. |
 | `show_slot_ids` | `false` | Let unnamed registers carry the ids of the definitions they may refer to. |
 | `function_definition_sugar` | `false` | Write `t.f = function() end` as `function t.f() end`. |
+
+## Testing
+
+```text
+cargo test # library and compiler round trips, seconds
+cargo test --features cli # the same, plus the command line tool
+```
+
+The round trips compile the decompiled source again, so they need a LuaJIT: `LUAJIT=<path>` picks one, and `luajit` on `PATH` is the default.
 
 ## Limitations
 
@@ -42,7 +114,9 @@ Both are inherited from the original decompiler.
 
 `OnFunctionError::Mark` turns the first case from a failure into a warning: the region is written as the statements it holds and pointed out with a `-- Decompilation error in this vicinity:` comment. The recovered code is usually right, but a branch that could not be told apart loses the arm that was not taken. A function that could not be finished at all is replaced by an `error("Decompilation failed")` call instead, so the rest of the chunk stays usable.
 
-## Examples
+## Example programs
+
+The library comes with a few, which are the quickest way to try a stage on its own:
 
 ```text
 cargo run --release --example decompile_file -- chunk.ljbc [--spaces] [--slots]
@@ -50,12 +124,16 @@ cargo run --release --example decompile_dir -- <input dir> <output dir> [--mark-
 cargo run --release --example listing -- chunk.ljbc
 ```
 
+The `luajit-ripper` binary is the same work with a command line around it, and is the one to use for a tree of dumps.
+
 ## License
 
 GPL-3.0-only. See `LICENSE` and `NOTICE.md`.
 
 ## AI Usage Disclosure
 
-This project is my first fully vibe-coded project. I do not understand what the program does in detail and I let LLM models to do almost all the work.
+This project is my first fully vibe-coded project. I do not understand what the program does in detail and I let LLM agents to do almost all the work. However, I did my best effort to guide them and review the parts I can understand. I also required them to do cross-validation with the original LJD decompiler, which is human-coded.
 
-Despite this, the resulting product works well for my needs. I have been using it in reverse-engineering work over a real-world luajit application containing ~20000 files.
+I did this primarily for my own needs. I have been using it in reverse-engineering work over a real-world luajit application containing ~20000 files. It works reasonably well.
+
+Anyway, but use it at your own risk.

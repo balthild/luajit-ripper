@@ -9,7 +9,7 @@ mod support;
 
 use luajit_ripper::ast::nodes::{AssignmentKind, IdentifierKind, Node};
 use luajit_ripper::ast::{locals, traverse};
-use support::*;
+use support::NodeRef;
 
 /// The names of all identifiers in the tree, without the synthetic ones.
 fn names(root: NodeRef<'_>) -> Vec<String> {
@@ -56,23 +56,23 @@ fn local_definitions(root: NodeRef<'_>) -> usize {
 }
 
 fn build(chunk: &'static luajit_ripper::bytecode::Chunk<'static>) -> NodeRef<'static> {
-    prepare(chunk).expect("the passes should run")
+    support::prepare(chunk).expect("the passes should run")
 }
 
 #[test]
 fn local_names_are_recovered() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source =
         "local alpha = 1\nlocal beta = alpha + 2\nlocal gamma = \"x\" .. beta\nreturn gamma\n";
-    let chunk = chunk_from_source(&luajit, "locals_names", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_names", source);
     let root = build(chunk);
 
     locals::mark_locals(root, false);
-    locals::mark_local_definitions(arena(), root);
+    locals::mark_local_definitions(support::arena(), root);
 
     assert_eq!(
         declared_locals(root),
@@ -93,13 +93,13 @@ fn local_names_are_recovered() {
 
 #[test]
 fn locals_are_declared_where_they_start() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local alpha = 1\nlocal beta = alpha + 2\nalpha = beta\nreturn alpha\n";
-    let chunk = chunk_from_source(&luajit, "locals_definitions", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_definitions", source);
     let root = build(chunk);
 
     locals::mark_locals(root, false);
@@ -109,7 +109,7 @@ fn locals_are_declared_where_they_start() {
         "nothing is a declaration before the definitions are marked"
     );
 
-    locals::mark_local_definitions(arena(), root);
+    locals::mark_local_definitions(support::arena(), root);
 
     assert_eq!(
         local_definitions(root),
@@ -120,18 +120,18 @@ fn locals_are_declared_where_they_start() {
 
 #[test]
 fn a_dump_without_debug_information_keeps_its_slots() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local alpha = 1\nreturn alpha\n";
-    let dump = compile_source(&luajit, "locals_stripped", source, false);
-    let chunk = parse_dump(&dump);
+    let dump = support::compile_source(&luajit, "locals_stripped", source, false);
+    let chunk = support::parse_dump(&dump);
     let root = build(chunk);
 
     locals::mark_locals(root, false);
-    locals::mark_local_definitions(arena(), root);
+    locals::mark_local_definitions(support::arena(), root);
 
     let names = names(root);
     assert!(
@@ -185,13 +185,13 @@ fn iterator_loop_variables(root: NodeRef<'_>) -> Vec<String> {
 
 #[test]
 fn loop_variables_are_named() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local sum = 0\nfor i = 1, 10 do\n\tsum = sum + i\nend\nreturn sum\n";
-    let chunk = chunk_from_source(&luajit, "locals_numeric_for", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_numeric_for", source);
     let root = build(chunk);
     locals::mark_locals(root, false);
     assert_eq!(
@@ -203,7 +203,7 @@ fn loop_variables_are_named() {
     // The variables of a generic loop are named like any other register: the
     // loop header keeps them alive while the body is being walked.
     let source = "local t = {}\nfor k, v in pairs(t) do\n\tprint(k, v)\nend\nreturn t\n";
-    let chunk = chunk_from_source(&luajit, "locals_generic_for", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_generic_for", source);
     let root = build(chunk);
     locals::mark_locals(root, false);
     assert_eq!(
@@ -215,14 +215,14 @@ fn loop_variables_are_named() {
 
 #[test]
 fn arguments_upvalues_and_nested_functions_are_named() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source =
         "local captured = 1\nlocal function f(a, b)\n\treturn a + b + captured\nend\nreturn f\n";
-    let chunk = chunk_from_source(&luajit, "locals_upvalue", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_upvalue", source);
     let root = build(chunk);
     locals::mark_locals(root, false);
 
@@ -242,16 +242,16 @@ fn arguments_upvalues_and_nested_functions_are_named() {
 
 #[test]
 fn shadowed_locals_are_named_separately() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 1\ndo\n\tlocal a = 2\n\tprint(a)\nend\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "locals_shadow", source);
+    let chunk = support::chunk_from_source(&luajit, "locals_shadow", source);
     let root = build(chunk);
     locals::mark_locals(root, false);
-    locals::mark_local_definitions(arena(), root);
+    locals::mark_local_definitions(support::arena(), root);
 
     assert_eq!(
         declared_locals(root),

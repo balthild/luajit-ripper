@@ -12,11 +12,10 @@ use luajit_ripper::ast::traverse;
 use luajit_ripper::bytecode::DebugInfo;
 use luajit_ripper::lua::writer;
 use oxc_allocator::{ArenaBox, ArenaVec};
-use support::arena;
 
 /// Builds a function definition holding `contents`.
 fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
-    let alloc = arena();
+    let alloc = support::arena();
     node(
         alloc,
         Node::FunctionDefinition(ArenaBox::new_in(
@@ -35,7 +34,7 @@ fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
 
 /// An assignment of `value` to the local `name`.
 fn assignment(name: &str, value: i32) -> NodeRef<'static> {
-    let alloc = arena();
+    let alloc = support::arena();
 
     let destination = node(
         alloc,
@@ -75,7 +74,8 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
 
 /// Renders a function definition with the default options.
 fn render(function: NodeRef<'static>) -> String {
-    writer::write_function(arena(), function, &writer::Options::default()).expect("renderable")
+    writer::write_function(support::arena(), function, &writer::Options::default())
+        .expect("renderable")
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn a_marker_survives_a_deep_clone() {
     let statement = assignment("a", 1);
     mark_error(statement);
 
-    let copy = traverse::deep_clone(arena(), statement);
+    let copy = traverse::deep_clone(support::arena(), statement);
     assert!(has_error(copy), "the copy carries the mark");
     assert!(
         !traverse::same_node(statement, copy),
@@ -124,8 +124,8 @@ fn a_marker_survives_a_deep_clone() {
 fn marking_a_list_or_a_primitive_is_harmless() {
     // List nodes and `Primitive` have nowhere to keep a mark; asking for one
     // must not panic.
-    let list = statements(arena(), Vec::new());
-    let primitive = primitive(arena(), PrimitiveKind::Nil);
+    let list = statements(support::arena(), Vec::new());
+    let primitive = primitive(support::arena(), PrimitiveKind::Nil);
 
     assert!(!has_error(list));
     mark_error(list);

@@ -10,15 +10,15 @@ mod support;
 use luajit_ripper::ast::nodes::Node;
 use luajit_ripper::ast::traverse;
 use luajit_ripper::bytecode::Chunk;
-use support::*;
+use support::NodeRef;
 
 /// Builds the AST of a chunk and unwraps every function in it.
 fn build_and_unwarp(
     chunk: &'static Chunk<'static>,
 ) -> Result<NodeRef<'static>, luajit_ripper::Error> {
-    let root = prepare(chunk)?;
+    let root = support::prepare(chunk)?;
     luajit_ripper::ast::unwarper::unwarp_chunk(
-        arena(),
+        support::arena(),
         root,
         luajit_ripper::ast::unwarper::Recovery::Off,
     )?;
@@ -46,13 +46,13 @@ fn empty_returns(root: NodeRef<'_>) -> usize {
 
 #[test]
 fn straight_line_code_unwarps_completely() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 1\nlocal b = a + 2\nlocal c = \"x\" .. b\nreturn c\n";
-    let chunk = chunk_from_source(&luajit, "straight_line", source);
+    let chunk = support::chunk_from_source(&luajit, "straight_line", source);
     let root = build_and_unwarp(chunk).expect("straight line code must unwarp");
 
     let kinds = kinds(root);
@@ -75,7 +75,7 @@ fn straight_line_code_unwarps_completely() {
 
 #[test]
 fn trailing_empty_return_is_dropped() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -83,7 +83,7 @@ fn trailing_empty_return_is_dropped() {
     // The inner function ends with an implicit `return`, which LuaJIT encodes
     // as `RET0`; the decompiler drops it again.
     let source = "local function f()\n\tlocal a = 1\n\tlocal b = a\nend\nreturn f\n";
-    let chunk = chunk_from_source(&luajit, "trailing_return", source);
+    let chunk = support::chunk_from_source(&luajit, "trailing_return", source);
     let root = build_and_unwarp(chunk).expect("straight line code must unwarp");
 
     assert_eq!(
@@ -96,13 +96,13 @@ fn trailing_empty_return_is_dropped() {
 
 #[test]
 fn a_branch_becomes_an_if_statement() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 1\nif a > 0 then\n\ta = 2\nend\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "branch", source);
+    let chunk = support::chunk_from_source(&luajit, "branch", source);
     let root = build_and_unwarp(chunk).expect("an if statement must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -127,7 +127,7 @@ fn a_branch_becomes_an_if_statement() {
 
 #[test]
 fn an_if_with_an_else_becomes_a_conditional_expression() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -135,7 +135,7 @@ fn an_if_with_an_else_becomes_a_conditional_expression() {
     // Both branches assign the same register, so the whole branch is the value
     // of that register and is written as an expression.
     let source = "local a = 1\nif a > 0 then\n\ta = 2\nelse\n\ta = 3\nend\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "branch_else", source);
+    let chunk = support::chunk_from_source(&luajit, "branch_else", source);
     let root = build_and_unwarp(chunk).expect("the branch must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -151,13 +151,13 @@ fn an_if_with_an_else_becomes_a_conditional_expression() {
 
 #[test]
 fn short_circuit_conditions_are_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 1\nlocal b = a > 0 and a or 5\nreturn b\n";
-    let chunk = chunk_from_source(&luajit, "short_circuit", source);
+    let chunk = support::chunk_from_source(&luajit, "short_circuit", source);
     let root = build_and_unwarp(chunk).expect("the expression must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -191,7 +191,7 @@ fn short_circuit_conditions_are_rebuilt() {
 /// understand.
 #[test]
 fn nested_branches_with_a_ternary_unwarp() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -217,7 +217,7 @@ fn nested_branches_with_a_ternary_unwarp() {
         "end\n",
         "return refresh\n",
     );
-    let chunk = chunk_from_source(&luajit, "nested_branches", source);
+    let chunk = support::chunk_from_source(&luajit, "nested_branches", source);
     let root = build_and_unwarp(chunk).expect("the branch must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -237,13 +237,13 @@ fn nested_branches_with_a_ternary_unwarp() {
 
 #[test]
 fn while_loop_is_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 0\nwhile a < 10 do\n\ta = a + 1\nend\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "while_loop", source);
+    let chunk = support::chunk_from_source(&luajit, "while_loop", source);
     let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -260,13 +260,13 @@ fn while_loop_is_rebuilt() {
 
 #[test]
 fn numeric_for_loop_is_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local s = 0\nfor i = 1, 10 do\n\ts = s + i\nend\nreturn s\n";
-    let chunk = chunk_from_source(&luajit, "numeric_for", source);
+    let chunk = support::chunk_from_source(&luajit, "numeric_for", source);
     let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -283,13 +283,13 @@ fn numeric_for_loop_is_rebuilt() {
 
 #[test]
 fn iterator_for_loop_is_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local s = 0\nfor k, v in pairs(t) do\n\ts = s + v\nend\nreturn s\n";
-    let chunk = chunk_from_source(&luajit, "iterator_for", source);
+    let chunk = support::chunk_from_source(&luajit, "iterator_for", source);
     let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -321,13 +321,13 @@ fn iterator_for_loop_is_rebuilt() {
 
 #[test]
 fn repeat_until_loop_is_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 0\nrepeat\n\ta = a + 1\nuntil a > 10\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "repeat_until", source);
+    let chunk = support::chunk_from_source(&luajit, "repeat_until", source);
     let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -341,13 +341,13 @@ fn repeat_until_loop_is_rebuilt() {
 
 #[test]
 fn a_loop_can_be_left_with_break() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local a = 0\nwhile true do\n\ta = a + 1\n\tif a > 10 then\n\t\tbreak\n\tend\nend\nreturn a\n";
-    let chunk = chunk_from_source(&luajit, "loop_break", source);
+    let chunk = support::chunk_from_source(&luajit, "loop_break", source);
     let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);
@@ -362,13 +362,13 @@ fn a_loop_can_be_left_with_break() {
 
 #[test]
 fn nested_loops_are_rebuilt() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local s = 0\nfor i = 1, 3 do\n\tfor j = 1, 3 do\n\t\ts = s + i * j\n\tend\nend\nreturn s\n";
-    let chunk = chunk_from_source(&luajit, "nested_loops", source);
+    let chunk = support::chunk_from_source(&luajit, "nested_loops", source);
     let root = build_and_unwarp(chunk).expect("the loops must unwarp");
 
     let dumped = luajit_ripper::ast::dump::dump(root);

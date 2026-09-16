@@ -5,10 +5,27 @@ edition = "2024"
 description = "A LuaJIT bytecode decompiler"
 license = "GPL-3.0-only"
 
+[features]
+default = []
+cli = ["dep:clap", "dep:rayon", "dep:walkdir"]
+
 [dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
 oxc_allocator = "0.150.0"
+rayon = { version = "1", optional = true }
 thiserror = "2"
+walkdir = { version = "2", optional = true }
 
 [lib]
 name = "luajit_ripper"
 path = "src/lib.rs"
+
+[[bin]]
+name = "luajit-ripper"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]

@@ -9,7 +9,6 @@ mod support;
 
 use std::process::Command;
 
-use support::*;
 /// Collects every prototype of a chunk, including nested ones.
 fn all_prototypes(
     root: &'static luajit_ripper::bytecode::Prototype<'static>,
@@ -26,17 +25,17 @@ fn all_prototypes(
 
 #[test]
 fn every_fixture_parses() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
-    for name in fixture_names() {
-        let source = fixtures_dir().join(format!("{name}.lua"));
+    for name in support::fixture_names() {
+        let source = support::fixtures_dir().join(format!("{name}.lua"));
 
         for debug in [true, false] {
-            let dump = compile(&luajit, &name, &source, debug);
-            let chunk = parse_dump(&dump);
+            let dump = support::compile(&luajit, &name, &source, debug);
+            let chunk = support::parse_dump(&dump);
 
             assert_eq!(chunk.header.flags.stripped, !debug, "{name}: strip flag");
             assert_eq!(
@@ -80,14 +79,14 @@ fn every_fixture_parses() {
 
 #[test]
 fn debug_information_matches_the_source() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
     let source = "local alpha = 1\nlocal beta = alpha + 1\nreturn beta\n";
-    let dump = compile_source(&luajit, "debug_info", source, true);
-    let chunk = parse_dump(&dump);
+    let dump = support::compile_source(&luajit, "debug_info", source, true);
+    let chunk = support::parse_dump(&dump);
 
     let names: Vec<&str> = chunk
         .root
@@ -105,7 +104,7 @@ fn debug_information_matches_the_source() {
 
 #[test]
 fn constant_kinds_are_decoded() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -113,8 +112,8 @@ fn constant_kinds_are_decoded() {
     use luajit_ripper::bytecode::{Const, NumConst};
 
     let source = "local a = 1\nlocal b = 1.5\nlocal c = \"text\"\nreturn a, b, c\n";
-    let dump = compile_source(&luajit, "constants", source, true);
-    let chunk = parse_dump(&dump);
+    let dump = support::compile_source(&luajit, "constants", source, true);
+    let chunk = support::parse_dump(&dump);
 
     assert!(
         chunk
@@ -133,7 +132,7 @@ fn constant_kinds_are_decoded() {
 
 #[test]
 fn compiling_is_deterministic() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -141,8 +140,8 @@ fn compiling_is_deterministic() {
     // The chunk name is embedded in the dump, so both runs have to use the very
     // same source path for the bytes to be comparable.
     let source = "local t = { 1, 2, 3, key = \"value\", other = 2.5 }\nreturn t\n";
-    let first = compile_source(&luajit, "deterministic", source, true);
-    let second = compile_source(&luajit, "deterministic", source, true);
+    let first = support::compile_source(&luajit, "deterministic", source, true);
+    let second = support::compile_source(&luajit, "deterministic", source, true);
     assert_eq!(first, second, "compiling the same source twice must match");
 }
 
@@ -150,17 +149,17 @@ fn compiling_is_deterministic() {
 fn every_fixture_builds_a_control_flow_graph() {
     use luajit_ripper::ast::nodes::Node;
 
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
-    for name in fixture_names() {
-        let source = fixtures_dir().join(format!("{name}.lua"));
+    for name in support::fixture_names() {
+        let source = support::fixtures_dir().join(format!("{name}.lua"));
         for debug in [true, false] {
-            let dump = compile(&luajit, &name, &source, debug);
-            let chunk = parse_dump(&dump);
-            let root = luajit_ripper::ast::builder::build(arena(), chunk)
+            let dump = support::compile(&luajit, &name, &source, debug);
+            let chunk = support::parse_dump(&dump);
+            let root = luajit_ripper::ast::builder::build(support::arena(), chunk)
                 .unwrap_or_else(|error| panic!("{name} (debug={debug}): {error}"));
 
             let statements = match &*root.borrow() {
@@ -199,14 +198,14 @@ fn every_fixture_builds_a_control_flow_graph() {
 
 #[test]
 fn bit_operators_use_the_current_opcode_numbering() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
-    let source = fixtures_dir().join("bitops.lua");
-    let dump = compile(&luajit, "bitops", &source, true);
-    let chunk = parse_dump(&dump);
+    let source = support::fixtures_dir().join("bitops.lua");
+    let dump = support::compile(&luajit, "bitops", &source, true);
+    let chunk = support::parse_dump(&dump);
 
     assert!(
         chunk.header.flags.bitop,
@@ -236,18 +235,18 @@ fn bit_operators_use_the_current_opcode_numbering() {
 
 #[test]
 fn listing_matches_luajit() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
 
-    for name in fixture_names() {
-        let source = fixtures_dir().join(format!("{name}.lua"));
+    for name in support::fixture_names() {
+        let source = support::fixtures_dir().join(format!("{name}.lua"));
 
         // `luajit -bl` lists the freshly compiled function, which still has its
         // debug information, so our dump has to keep it as well.
-        let dump = compile(&luajit, &name, &source, true);
-        let chunk = parse_dump(&dump);
+        let dump = support::compile(&luajit, &name, &source, true);
+        let chunk = support::parse_dump(&dump);
         let actual = luajit_ripper::listing::dump(chunk);
 
         let listed = Command::new(&luajit)

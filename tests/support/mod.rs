@@ -137,3 +137,162 @@ pub fn prepare(chunk: &'static Chunk<'static>) -> Result<NodeRef<'static>, luaji
 
 /// A shared, mutable AST node.
 pub use luajit_ripper::ast::nodes::NodeRef;
+
+// ---------------------------------------------------------------------------
+// The corpus
+// ---------------------------------------------------------------------------
+
+/// How many dumps a run over the corpus looks at by default.
+///
+/// The corpus is a few tens of thousands of files and the `_ignored_*`
+/// harnesses take minutes over all of them, which is too slow to sit through
+/// after every change. They check this many dumps spread over the whole corpus
+/// instead, and the full set is only looked at when it is asked for:
+///
+/// * `LJR_FULL=1` checks every dump.
+/// * `LJR_SAMPLE=<n>` checks `n` of them, and `LJR_SAMPLE=0` checks all.
+///
+/// `LJR_FULL` wins when both are set.
+const CORPUS_SAMPLE: usize = 128;
+
+/// As much of the corpus as this run should look at.
+#[derive(Debug)]
+pub struct Corpus {
+    /// Directory the dumps live in.
+    pub dir: PathBuf,
+    /// The dumps to check: a sample, unless the whole set was asked for.
+    pub files: Vec<PathBuf>,
+    /// How many dumps the corpus holds in total.
+    pub total: usize,
+}
+
+impl Corpus {
+    /// Loads the corpus, or reports that there is none and gives back `None`.
+    ///
+    /// A test that gets `None` is meant to return, which is what happens on a
+    /// checkout without the corpus.
+    pub fn load() -> Option<Corpus> {
+        let Some(dir) = corpus_dir() else {
+            eprintln!("corpus not present, skipping");
+            return None;
+        };
+
+        let all = dumps_in(&dir);
+        let total = all.len();
+        if total == 0 {
+            eprintln!("corpus directory {} is empty, skipping", dir.display());
+            return None;
+        }
+
+        let files = sample(&all, sample_size());
+        if files.len() == total {
+            eprintln!("corpus: all {total} dumps");
+        } else {
+            eprintln!(
+                "corpus: {} of {total} dumps sampled \
+                 (LJR_SAMPLE=<n> changes that, LJR_FULL=1 checks the whole set)",
+                files.len()
+            );
+        }
+
+        Some(Corpus { dir, files, total })
+    }
+}
+
+/// How many dumps to look at, where `0` means all of them.
+fn sample_size() -> usize {
+    if std::env::var("LJR_FULL").is_ok_and(|value| is_truthy(&value)) {
+        return 0;
+    }
+    match std::env::var("LJR_SAMPLE") {
+        Ok(value) => value.parse().unwrap_or(CORPUS_SAMPLE),
+        Err(_) => CORPUS_SAMPLE,
+    }
+}
+
+/// Whether an environment variable was set to something that means yes.
+fn is_truthy(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+/// The directory the corpus lives in, if it is there.
+pub fn corpus_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("LJR_DATASET_DIR") {
+        let dir = PathBuf::from(dir);
+        return dir.is_dir().then_some(dir);
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("_ignored/ljbc");
+    dir.is_dir().then_some(dir)
+}
+
+/// Every dump below `dir`, in path order.
+fn dumps_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("corpus directory should be readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ljbc"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Picks `size` dumps spread over the whole list.
+///
+/// The names are content hashes, so any few of them are as arbitrary as any
+/// other few. Spreading the sample over the list is what keeps a partial run
+/// from depending on where in the sorted order a dump happens to land.
+fn sample(files: &[PathBuf], size: usize) -> Vec<PathBuf> {
+    if size == 0 || size >= files.len() {
+        return files.to_vec();
+    }
+    (0..size)
+        .map(|index| files[index * files.len() / size].clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered(count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| PathBuf::from(format!("{index}.ljbc")))
+            .collect()
+    }
+
+    #[test]
+    fn a_sample_is_spread_over_the_whole_corpus() {
+        let files = numbered(100);
+        let picked = sample(&files, 4);
+        let expected: Vec<PathBuf> = [0, 25, 50, 75]
+            .into_iter()
+            .map(|index| PathBuf::from(format!("{index}.ljbc")))
+            .collect();
+        assert_eq!(picked, expected);
+        // The start, the middle and the end of the list are all represented.
+        assert_eq!(picked.first(), files.first());
+        assert_eq!(picked.last(), files.get(75));
+    }
+
+    #[test]
+    fn a_sample_of_everything_is_everything() {
+        let files = numbered(10);
+        assert_eq!(sample(&files, 10), files);
+        assert_eq!(sample(&files, 0), files);
+        assert_eq!(sample(&files, 99), files);
+    }
+
+    #[test]
+    fn samples_do_not_repeat_a_dump() {
+        let files = numbered(1000);
+        let picked = sample(&files, 333);
+        let mut unique = picked.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), picked.len());
+    }
+}

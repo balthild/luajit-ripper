@@ -7,18 +7,16 @@
 
 mod support;
 
-use support::*;
-
 /// Decompiles a snippet into Lua source.
 fn decompile(luajit: &str, name: &str, source: &str) -> String {
-    let dump = compile_source(luajit, name, source, true);
+    let dump = support::compile_source(luajit, name, source, true);
     luajit_ripper::decompile(&dump, &Default::default())
         .unwrap_or_else(|error| panic!("{name} must decompile: {error}"))
 }
 
 #[test]
 fn an_if_in_an_else_becomes_an_elseif() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -46,7 +44,7 @@ fn an_if_in_an_else_becomes_an_elseif() {
 
 #[test]
 fn table_field_assignments_are_folded_into_the_constructor() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -72,7 +70,7 @@ fn table_field_assignments_are_folded_into_the_constructor() {
 
 #[test]
 fn a_read_of_the_table_keeps_it_out_of_the_constructor() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
@@ -90,7 +88,7 @@ fn a_read_of_the_table_keeps_it_out_of_the_constructor() {
 
 #[test]
 fn a_field_constructor_is_compared_safely() {
-    let Some(luajit) = luajit() else {
+    let Some(luajit) = support::luajit() else {
         eprintln!("luajit not found, skipping");
         return;
     };
