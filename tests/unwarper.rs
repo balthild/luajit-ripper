@@ -7,26 +7,26 @@
 
 mod support;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use luajit_ripper::ast::nodes::Node;
 use luajit_ripper::ast::traverse;
+use luajit_ripper::bytecode::Chunk;
 use support::*;
-
-type NodeRef = Rc<RefCell<Node>>;
 
 /// Builds the AST of a chunk and unwraps every function in it.
 fn build_and_unwarp(
-    chunk: &luajit_ripper::bytecode::Chunk,
-) -> Result<NodeRef, luajit_ripper::Error> {
+    chunk: &'static Chunk<'static>,
+) -> Result<NodeRef<'static>, luajit_ripper::Error> {
     let root = prepare(chunk)?;
-    luajit_ripper::ast::unwarper::unwarp_chunk(&root, luajit_ripper::ast::unwarper::Recovery::Off)?;
+    luajit_ripper::ast::unwarper::unwarp_chunk(
+        arena(),
+        root,
+        luajit_ripper::ast::unwarper::Recovery::Off,
+    )?;
     Ok(root)
 }
 
 /// The kinds of all nodes in the tree.
-fn kinds(root: &NodeRef) -> Vec<&'static str> {
+fn kinds(root: NodeRef<'_>) -> Vec<&'static str> {
     traverse::walk(root)
         .iter()
         .map(|node| node.borrow().kind())
@@ -34,12 +34,12 @@ fn kinds(root: &NodeRef) -> Vec<&'static str> {
 }
 
 /// How many `return` statements without values the tree contains.
-fn empty_returns(root: &NodeRef) -> usize {
+fn empty_returns(root: NodeRef<'_>) -> usize {
     traverse::walk(root)
         .iter()
         .filter(|node| {
             matches!(&*node.borrow(), Node::Return(inner)
-                if traverse::list_contents(&inner.returns).is_empty())
+                if traverse::list_contents(inner.returns).is_empty())
         })
         .count()
 }
@@ -53,9 +53,9 @@ fn straight_line_code_unwarps_completely() {
 
     let source = "local a = 1\nlocal b = a + 2\nlocal c = \"x\" .. b\nreturn c\n";
     let chunk = chunk_from_source(&luajit, "straight_line", source);
-    let root = build_and_unwarp(&chunk).expect("straight line code must unwarp");
+    let root = build_and_unwarp(chunk).expect("straight line code must unwarp");
 
-    let kinds = kinds(&root);
+    let kinds = kinds(root);
     assert!(
         !kinds.contains(&"block"),
         "no block should survive unwarping: {kinds:?}"
@@ -65,7 +65,7 @@ fn straight_line_code_unwarps_completely() {
         "no warp should survive unwarping: {kinds:?}"
     );
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     eprintln!("{dumped}");
     assert!(dumped.contains("assign"), "{dumped}");
     assert!(dumped.contains("return"), "{dumped}");
@@ -84,13 +84,13 @@ fn trailing_empty_return_is_dropped() {
     // as `RET0`; the decompiler drops it again.
     let source = "local function f()\n\tlocal a = 1\n\tlocal b = a\nend\nreturn f\n";
     let chunk = chunk_from_source(&luajit, "trailing_return", source);
-    let root = build_and_unwarp(&chunk).expect("straight line code must unwarp");
+    let root = build_and_unwarp(chunk).expect("straight line code must unwarp");
 
     assert_eq!(
-        empty_returns(&root),
+        empty_returns(root),
         0,
         "{}",
-        luajit_ripper::ast::dump::dump(&root)
+        luajit_ripper::ast::dump::dump(root)
     );
 }
 
@@ -103,10 +103,10 @@ fn a_branch_becomes_an_if_statement() {
 
     let source = "local a = 1\nif a > 0 then\n\ta = 2\nend\nreturn a\n";
     let chunk = chunk_from_source(&luajit, "branch", source);
-    let root = build_and_unwarp(&chunk).expect("an if statement must unwarp");
+    let root = build_and_unwarp(chunk).expect("an if statement must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
-    let kinds = kinds(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
+    let kinds = kinds(root);
     assert!(
         !kinds.contains(&"block"),
         "no block should survive: {dumped}"
@@ -136,11 +136,11 @@ fn an_if_with_an_else_becomes_a_conditional_expression() {
     // of that register and is written as an expression.
     let source = "local a = 1\nif a > 0 then\n\ta = 2\nelse\n\ta = 3\nend\nreturn a\n";
     let chunk = chunk_from_source(&luajit, "branch_else", source);
-    let root = build_and_unwarp(&chunk).expect("the branch must unwarp");
+    let root = build_and_unwarp(chunk).expect("the branch must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"if"),
+        !kinds(root).contains(&"if"),
         "nothing should be left: {dumped}"
     );
     assert!(
@@ -158,11 +158,11 @@ fn short_circuit_conditions_are_rebuilt() {
 
     let source = "local a = 1\nlocal b = a > 0 and a or 5\nreturn b\n";
     let chunk = chunk_from_source(&luajit, "short_circuit", source);
-    let root = build_and_unwarp(&chunk).expect("the expression must unwarp");
+    let root = build_and_unwarp(chunk).expect("the expression must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
 
@@ -218,15 +218,15 @@ fn nested_branches_with_a_ternary_unwarp() {
         "return refresh\n",
     );
     let chunk = chunk_from_source(&luajit, "nested_branches", source);
-    let root = build_and_unwarp(&chunk).expect("the branch must unwarp");
+    let root = build_and_unwarp(chunk).expect("the branch must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert!(
-        !kinds(&root).contains(&"conditional warp"),
+        !kinds(root).contains(&"conditional warp"),
         "no branch should survive: {dumped}"
     );
     assert!(
@@ -244,11 +244,11 @@ fn while_loop_is_rebuilt() {
 
     let source = "local a = 0\nwhile a < 10 do\n\ta = a + 1\nend\nreturn a\n";
     let chunk = chunk_from_source(&luajit, "while_loop", source);
-    let root = build_and_unwarp(&chunk).expect("the loop must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert!(dumped.contains("while"), "{dumped}");
@@ -267,11 +267,11 @@ fn numeric_for_loop_is_rebuilt() {
 
     let source = "local s = 0\nfor i = 1, 10 do\n\ts = s + i\nend\nreturn s\n";
     let chunk = chunk_from_source(&luajit, "numeric_for", source);
-    let root = build_and_unwarp(&chunk).expect("the loop must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert!(dumped.contains("numeric-for"), "{dumped}");
@@ -290,11 +290,11 @@ fn iterator_for_loop_is_rebuilt() {
 
     let source = "local s = 0\nfor k, v in pairs(t) do\n\ts = s + v\nend\nreturn s\n";
     let chunk = chunk_from_source(&luajit, "iterator_for", source);
-    let root = build_and_unwarp(&chunk).expect("the loop must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert!(dumped.contains("iterator-for"), "{dumped}");
@@ -307,10 +307,10 @@ fn iterator_for_loop_is_rebuilt() {
     // statement before it.
     let mut loops = 0;
     let mut controls_are_a_call = false;
-    for node in traverse::walk(&root) {
+    for node in traverse::walk(root) {
         if let Node::IteratorFor(inner) = &*node.borrow() {
             loops += 1;
-            let expressions = traverse::list_contents(&inner.expressions);
+            let expressions = traverse::list_contents(inner.expressions);
             controls_are_a_call = expressions.len() == 1
                 && matches!(&*expressions[0].borrow(), Node::FunctionCall(_));
         }
@@ -328,11 +328,11 @@ fn repeat_until_loop_is_rebuilt() {
 
     let source = "local a = 0\nrepeat\n\ta = a + 1\nuntil a > 10\nreturn a\n";
     let chunk = chunk_from_source(&luajit, "repeat_until", source);
-    let root = build_and_unwarp(&chunk).expect("the loop must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert!(dumped.contains("repeat"), "{dumped}");
@@ -348,14 +348,14 @@ fn a_loop_can_be_left_with_break() {
 
     let source = "local a = 0\nwhile true do\n\ta = a + 1\n\tif a > 10 then\n\t\tbreak\n\tend\nend\nreturn a\n";
     let chunk = chunk_from_source(&luajit, "loop_break", source);
-    let root = build_and_unwarp(&chunk).expect("the loop must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loop must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
-    assert!(kinds(&root).contains(&"break"), "{dumped}");
+    assert!(kinds(root).contains(&"break"), "{dumped}");
     assert!(dumped.contains("while"), "{dumped}");
     assert!(dumped.contains("if"), "{dumped}");
 }
@@ -369,15 +369,15 @@ fn nested_loops_are_rebuilt() {
 
     let source = "local s = 0\nfor i = 1, 3 do\n\tfor j = 1, 3 do\n\t\ts = s + i * j\n\tend\nend\nreturn s\n";
     let chunk = chunk_from_source(&luajit, "nested_loops", source);
-    let root = build_and_unwarp(&chunk).expect("the loops must unwarp");
+    let root = build_and_unwarp(chunk).expect("the loops must unwarp");
 
-    let dumped = luajit_ripper::ast::dump::dump(&root);
+    let dumped = luajit_ripper::ast::dump::dump(root);
     assert!(
-        !kinds(&root).contains(&"block"),
+        !kinds(root).contains(&"block"),
         "no block should survive: {dumped}"
     );
     assert_eq!(
-        kinds(&root)
+        kinds(root)
             .iter()
             .filter(|kind| **kind == "numeric for")
             .count(),

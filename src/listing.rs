@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use crate::bytecode::constants::{Const, NumConst};
 use crate::bytecode::opcodes::Mode;
-use crate::bytecode::{Chunk, Ins, Prototype};
+use crate::bytecode::{Chunk, Ins, Opcode, Prototype};
 
 /// Renders the whole chunk, nested functions included, the way `luajit -bl`
 /// does.
@@ -27,7 +27,7 @@ pub fn dump(chunk: &Chunk) -> String {
 
 /// Renders the whole chunk into an existing buffer.
 pub fn write_chunk(out: &mut String, chunk: &Chunk) {
-    write_prototype(out, chunk, &chunk.root);
+    write_prototype(out, chunk, chunk.root);
 }
 
 /// Renders a single prototype and, before it, all of its children.
@@ -154,7 +154,7 @@ fn comment_for(chunk: &Chunk, prototype: &Prototype, instruction: &Ins) -> Optio
         }
         Mode::Num => {
             let mut value = prototype.constants.knum_at(instruction.cd)?;
-            if instruction.op == crate::bytecode::Opcode::TSETM {
+            if instruction.op == Opcode::TSETM {
                 // `TSETM` stores the array size as a biased double.
                 if let NumConst::Float(number) = value {
                     value = NumConst::Float(number - 4_503_599_627_370_496.0);
@@ -274,7 +274,10 @@ pub fn format_double(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use oxc_allocator::{Allocator, ArenaVec};
+
     use super::*;
+    use crate::bytecode::{Constants, DebugInfo, Header, HeaderFlags, Magic};
 
     #[test]
     fn doubles_are_formatted_like_lua() {
@@ -293,25 +296,25 @@ mod tests {
 
     #[test]
     fn short_source_name_strips_directories() {
-        let header = crate::bytecode::Header {
-            magic: crate::bytecode::Magic::LuaJit,
+        let alloc = Allocator::default();
+        let header = Header {
+            magic: Magic::LuaJit,
             version: 2,
-            flags: crate::bytecode::HeaderFlags::default(),
-            name: Some("@dir/sub/file.lua".into()),
+            flags: HeaderFlags::default(),
+            name: Some("@dir/sub/file.lua"),
         };
-        let chunk = Chunk {
-            header,
-            root: Prototype {
-                flags: Default::default(),
-                num_params: 0,
-                frame_size: 0,
-                first_line: 0,
-                num_lines: 0,
-                instructions: Vec::new(),
-                constants: Default::default(),
-                debug: Default::default(),
-            },
-        };
+        let debug = alloc.alloc(DebugInfo::new_in(&alloc));
+        let root = alloc.alloc(Prototype {
+            flags: Default::default(),
+            num_params: 0,
+            frame_size: 0,
+            first_line: 0,
+            num_lines: 0,
+            instructions: ArenaVec::new_in(&&alloc),
+            constants: Constants::new_in(&alloc),
+            debug,
+        });
+        let chunk = Chunk { header, root };
         assert_eq!(short_source_name(&chunk), "file.lua");
     }
 

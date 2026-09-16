@@ -50,8 +50,7 @@ fn a_chunk_decompiles_to_source_that_compiles_again() {
 
     // The result has to be Lua the same compiler accepts.
     let recompiled = compile_source(&luajit, "chunk_again", &text, false);
-    luajit_ripper::bytecode::parse(&recompiled)
-        .expect("the decompiled source must compile back to a dump");
+    parse_dump(&recompiled);
 }
 
 #[test]

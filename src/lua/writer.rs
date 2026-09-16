@@ -19,7 +19,8 @@
 //!   out as `function Mod:name()`.
 
 use std::collections::HashSet;
-use std::rc::Rc;
+
+use oxc_allocator::{Allocator, ArenaBox};
 
 use crate::ast::nodes::*;
 use crate::ast::traverse;
@@ -101,9 +102,13 @@ impl Default for Options {
 /// The header of the function itself is not written: a chunk is written as the
 /// statements of its main function, and a nested function is written where the
 /// assignment that defines it is.
-pub fn write_function(root: &NodeRef, options: &Options) -> Result<String> {
+pub fn write_function<'a>(
+    alloc: &'a Allocator,
+    root: NodeRef<'a>,
+    options: &Options,
+) -> Result<String> {
     let statements = match &*root.borrow() {
-        Node::FunctionDefinition(inner) => inner.statements.clone(),
+        Node::FunctionDefinition(inner) => inner.statements,
         _ => {
             return Err(Error::Internal(
                 "the writer needs a function definition".to_string(),
@@ -111,8 +116,8 @@ pub fn write_function(root: &NodeRef, options: &Options) -> Result<String> {
         }
     };
 
-    let mut writer = Writer::new(options);
-    writer.visit_node(&statements);
+    let mut writer = Writer::new(alloc, options);
+    writer.visit_node(statements);
 
     Ok(process_queue(&writer.queue, options))
 }
@@ -150,14 +155,14 @@ enum Command {
 }
 
 /// The part of the writer's state that belongs to one function.
-struct State {
+struct State<'a> {
     current_statement: Statement,
-    function_name: Option<NodeRef>,
+    function_name: Option<NodeRef<'a>>,
     function_local: bool,
     function_method: bool,
 }
 
-impl State {
+impl<'a> State<'a> {
     fn new() -> Self {
         State {
             current_statement: Statement::None,
@@ -168,21 +173,23 @@ impl State {
     }
 }
 
-struct Writer<'a> {
-    options: &'a Options,
+struct Writer<'a, 'c> {
+    alloc: &'a Allocator,
+    options: &'c Options,
     queue: Vec<Command>,
-    path: Vec<NodeRef>,
+    path: Vec<NodeRef<'a>>,
     skipped: Vec<HashSet<usize>>,
-    states: Vec<State>,
+    states: Vec<State<'a>>,
 }
 
-fn node_key(node: &NodeRef) -> usize {
-    Rc::as_ptr(node) as usize
+fn node_key(node: NodeRef<'_>) -> usize {
+    traverse::node_key(node)
 }
 
-impl<'a> Writer<'a> {
-    fn new(options: &'a Options) -> Self {
+impl<'a, 'c> Writer<'a, 'c> {
+    fn new(alloc: &'a Allocator, options: &'c Options) -> Self {
         Writer {
+            alloc,
             options,
             queue: Vec::new(),
             path: Vec::new(),
@@ -219,14 +226,14 @@ impl<'a> Writer<'a> {
         self.queue.push(Command::Write(text.into()));
     }
 
-    fn state(&mut self) -> &mut State {
+    fn state(&mut self) -> &mut State<'a> {
         self.states
             .last_mut()
             .expect("the state stack is never empty")
     }
 
     /// Marks a node as printed, so it is not printed again from elsewhere.
-    fn skip(&mut self, node: &NodeRef) {
+    fn skip(&mut self, node: NodeRef<'a>) {
         self.skipped
             .last_mut()
             .expect("the skip stack is never empty")
@@ -234,7 +241,7 @@ impl<'a> Writer<'a> {
     }
 
     /// Writes the text of a constant that stands for a name.
-    fn write_name(&mut self, key: &NodeRef) {
+    fn write_name(&mut self, key: NodeRef<'a>) {
         if let Node::Constant(constant) = &*key.borrow()
             && let ConstantValue::String(text) = &constant.value
         {
@@ -248,13 +255,13 @@ impl<'a> Writer<'a> {
 
     // -- statements --------------------------------------------------------
 
-    fn visit_function_definition(&mut self, node: &NodeRef) {
+    fn visit_function_definition(&mut self, node: NodeRef<'a>) {
         let (arguments, statements) = {
             let borrowed = node.borrow();
             let Node::FunctionDefinition(inner) = &*borrowed else {
                 return;
             };
-            (inner.arguments.clone(), inner.statements.clone())
+            (inner.arguments, inner.statements)
         };
 
         let is_statement = self.state().function_name.is_some();
@@ -268,30 +275,24 @@ impl<'a> Writer<'a> {
             }
             self.write("function ");
 
-            let name = self
-                .state()
-                .function_name
-                .clone()
-                .expect("checked by is_statement");
+            let name = self.state().function_name.expect("checked by is_statement");
 
             if is_method && !self.options.write_function_definition_self_arg {
                 let element = match &*name.borrow() {
-                    Node::TableElement(element) => {
-                        Some((element.table.clone(), element.key.clone()))
-                    }
+                    Node::TableElement(element) => Some((element.table, element.key)),
                     _ => None,
                 };
 
                 match element {
                     Some((table, key)) => {
-                        self.visit_node(&table);
+                        self.visit_node(table);
                         self.write(":");
-                        self.write_name(&key);
+                        self.write_name(key);
                     }
-                    None => self.visit_node(&name),
+                    None => self.visit_node(name),
                 }
             } else {
-                self.visit_node(&name);
+                self.visit_node(name);
             }
 
             self.write("(");
@@ -300,7 +301,7 @@ impl<'a> Writer<'a> {
             self.write("function (");
         }
 
-        let mut arguments = traverse::list_contents(&arguments);
+        let mut arguments = traverse::list_contents(arguments);
 
         // A method receives its `self` from the call, so it is not written.
         if is_method && !self.options.write_function_definition_self_arg {
@@ -315,19 +316,19 @@ impl<'a> Writer<'a> {
         self.end_line();
 
         // A function ends with an implicit `return`; it is not written out.
-        let contents = traverse::list_contents(&statements);
+        let contents = traverse::list_contents(statements);
         let ends_with_empty_return = contents.len() > 1
             && contents.last().is_some_and(|last| {
                 matches!(&*last.borrow(), Node::Return(inner)
-                    if traverse::list_contents(&inner.returns).is_empty())
+                    if traverse::list_contents(inner.returns).is_empty())
             });
         if ends_with_empty_return {
             let mut contents = contents;
             contents.pop();
-            traverse::set_list_contents(&statements, contents);
+            traverse::set_list_contents(self.alloc, statements, contents);
         }
 
-        self.visit_node(&statements);
+        self.visit_node(statements);
         self.write("end");
 
         if is_statement {
@@ -335,22 +336,22 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn visit_table_constructor(&mut self, constructor: &NodeRef) {
+    fn visit_table_constructor(&mut self, constructor: NodeRef<'a>) {
         let (array, records) = {
             let borrowed = constructor.borrow();
             let Node::TableConstructor(inner) = &*borrowed else {
                 return;
             };
-            (inner.array.clone(), inner.records.clone())
+            (inner.array, inner.records)
         };
 
         self.write("{");
-        self.skip(&array);
-        self.skip(&records);
+        self.skip(array);
+        self.skip(records);
 
-        let array_contents = traverse::list_contents(&array);
+        let array_contents = traverse::list_contents(array);
         let mut contents = array_contents.clone();
-        contents.extend(traverse::list_contents(&records));
+        contents.extend(traverse::list_contents(records));
 
         if !array_contents.is_empty() {
             // The array part comes first, so its first entry is the first entry
@@ -359,30 +360,42 @@ impl<'a> Writer<'a> {
             // that was never there.
             let first = contents.remove(0);
             let value = match &*first.borrow() {
-                Node::ArrayRecord(record) => record.value.clone(),
-                _ => first.clone(),
+                Node::ArrayRecord(record) => record.value,
+                _ => first,
             };
             let is_nil = matches!(&*value.borrow(), Node::Primitive(primitive)
                 if primitive.kind == PrimitiveKind::Nil);
 
             if !is_nil {
-                let key = crate::ast::nodes::node(Node::Constant(Box::new(Constant {
-                    value: ConstantValue::Integer(0),
-                    meta: Meta::default(),
-                })));
+                let key = crate::ast::nodes::node(
+                    self.alloc,
+                    Node::Constant(ArenaBox::new_in(
+                        Constant {
+                            value: ConstantValue::Integer(0),
+                            meta: Meta::default(),
+                        },
+                        &self.alloc,
+                    )),
+                );
                 contents.insert(
                     0,
-                    crate::ast::nodes::node(Node::TableRecord(Box::new(TableRecord {
-                        key,
-                        value,
-                        meta: Meta::default(),
-                    }))),
+                    crate::ast::nodes::node(
+                        self.alloc,
+                        Node::TableRecord(ArenaBox::new_in(
+                            TableRecord {
+                                key,
+                                value,
+                                meta: Meta::default(),
+                            },
+                            &self.alloc,
+                        )),
+                    ),
                 );
             }
         }
 
         if self.options.compact_table_constructors && contents.len() == 1 {
-            self.visit_node(&contents[0]);
+            self.visit_node(contents[0]);
         } else if !contents.is_empty() {
             self.end_line();
             self.start_block();
@@ -393,74 +406,70 @@ impl<'a> Writer<'a> {
         self.write("}");
     }
 
-    fn visit_table_record(&mut self, node: &NodeRef) {
+    fn visit_table_record(&mut self, node: NodeRef<'a>) {
         let (key, value) = {
             let borrowed = node.borrow();
             let Node::TableRecord(inner) = &*borrowed else {
                 return;
             };
-            (inner.key.clone(), inner.value.clone())
+            (inner.key, inner.value)
         };
 
-        if is_valid_name(&key) {
-            self.write_name(&key);
-            self.skip(&key);
+        if is_valid_name(key) {
+            self.write_name(key);
+            self.skip(key);
             self.write(" = ");
         } else {
             self.write("[");
-            self.visit_node(&key);
+            self.visit_node(key);
             self.write("] = ");
         }
 
-        self.visit_node(&value);
+        self.visit_node(value);
     }
 
-    fn visit_assignment(&mut self, node: &NodeRef) {
+    fn visit_assignment(&mut self, node: NodeRef<'a>) {
         let (kind, destinations, expressions) = {
             let borrowed = node.borrow();
             let Node::Assignment(inner) = &*borrowed else {
                 return;
             };
-            (
-                inner.kind,
-                inner.destinations.clone(),
-                inner.expressions.clone(),
-            )
+            (inner.kind, inner.destinations, inner.expressions)
         };
 
         let is_local = kind == AssignmentKind::LocalDefinition;
-        let dsts = traverse::list_contents(&destinations);
-        let srcs = traverse::list_contents(&expressions);
+        let dsts = traverse::list_contents(destinations);
+        let srcs = traverse::list_contents(expressions);
 
         // A register that stands for a constant is not a variable, so an
         // assignment to one cannot be written out. It is left over from a
         // branch the decompiler could not make sense of; dropping it keeps the
         // output readable Lua instead of `false = ...`.
-        if !dsts.is_empty() && dsts.iter().all(is_constant_slot) {
+        if !dsts.is_empty() && dsts.iter().all(|node| is_constant_slot(node)) {
             return;
         }
 
         let mut source_is_function = false;
         if dsts.len() == 1 && srcs.len() == 1 {
-            let destination = dsts[0].clone();
-            let source = srcs[0].clone();
+            let destination = dsts[0];
+            let source = srcs[0];
             source_is_function = matches!(&*source.borrow(), Node::FunctionDefinition(_));
 
             if source_is_function {
                 let acceptable = if self.options.function_definition_sugar {
-                    is_acceptable_function_destination(&destination)
+                    is_acceptable_function_destination(destination)
                 } else {
-                    is_variable(&destination)
+                    is_variable(destination)
                 };
 
                 if acceptable {
-                    self.state().function_name = Some(destination.clone());
+                    self.state().function_name = Some(destination);
                     self.state().function_local = is_local;
-                    self.state().function_method = is_method(&destination, &source);
+                    self.state().function_method = is_method(destination, source);
 
-                    self.visit_node(&source);
-                    self.skip(&destinations);
-                    self.skip(&expressions);
+                    self.visit_node(source);
+                    self.skip(destinations);
+                    self.skip(expressions);
                     return;
                 }
             }
@@ -477,20 +486,20 @@ impl<'a> Writer<'a> {
         };
         self.start_statement(statement);
 
-        self.visit_node(&destinations);
+        self.visit_node(destinations);
         self.write(" = ");
-        self.visit_node(&expressions);
+        self.visit_node(expressions);
 
         self.end_statement(statement);
     }
 
-    fn visit_binary_operator(&mut self, node: &NodeRef) {
+    fn visit_binary_operator(&mut self, node: NodeRef<'a>) {
         let (kind, left, right) = {
             let borrowed = node.borrow();
             let Node::BinaryOperator(inner) = &*borrowed else {
                 return;
             };
-            (inner.kind, inner.left.clone(), inner.right.clone())
+            (inner.kind, inner.left, inner.right)
         };
 
         if self.options.bitop_style == BitOpStyle::BitLibrary
@@ -498,15 +507,15 @@ impl<'a> Writer<'a> {
         {
             // The operands become arguments, so they never need braces.
             self.write(format!("{name}("));
-            self.visit_node(&left);
+            self.visit_node(left);
             self.write(", ");
-            self.visit_node(&right);
+            self.visit_node(right);
             self.write(")");
             return;
         }
 
-        let left_precedence = precedence_of(&left);
-        let right_precedence = precedence_of(&right);
+        let left_precedence = precedence_of(left);
+        let right_precedence = precedence_of(right);
 
         // A subexpression only needs braces when it binds less tightly than the
         // operator it sits under; at the same precedence it needs them on the
@@ -533,7 +542,7 @@ impl<'a> Writer<'a> {
             if !kind.is_right_associative() && Some(kind.precedence()) == right_precedence {
                 use BinaryOperatorKind::*;
                 let droppable = matches!(
-                    (kind, binary_kind_of(&right)),
+                    (kind, binary_kind_of(right)),
                     (Add, Some(Add | Subtract)) | (Multiply, Some(Multiply | Division))
                 );
                 if droppable {
@@ -545,7 +554,7 @@ impl<'a> Writer<'a> {
         if left_parentheses {
             self.write("(");
         }
-        self.visit_node(&left);
+        self.visit_node(left);
         if left_parentheses {
             self.write(")");
         }
@@ -561,19 +570,19 @@ impl<'a> Writer<'a> {
         if right_parentheses {
             self.write("(");
         }
-        self.visit_node(&right);
+        self.visit_node(right);
         if right_parentheses {
             self.write(")");
         }
     }
 
-    fn visit_unary_operator(&mut self, node: &NodeRef) {
+    fn visit_unary_operator(&mut self, node: NodeRef<'a>) {
         let (kind, operand) = {
             let borrowed = node.borrow();
             let Node::UnaryOperator(inner) = &*borrowed else {
                 return;
             };
-            (inner.kind, inner.operand.clone())
+            (inner.kind, inner.operand)
         };
 
         match kind {
@@ -602,20 +611,20 @@ impl<'a> Writer<'a> {
                     "tonumber"
                 };
                 self.write(format!("{name}("));
-                self.visit_node(&operand);
+                self.visit_node(operand);
                 self.write(")");
                 return;
             }
             UnaryOperatorKind::BitNot if self.options.bitop_style == BitOpStyle::BitLibrary => {
                 self.write("bit.bnot(");
-                self.visit_node(&operand);
+                self.visit_node(operand);
                 self.write(")");
                 return;
             }
             _ => self.write(kind.as_str()),
         }
 
-        let need_parentheses = needs_parentheses_around(kind, &operand);
+        let need_parentheses = needs_parentheses_around(kind, operand);
         if need_parentheses {
             self.write("(");
         }
@@ -629,23 +638,19 @@ impl<'a> Writer<'a> {
             self.write(" ");
         }
 
-        self.visit_node(&operand);
+        self.visit_node(operand);
         if need_parentheses {
             self.write(")");
         }
     }
 
-    fn visit_function_call(&mut self, node: &NodeRef) {
+    fn visit_function_call(&mut self, node: NodeRef<'a>) {
         let (function, arguments, is_method) = {
             let borrowed = node.borrow();
             let Node::FunctionCall(inner) = &*borrowed else {
                 return;
             };
-            (
-                inner.function.clone(),
-                inner.arguments.clone(),
-                inner.is_method,
-            )
+            (inner.function, inner.arguments, inner.is_method)
         };
 
         let is_statement = self.state().current_statement == Statement::None;
@@ -655,39 +660,39 @@ impl<'a> Writer<'a> {
 
         if is_method {
             let (table, key) = match &*function.borrow() {
-                Node::TableElement(element) => (element.table.clone(), element.key.clone()),
-                _ => (function.clone(), function.clone()),
+                Node::TableElement(element) => (element.table, element.key),
+                _ => (function, function),
             };
 
-            let needs_parentheses = neighbours_a_constructor(&table);
+            let needs_parentheses = neighbours_a_constructor(table);
             if needs_parentheses {
                 self.write("(");
             }
-            self.visit_node(&table);
+            self.visit_node(table);
             if needs_parentheses {
                 self.write(")");
             }
 
             self.write(":");
-            self.write_name(&key);
-            self.skip(&key);
-            self.skip(&function);
+            self.write_name(key);
+            self.skip(key);
+            self.skip(function);
 
             self.write("(");
-            self.visit_node(&arguments);
+            self.visit_node(arguments);
             self.write(")");
-            self.skip(&arguments);
+            self.skip(arguments);
         } else {
-            let needs_parentheses = neighbours_a_constructor(&function);
+            let needs_parentheses = neighbours_a_constructor(function);
             if needs_parentheses {
                 self.write("(");
             }
-            self.visit_node(&function);
+            self.visit_node(function);
             if needs_parentheses {
                 self.write(")");
             }
             self.write("(");
-            self.visit_node(&arguments);
+            self.visit_node(arguments);
             self.write(")");
         }
 
@@ -696,118 +701,114 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn visit_if(&mut self, node: &NodeRef) {
+    fn visit_if(&mut self, node: NodeRef<'a>) {
         let (expression, then_block, elseifs, else_block) = {
             let borrowed = node.borrow();
             let Node::If(inner) = &*borrowed else {
                 return;
             };
             (
-                inner.expression.clone(),
-                inner.then_block.clone(),
-                inner.elseifs.clone(),
-                inner.else_block.clone(),
+                inner.expression,
+                inner.then_block,
+                inner.elseifs.iter().copied().collect::<Vec<_>>(),
+                inner.else_block,
             )
         };
 
         self.start_statement(Statement::If);
         self.write("if ");
-        self.visit_node(&expression);
+        self.visit_node(expression);
         self.write(" then");
         self.end_line();
 
-        self.visit_node(&then_block);
+        self.visit_node(then_block);
 
         for branch in &elseifs {
             self.visit_node(branch);
         }
 
-        if traverse::list_contents(&else_block).is_empty() {
-            self.skip(&else_block);
+        if traverse::list_contents(else_block).is_empty() {
+            self.skip(else_block);
         } else {
             self.write("else");
             self.end_line();
-            self.visit_node(&else_block);
+            self.visit_node(else_block);
         }
 
         self.write("end");
         self.end_statement(Statement::If);
     }
 
-    fn visit_elseif(&mut self, node: &NodeRef) {
+    fn visit_elseif(&mut self, node: NodeRef<'a>) {
         let (expression, then_block) = {
             let borrowed = node.borrow();
             let Node::ElseIf(inner) = &*borrowed else {
                 return;
             };
-            (inner.expression.clone(), inner.then_block.clone())
+            (inner.expression, inner.then_block)
         };
 
         self.write("elseif ");
-        self.visit_node(&expression);
+        self.visit_node(expression);
         self.write(" then");
         self.end_line();
-        self.visit_node(&then_block);
+        self.visit_node(then_block);
     }
 
-    fn visit_while(&mut self, node: &NodeRef) {
+    fn visit_while(&mut self, node: NodeRef<'a>) {
         let (expression, statements) = {
             let borrowed = node.borrow();
             let Node::While(inner) = &*borrowed else {
                 return;
             };
-            (inner.expression.clone(), inner.statements.clone())
+            (inner.expression, inner.statements)
         };
 
         self.start_statement(Statement::While);
         self.write("while ");
-        self.visit_node(&expression);
+        self.visit_node(expression);
         self.write(" do");
         self.end_line();
-        self.visit_node(&statements);
+        self.visit_node(statements);
         self.write("end");
         self.end_statement(Statement::While);
     }
 
-    fn visit_repeat_until(&mut self, node: &NodeRef) {
+    fn visit_repeat_until(&mut self, node: NodeRef<'a>) {
         let (expression, statements) = {
             let borrowed = node.borrow();
             let Node::RepeatUntil(inner) = &*borrowed else {
                 return;
             };
-            (inner.expression.clone(), inner.statements.clone())
+            (inner.expression, inner.statements)
         };
 
         self.start_statement(Statement::RepeatUntil);
         self.write("repeat");
         self.end_line();
-        self.visit_node(&statements);
+        self.visit_node(statements);
         self.write("until ");
-        self.visit_node(&expression);
+        self.visit_node(expression);
         self.end_statement(Statement::RepeatUntil);
     }
 
-    fn visit_numeric_for(&mut self, node: &NodeRef) {
+    fn visit_numeric_for(&mut self, node: NodeRef<'a>) {
         let (variable, expressions, statements) = {
             let borrowed = node.borrow();
             let Node::NumericFor(inner) = &*borrowed else {
                 return;
             };
-            (
-                inner.variable.clone(),
-                inner.expressions.clone(),
-                inner.statements.clone(),
-            )
+            (inner.variable, inner.expressions, inner.statements)
         };
 
         self.start_statement(Statement::NumericFor);
         self.write("for ");
-        self.visit_node(&variable);
+        self.visit_node(variable);
         self.write(" = ");
-        self.skip(&expressions);
+        self.skip(expressions);
 
         // The step is left out when it is one.
-        let mut expressions = traverse::list_contents(&expressions);
+        let mut expressions = traverse::list_contents(expressions);
         let default_step = expressions.len() == 3
             && matches!(&*expressions[2].borrow(), Node::Constant(constant)
                 if constant.value == ConstantValue::Integer(1));
@@ -826,49 +827,45 @@ impl<'a> Writer<'a> {
 
         self.write(" do");
         self.end_line();
-        self.visit_node(&statements);
+        self.visit_node(statements);
         self.write("end");
         self.end_statement(Statement::NumericFor);
     }
 
-    fn visit_iterator_for(&mut self, node: &NodeRef) {
+    fn visit_iterator_for(&mut self, node: NodeRef<'a>) {
         let (identifiers, expressions, statements) = {
             let borrowed = node.borrow();
             let Node::IteratorFor(inner) = &*borrowed else {
                 return;
             };
-            (
-                inner.identifiers.clone(),
-                inner.expressions.clone(),
-                inner.statements.clone(),
-            )
+            (inner.identifiers, inner.expressions, inner.statements)
         };
 
         self.start_statement(Statement::IteratorFor);
         self.write("for ");
-        self.visit_node(&identifiers);
+        self.visit_node(identifiers);
         self.write(" in ");
-        self.visit_node(&expressions);
+        self.visit_node(expressions);
         self.write(" do");
         self.end_line();
-        self.visit_node(&statements);
+        self.visit_node(statements);
         self.write("end");
         self.end_statement(Statement::IteratorFor);
     }
 
-    fn visit_return(&mut self, node: &NodeRef) {
+    fn visit_return(&mut self, node: NodeRef<'a>) {
         let returns = match &*node.borrow() {
-            Node::Return(inner) => inner.returns.clone(),
+            Node::Return(inner) => inner.returns,
             _ => return,
         };
 
         self.start_statement(Statement::Return);
-        if traverse::list_contents(&returns).is_empty() {
+        if traverse::list_contents(returns).is_empty() {
             self.write("return");
         } else {
             self.write("return ");
         }
-        self.visit_node(&returns);
+        self.visit_node(returns);
         self.end_statement(Statement::Return);
     }
 
@@ -880,7 +877,7 @@ impl<'a> Writer<'a> {
 
     // -- lists and values --------------------------------------------------
 
-    fn visit_statements_list(&mut self, node: &NodeRef) {
+    fn visit_statements_list(&mut self, node: NodeRef<'a>) {
         if self.states.len() > 1 {
             self.start_block();
         }
@@ -917,7 +914,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn visit_comma_separated_list(&mut self, contents: &[NodeRef]) {
+    fn visit_comma_separated_list(&mut self, contents: &[NodeRef<'a>]) {
         if contents.is_empty() {
             return;
         }
@@ -930,7 +927,7 @@ impl<'a> Writer<'a> {
         self.visit_node(contents.last().expect("checked above"));
     }
 
-    fn visit_record_list(&mut self, contents: &[NodeRef]) {
+    fn visit_record_list(&mut self, contents: &[NodeRef<'a>]) {
         if contents.is_empty() {
             return;
         }
@@ -945,7 +942,7 @@ impl<'a> Writer<'a> {
         self.end_line();
     }
 
-    fn visit_identifier(&mut self, node: &NodeRef) {
+    fn visit_identifier(&mut self, node: NodeRef<'a>) {
         enum Action {
             Slot {
                 slot: u32,
@@ -963,10 +960,10 @@ impl<'a> Writer<'a> {
                     Action::Slot {
                         slot: identifier.slot,
                         id: identifier.id,
-                        possible_ids: identifier.possible_ids.clone(),
+                        possible_ids: identifier.possible_ids.iter().copied().collect(),
                     }
                 } else if let Some(name) = &identifier.name {
-                    Action::Named(name.clone())
+                    Action::Named(name.to_string())
                 } else if identifier.kind == IdentifierKind::Upvalue {
                     Action::Upvalue(identifier.slot)
                 } else {
@@ -1022,44 +1019,44 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn visit_table_element(&mut self, node: &NodeRef) {
+    fn visit_table_element(&mut self, node: NodeRef<'a>) {
         let (key, table) = {
             let borrowed = node.borrow();
             let Node::TableElement(inner) = &*borrowed else {
                 return;
             };
-            (inner.key.clone(), inner.table.clone())
+            (inner.key, inner.table)
         };
 
         if is_global(node) {
             // A global is written as its name, without the environment table.
-            self.skip(&table);
-            self.skip(&key);
-            self.write_name(&key);
+            self.skip(table);
+            self.skip(key);
+            self.write_name(key);
             return;
         }
 
-        let needs_parentheses = neighbours_a_constructor(&table);
+        let needs_parentheses = neighbours_a_constructor(table);
         if needs_parentheses {
             self.write("(");
         }
-        self.visit_node(&table);
+        self.visit_node(table);
         if needs_parentheses {
             self.write(")");
         }
 
-        if is_valid_name(&key) {
+        if is_valid_name(key) {
             self.write(".");
-            self.write_name(&key);
-            self.skip(&key);
+            self.write_name(key);
+            self.skip(key);
         } else {
             self.write("[");
-            self.visit_node(&key);
+            self.visit_node(key);
             self.write("]");
         }
     }
 
-    fn visit_constant(&mut self, node: &NodeRef) {
+    fn visit_constant(&mut self, node: NodeRef<'a>) {
         let value = match &*node.borrow() {
             Node::Constant(constant) => constant.value.clone(),
             _ => return,
@@ -1075,11 +1072,11 @@ impl<'a> Writer<'a> {
                 self.write(text);
             }
             ConstantValue::CData(bytes) => {
-                let text = decode_string(&bytes);
+                let text = decode_string(bytes);
                 self.write(text);
             }
             ConstantValue::String(bytes) => {
-                let text = decode_string(&bytes);
+                let text = decode_string(bytes);
                 self.write_string_literal(&text);
             }
         }
@@ -1119,7 +1116,7 @@ impl<'a> Writer<'a> {
         self.write(escaped);
     }
 
-    fn visit_primitive(&mut self, node: &NodeRef) {
+    fn visit_primitive(&mut self, node: NodeRef<'a>) {
         let kind = match &*node.borrow() {
             Node::Primitive(inner) => inner.kind,
             _ => return,
@@ -1136,7 +1133,7 @@ impl<'a> Writer<'a> {
     // -- the walk ----------------------------------------------------------
 
     /// Prints a node and its children.
-    fn visit_node(&mut self, node: &NodeRef) {
+    fn visit_node(&mut self, node: NodeRef<'a>) {
         if self
             .skipped
             .last()
@@ -1156,7 +1153,7 @@ impl<'a> Writer<'a> {
 
         self.skip(node);
         self.skipped.push(HashSet::new());
-        self.path.push(node.clone());
+        self.path.push(node);
 
         // A node a pass gave up on is pointed out, so that the code around it
         // is not mistaken for a faithful rendering.
@@ -1172,7 +1169,7 @@ impl<'a> Writer<'a> {
         self.skipped.pop();
     }
 
-    fn dispatch(&mut self, node: &NodeRef) {
+    fn dispatch(&mut self, node: NodeRef<'a>) {
         let action = {
             let borrowed = node.borrow();
             match &*borrowed {
@@ -1246,10 +1243,10 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn visit_children(&mut self, node: &NodeRef) {
+    fn visit_children(&mut self, node: NodeRef<'a>) {
         let children = traverse::children(&node.borrow());
         for child in children {
-            self.visit_node(&child);
+            self.visit_node(child);
         }
     }
 }
@@ -1299,7 +1296,7 @@ fn bit_library_name(kind: BinaryOperatorKind) -> Option<&'static str> {
 }
 
 /// How tightly a node binds, when it is an operator.
-fn precedence_of(node: &NodeRef) -> Option<Precedence> {
+fn precedence_of(node: NodeRef<'_>) -> Option<Precedence> {
     match &*node.borrow() {
         Node::BinaryOperator(inner) => Some(inner.kind.precedence()),
         Node::UnaryOperator(_) => Some(Precedence::Unary),
@@ -1311,7 +1308,7 @@ fn precedence_of(node: &NodeRef) -> Option<Precedence> {
 ///
 /// Every binary operator binds less tightly than a unary one, so it always
 /// needs them; between two unary operators it depends on which one comes first.
-fn needs_parentheses_around(kind: UnaryOperatorKind, operand: &NodeRef) -> bool {
+fn needs_parentheses_around(kind: UnaryOperatorKind, operand: NodeRef<'_>) -> bool {
     match &*operand.borrow() {
         Node::BinaryOperator(_) => true,
         Node::UnaryOperator(inner) => inner.kind.rank() < kind.rank(),
@@ -1320,7 +1317,7 @@ fn needs_parentheses_around(kind: UnaryOperatorKind, operand: &NodeRef) -> bool 
 }
 
 /// The operator of a binary operator node.
-fn binary_kind_of(node: &NodeRef) -> Option<BinaryOperatorKind> {
+fn binary_kind_of(node: NodeRef<'_>) -> Option<BinaryOperatorKind> {
     match &*node.borrow() {
         Node::BinaryOperator(inner) => Some(inner.kind),
         _ => None,
@@ -1329,14 +1326,14 @@ fn binary_kind_of(node: &NodeRef) -> Option<BinaryOperatorKind> {
 
 /// Whether a node is a register that stands for one of the constants `false`
 /// and `true`.
-fn is_constant_slot(node: &NodeRef) -> bool {
+fn is_constant_slot(node: NodeRef<'_>) -> bool {
     matches!(&*node.borrow(), Node::Identifier(identifier)
         if identifier.kind == IdentifierKind::Slot
             && (identifier.slot == SLOT_FALSE || identifier.slot == SLOT_TRUE))
 }
 
 /// Whether a value has to be wrapped before it can be indexed or called.
-fn neighbours_a_constructor(node: &NodeRef) -> bool {
+fn neighbours_a_constructor(node: NodeRef<'_>) -> bool {
     match &*node.borrow() {
         Node::TableConstructor(_)
         | Node::BinaryOperator(_)
@@ -1348,25 +1345,25 @@ fn neighbours_a_constructor(node: &NodeRef) -> bool {
 }
 
 /// Whether a destination can be written as the name of a function.
-fn is_variable(node: &NodeRef) -> bool {
+fn is_variable(node: NodeRef<'_>) -> bool {
     matches!(&*node.borrow(), Node::Identifier(_)) || is_global(node)
 }
 
 /// Whether the node reads a global through the function environment.
-fn is_global(node: &NodeRef) -> bool {
+fn is_global(node: NodeRef<'_>) -> bool {
     match &*node.borrow() {
-        Node::TableElement(inner) => is_builtin(&inner.table),
+        Node::TableElement(inner) => is_builtin(inner.table),
         _ => false,
     }
 }
 
-fn is_builtin(node: &NodeRef) -> bool {
+fn is_builtin(node: NodeRef<'_>) -> bool {
     matches!(&*node.borrow(), Node::Identifier(identifier)
         if identifier.kind == IdentifierKind::Builtin)
 }
 
 /// Whether the destination can carry a `function name()` prefix.
-fn is_acceptable_function_destination(destination: &NodeRef) -> bool {
+fn is_acceptable_function_destination(destination: NodeRef<'_>) -> bool {
     match &*destination.borrow() {
         Node::Identifier(_) => true,
         Node::TableElement(element) => {
@@ -1390,23 +1387,23 @@ fn is_acceptable_function_destination(destination: &NodeRef) -> bool {
                 return false;
             }
 
-            is_acceptable_function_destination(&element.table)
+            is_acceptable_function_destination(element.table)
         }
         _ => false,
     }
 }
 
 /// Whether the function's first argument is the `self` a method takes.
-fn is_method(destination: &NodeRef, function: &NodeRef) -> bool {
+fn is_method(destination: NodeRef<'_>, function: NodeRef<'_>) -> bool {
     let arguments = match &*function.borrow() {
-        Node::FunctionDefinition(inner) => traverse::list_contents(&inner.arguments),
+        Node::FunctionDefinition(inner) => traverse::list_contents(inner.arguments),
         _ => return false,
     };
     let Some(first) = arguments.first() else {
         return false;
     };
     let is_self = matches!(&*first.borrow(), Node::Identifier(identifier)
-        if identifier.name.as_deref() == Some("self"));
+        if identifier.name == Some("self"));
     if !is_self {
         return false;
     }
@@ -1415,7 +1412,7 @@ fn is_method(destination: &NodeRef, function: &NodeRef) -> bool {
 }
 
 /// Whether a key can be written as a name.
-fn is_valid_name(key: &NodeRef) -> bool {
+fn is_valid_name(key: NodeRef<'_>) -> bool {
     let Node::Constant(constant) = &*key.borrow() else {
         return false;
     };

@@ -1,5 +1,8 @@
 //! Header of a LuaJIT bytecode dump.
 
+use oxc_allocator::Allocator;
+
+use super::arena_str;
 use super::reader::Reader;
 use crate::error::{Error, Result};
 
@@ -50,8 +53,8 @@ pub struct HeaderFlags {
 }
 
 /// The parsed header of a bytecode dump.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Header {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header<'a> {
     /// Which flavour of dump this is.
     pub magic: Magic,
     /// Bytecode revision. `2` is LuaJIT 2.1.
@@ -59,18 +62,18 @@ pub struct Header {
     /// Dump flags.
     pub flags: HeaderFlags,
     /// Chunk name, absent for stripped dumps.
-    pub name: Option<String>,
+    pub name: Option<&'a str>,
 }
 
-impl Header {
+impl Header<'_> {
     /// Chunk name, falling back to `=?` for stripped dumps.
     pub fn chunk_name(&self) -> &str {
-        self.name.as_deref().unwrap_or("=?")
+        self.name.unwrap_or("=?")
     }
 }
 
 /// Reads and validates the dump header.
-pub fn read(reader: &mut Reader<'_>) -> Result<Header> {
+pub fn read<'a>(alloc: &'a Allocator, reader: &mut Reader<'_>) -> Result<Header<'a>> {
     let magic_bytes = reader.read_bytes(3)?;
     let magic = if magic_bytes == MAGIC_LUAJIT {
         Magic::LuaJit
@@ -112,7 +115,7 @@ pub fn read(reader: &mut Reader<'_>) -> Result<Header> {
             });
         }
         let bytes = reader.read_bytes(length)?;
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        Some(arena_str(alloc, bytes))
     };
 
     Ok(Header {
@@ -129,22 +132,24 @@ mod tests {
 
     #[test]
     fn reads_a_plain_header() {
+        let alloc = Allocator::default();
         let mut data = vec![0x1b, b'L', b'J', 2, 0x08, 0x03];
         data.extend_from_slice(b"@a/");
         let mut reader = Reader::new(&data);
-        let header = read(&mut reader).unwrap();
+        let header = read(&alloc, &mut reader).unwrap();
         assert_eq!(header.magic, Magic::LuaJit);
         assert_eq!(header.version, 2);
         assert!(header.flags.fr2);
         assert!(!header.flags.big_endian);
-        assert_eq!(header.name.as_deref(), Some("@a/"));
+        assert_eq!(header.name, Some("@a/"));
     }
 
     #[test]
     fn stripped_headers_have_no_name() {
+        let alloc = Allocator::default();
         let data = [0x1b, b'L', b'J', 2, 0x02];
         let mut reader = Reader::new(&data);
-        let header = read(&mut reader).unwrap();
+        let header = read(&alloc, &mut reader).unwrap();
         assert!(header.flags.stripped);
         assert_eq!(header.name, None);
         assert_eq!(header.chunk_name(), "=?");
@@ -152,28 +157,31 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
+        let alloc = Allocator::default();
         let data = [0x00, b'L', b'J', 2, 0x00];
         let mut reader = Reader::new(&data);
-        assert!(matches!(read(&mut reader), Err(Error::BadMagic)));
+        assert!(matches!(read(&alloc, &mut reader), Err(Error::BadMagic)));
     }
 
     #[test]
     fn rejects_unknown_versions() {
         // Version 1 is LuaJIT 2.0, which uses a different opcode table.
+        let alloc = Allocator::default();
         let data = [0x1b, b'L', b'J', 1, 0x00];
         let mut reader = Reader::new(&data);
         assert!(matches!(
-            read(&mut reader),
+            read(&alloc, &mut reader),
             Err(Error::UnsupportedVersion(1))
         ));
     }
 
     #[test]
     fn rejects_unknown_flag_bits() {
+        let alloc = Allocator::default();
         let data = [0x1b, b'L', b'J', 2, 0x20];
         let mut reader = Reader::new(&data);
         assert!(matches!(
-            read(&mut reader),
+            read(&alloc, &mut reader),
             Err(Error::UnsupportedFlags(0x20))
         ));
     }

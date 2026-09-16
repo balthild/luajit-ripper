@@ -1,5 +1,7 @@
 //! Prototypes: the unit of bytecode a LuaJIT dump stores.
 
+use oxc_allocator::{Allocator, ArenaVec};
+
 use super::constants::{self, Const, Constants};
 use super::debuginfo::{self, DebugInfo, VariableInfo};
 use super::header::Header;
@@ -76,8 +78,8 @@ impl ProtoFlags {
 }
 
 /// A single LuaJIT function prototype.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Prototype {
+#[derive(Debug, PartialEq)]
+pub struct Prototype<'a> {
     /// Prototype flags.
     pub flags: ProtoFlags,
     /// Number of fixed parameters.
@@ -93,14 +95,14 @@ pub struct Prototype {
     /// The dump does not store `[JI]FUNC*` instructions; the reader recreates
     /// them, exactly like LuaJIT's own reader does. Address `n` in the bytecode
     /// therefore corresponds to `instructions[n]`.
-    pub instructions: Vec<Ins>,
+    pub instructions: ArenaVec<'a, Ins>,
     /// Upvalue references, GC constants and number constants.
-    pub constants: Constants,
+    pub constants: Constants<'a>,
     /// Debug information, empty for stripped dumps.
-    pub debug: DebugInfo,
+    pub debug: &'a DebugInfo<'a>,
 }
 
-impl Prototype {
+impl<'a> Prototype<'a> {
     /// `true` when the prototype is a vararg function.
     pub fn is_variadic(&self) -> bool {
         self.flags.is_variadic()
@@ -112,12 +114,12 @@ impl Prototype {
     }
 
     /// Iterates over the child prototypes of this prototype.
-    pub fn children(&self) -> impl Iterator<Item = &Prototype> {
+    pub fn children(&self) -> impl Iterator<Item = &'a Prototype<'a>> {
         self.constants
             .kgc
             .iter()
             .filter_map(|constant| match constant {
-                Const::Child(child) => Some(&**child),
+                Const::Child(child) => Some(*child),
                 _ => None,
             })
     }
@@ -128,18 +130,18 @@ impl Prototype {
     }
 
     /// Looks up a local variable name; see [`DebugInfo::local_name`].
-    pub fn local_name(&self, addr: u32, slot: u32, alt_mode: bool) -> Option<&VariableInfo> {
+    pub fn local_name(&self, addr: u32, slot: u32, alt_mode: bool) -> Option<&VariableInfo<'a>> {
         self.debug.local_name(addr, slot, alt_mode)
     }
 
     /// Name of the upvalue in `slot`, if debug information is available.
-    pub fn upvalue_name(&self, slot: u32) -> Option<&str> {
+    pub fn upvalue_name(&self, slot: u32) -> Option<&'a str> {
         self.debug.upvalue_name(slot)
     }
 
     /// The GC constant a `FNEW`, `KSTR`, `TDUP` or `KCDATA` instruction refers
     /// to.
-    pub fn kgc(&self, instruction: &Ins) -> Option<&Const> {
+    pub fn kgc(&self, instruction: &Ins) -> Option<&Const<'a>> {
         self.constants.kgc_at(instruction.cd)
     }
 
@@ -153,8 +155,12 @@ impl Prototype {
 ///
 /// LuaJIT writes child prototypes before their parent and in reverse constant
 /// order, so a plain stack reproduces the nesting.
-pub fn read_all(reader: &mut Reader<'_>, header: &Header) -> Result<Vec<Prototype>> {
-    let mut stack: Vec<Prototype> = Vec::new();
+pub fn read_all<'a>(
+    alloc: &'a Allocator,
+    reader: &mut Reader<'_>,
+    header: &Header<'_>,
+) -> Result<ArenaVec<'a, &'a Prototype<'a>>> {
+    let mut stack: ArenaVec<&'a Prototype<'a>> = ArenaVec::new_in(&alloc);
 
     while !reader.is_eof() {
         let size = reader.read_uleb128()? as usize;
@@ -176,7 +182,7 @@ pub fn read_all(reader: &mut Reader<'_>, header: &Header) -> Result<Vec<Prototyp
 
         let start = reader.pos();
         let block_end = start + size;
-        let prototype = read_one(reader, header, &mut stack, block_end)?;
+        let prototype = read_one(alloc, reader, header, &mut stack, block_end)?;
 
         let consumed = reader.pos() - start;
         if consumed != size {
@@ -191,12 +197,13 @@ pub fn read_all(reader: &mut Reader<'_>, header: &Header) -> Result<Vec<Prototyp
     Ok(stack)
 }
 
-fn read_one(
+fn read_one<'a>(
+    alloc: &'a Allocator,
     reader: &mut Reader<'_>,
-    header: &Header,
-    stack: &mut Vec<Prototype>,
+    header: &Header<'_>,
+    stack: &mut ArenaVec<&'a Prototype<'a>>,
     block_end: usize,
-) -> Result<Prototype> {
+) -> Result<&'a Prototype<'a>> {
     let raw_flags = reader.read_u8()?;
     let unknown = raw_flags & !PROTO_KNOWN;
     if unknown != 0 {
@@ -243,22 +250,24 @@ fn read_one(
     } else {
         Opcode::FUNCF
     };
-    let mut instructions = Vec::with_capacity(num_bc + 1);
+    let mut instructions = ArenaVec::with_capacity_in(num_bc + 1, &alloc);
     instructions.push(Ins::new_ad(header_op, u32::from(frame_size), 0));
     for _ in 0..num_bc {
         let word = reader.read_u32()?;
         instructions.push(Ins::decode(word, num_kgc)?);
     }
 
-    let constants = constants::read(reader, num_uv, num_kgc, num_kn, stack)?;
+    let constants = constants::read(alloc, reader, num_uv, num_kgc, num_kn, stack)?;
 
     let debug = if debug_size == 0 {
-        DebugInfo::default()
+        alloc.alloc(DebugInfo::new_in(alloc))
     } else {
-        debuginfo::read(reader, first_line, num_lines, num_bc, num_uv, block_end)?
+        debuginfo::read(
+            alloc, reader, first_line, num_lines, num_bc, num_uv, block_end,
+        )?
     };
 
-    Ok(Prototype {
+    Ok(alloc.alloc(Prototype {
         flags,
         num_params,
         frame_size,
@@ -267,7 +276,7 @@ fn read_one(
         instructions,
         constants,
         debug,
-    })
+    }))
 }
 
 #[cfg(test)]

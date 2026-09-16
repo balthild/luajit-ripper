@@ -1,12 +1,17 @@
 //! Prototype debug information: line numbers, upvalue names and local variable
 //! info.
 
+use oxc_allocator::{Allocator, ArenaVec};
+
+use super::arena_str;
 use super::reader::Reader;
 use crate::error::{Error, Result};
 
 /// Terminator of the variable info list.
 pub const VARNAME_END: u8 = 0;
+
 /// Lowest tag value that starts a real (visible) variable name.
+#[allow(non_upper_case_globals)]
 pub const VARNAME__MAX: u8 = 7;
 
 /// Names LuaJIT gives to the hidden control variables it creates for loops.
@@ -31,8 +36,8 @@ pub enum VarKind {
 }
 
 /// One entry of the variable info list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VariableInfo {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariableInfo<'a> {
     /// First instruction address the variable is live at.
     pub start_addr: u32,
     /// First instruction address the variable is dead at.
@@ -40,24 +45,33 @@ pub struct VariableInfo {
     /// Whether the variable is visible in the source.
     pub kind: VarKind,
     /// Name of the variable.
-    pub name: String,
+    pub name: &'a str,
 }
 
 /// Debug information of a single prototype.
 ///
 /// All fields are empty for stripped dumps.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DebugInfo {
+#[derive(Debug, PartialEq, Eq)]
+pub struct DebugInfo<'a> {
     /// Source line for every instruction address, including the synthesised
     /// function header at address 0.
-    pub addr_to_line: Vec<u32>,
+    pub addr_to_line: ArenaVec<'a, u32>,
     /// Names of the upvalues captured by this prototype.
-    pub upvalue_names: Vec<String>,
+    pub upvalue_names: ArenaVec<'a, &'a str>,
     /// Ranges and names of the local variables.
-    pub variable_info: Vec<VariableInfo>,
+    pub variable_info: ArenaVec<'a, VariableInfo<'a>>,
 }
 
-impl DebugInfo {
+impl<'a> DebugInfo<'a> {
+    /// Creates empty debug information, which is what a stripped dump has.
+    pub fn new_in(alloc: &'a Allocator) -> Self {
+        DebugInfo {
+            addr_to_line: ArenaVec::new_in(&alloc),
+            upvalue_names: ArenaVec::new_in(&alloc),
+            variable_info: ArenaVec::new_in(&alloc),
+        }
+    }
+
     /// Whether this prototype carries no debug information at all.
     pub fn is_empty(&self) -> bool {
         self.addr_to_line.is_empty()
@@ -71,8 +85,8 @@ impl DebugInfo {
     }
 
     /// Name of upvalue `slot`, if it is known.
-    pub fn upvalue_name(&self, slot: u32) -> Option<&str> {
-        self.upvalue_names.get(slot as usize).map(String::as_str)
+    pub fn upvalue_name(&self, slot: u32) -> Option<&'a str> {
+        self.upvalue_names.get(slot as usize).copied()
     }
 
     /// Looks up the name of the local that lives in `slot` at `addr`.
@@ -83,7 +97,12 @@ impl DebugInfo {
     ///
     /// With `alt_mode` a variable that dies exactly at `addr` is still
     /// considered alive, which recovers a few names that are otherwise lost.
-    pub fn local_name(&self, addr: u32, mut slot: u32, alt_mode: bool) -> Option<&VariableInfo> {
+    pub fn local_name(
+        &self,
+        addr: u32,
+        mut slot: u32,
+        alt_mode: bool,
+    ) -> Option<&VariableInfo<'a>> {
         for info in &self.variable_info {
             if info.start_addr > addr {
                 break;
@@ -106,18 +125,19 @@ impl DebugInfo {
     }
 }
 
-/// Reads the debug information of a prototype.
+/// Reads the debug information of a prototype, storing it in `alloc`.
 ///
 /// `block_end` is the offset one past the end of the prototype's data, which is
 /// exactly where the debug blob ends.
-pub fn read(
+pub fn read<'a>(
+    alloc: &'a Allocator,
     reader: &mut Reader<'_>,
     first_line: u32,
     num_lines: u32,
     num_bc: usize,
     num_uv: usize,
     block_end: usize,
-) -> Result<DebugInfo> {
+) -> Result<&'a DebugInfo<'a>> {
     let line_width = if num_lines >= 65_536 {
         4
     } else if num_lines >= 256 {
@@ -126,7 +146,7 @@ pub fn read(
         1
     };
 
-    let mut addr_to_line = Vec::with_capacity(num_bc + 1);
+    let mut addr_to_line = ArenaVec::with_capacity_in(num_bc + 1, &alloc);
     // Address 0 is the synthesised function header and never has a line.
     addr_to_line.push(0);
     for _ in 0..num_bc {
@@ -134,23 +154,27 @@ pub fn read(
         addr_to_line.push(first_line.wrapping_add(delta));
     }
 
-    let mut upvalue_names = Vec::with_capacity(num_uv.min(reader.remaining()));
+    let mut upvalue_names = ArenaVec::with_capacity_in(num_uv.min(reader.remaining()), &alloc);
     for _ in 0..num_uv {
         let name = reader.read_zstring()?;
-        upvalue_names.push(String::from_utf8_lossy(name).into_owned());
+        upvalue_names.push(arena_str(alloc, name));
     }
 
-    let variable_info = read_variable_info(reader, block_end)?;
+    let variable_info = read_variable_info(alloc, reader, block_end)?;
 
-    Ok(DebugInfo {
+    Ok(alloc.alloc(DebugInfo {
         addr_to_line,
         upvalue_names,
         variable_info,
-    })
+    }))
 }
 
-fn read_variable_info(reader: &mut Reader<'_>, block_end: usize) -> Result<Vec<VariableInfo>> {
-    let mut infos = Vec::new();
+fn read_variable_info<'a>(
+    alloc: &'a Allocator,
+    reader: &mut Reader<'_>,
+    block_end: usize,
+) -> Result<ArenaVec<'a, VariableInfo<'a>>> {
+    let mut infos = ArenaVec::new_in(&alloc);
     let mut last_addr = 0u32;
 
     while reader.pos() < block_end {
@@ -160,12 +184,12 @@ fn read_variable_info(reader: &mut Reader<'_>, block_end: usize) -> Result<Vec<V
             let mut name = String::with_capacity(suffix.len() + 1);
             name.push(tag as char);
             name.push_str(&String::from_utf8_lossy(suffix));
-            (VarKind::Visible, name)
+            (VarKind::Visible, alloc.alloc_str(&name))
         } else if tag == VARNAME_END {
             return Ok(infos);
         } else {
             let name = INTERNAL_VARNAMES[tag as usize].unwrap_or("<unknown>");
-            (VarKind::Internal, name.to_string())
+            (VarKind::Internal, name)
         };
 
         let start_addr = last_addr.wrapping_add(reader.read_uleb128()?);
@@ -193,21 +217,37 @@ fn read_variable_info(reader: &mut Reader<'_>, block_end: usize) -> Result<Vec<V
 mod tests {
     use super::*;
 
-    fn info(start: u32, end: u32, name: &str) -> VariableInfo {
+    fn info<'a>(alloc: &'a Allocator, start: u32, end: u32, name: &str) -> VariableInfo<'a> {
         VariableInfo {
             start_addr: start,
             end_addr: end,
             kind: VarKind::Visible,
-            name: name.to_string(),
+            name: alloc.alloc_str(name),
+        }
+    }
+
+    /// Builds debug info whose only content is the given variable list.
+    fn debug<'a>(
+        alloc: &'a Allocator,
+        infos: impl IntoIterator<Item = VariableInfo<'a>>,
+    ) -> DebugInfo<'a> {
+        DebugInfo {
+            variable_info: ArenaVec::from_iter_in(infos, &alloc),
+            ..DebugInfo::new_in(alloc)
         }
     }
 
     #[test]
     fn local_lookup_counts_live_variables() {
-        let debug = DebugInfo {
-            variable_info: vec![info(2, 10, "a"), info(4, 6, "b"), info(7, 20, "c")],
-            ..DebugInfo::default()
-        };
+        let alloc = Allocator::default();
+        let debug = debug(
+            &alloc,
+            [
+                info(&alloc, 2, 10, "a"),
+                info(&alloc, 4, 6, "b"),
+                info(&alloc, 7, 20, "c"),
+            ],
+        );
 
         // Only `a` is alive at address 3.
         assert_eq!(debug.local_name(3, 0, false).unwrap().name, "a");
@@ -224,19 +264,18 @@ mod tests {
 
     #[test]
     fn alt_mode_accepts_variables_dying_at_the_address() {
-        let debug = DebugInfo {
-            variable_info: vec![info(2, 10, "a")],
-            ..DebugInfo::default()
-        };
+        let alloc = Allocator::default();
+        let debug = debug(&alloc, [info(&alloc, 2, 10, "a")]);
         assert!(debug.local_name(10, 0, false).is_none());
         assert_eq!(debug.local_name(10, 0, true).unwrap().name, "a");
     }
 
     #[test]
     fn line_lookup_is_total() {
+        let alloc = Allocator::default();
         let debug = DebugInfo {
-            addr_to_line: vec![0, 3, 4],
-            ..DebugInfo::default()
+            addr_to_line: ArenaVec::from_iter_in([0, 3, 4], &&alloc),
+            ..DebugInfo::new_in(&alloc)
         };
         assert_eq!(debug.line_for(1), 3);
         assert_eq!(debug.line_for(99), 0);
@@ -244,10 +283,11 @@ mod tests {
 
     #[test]
     fn reads_visible_and_internal_names() {
+        let alloc = Allocator::default();
         // "x" (two bytes: 'x' then NUL), live from 1 to 5, then the terminator.
         let data = [b'x', 0, 1, 4, VARNAME_END];
         let mut reader = Reader::new(&data);
-        let infos = read_variable_info(&mut reader, data.len()).unwrap();
+        let infos = read_variable_info(&alloc, &mut reader, data.len()).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "x");
         assert_eq!(infos[0].kind, VarKind::Visible);
@@ -256,9 +296,10 @@ mod tests {
 
     #[test]
     fn reads_internal_names() {
+        let alloc = Allocator::default();
         let data = [1, 2, 3, VARNAME_END];
         let mut reader = Reader::new(&data);
-        let infos = read_variable_info(&mut reader, data.len()).unwrap();
+        let infos = read_variable_info(&alloc, &mut reader, data.len()).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "<index>");
         assert_eq!(infos[0].kind, VarKind::Internal);
@@ -266,10 +307,11 @@ mod tests {
 
     #[test]
     fn extents_are_delta_encoded_on_the_start_address() {
+        let alloc = Allocator::default();
         // Two variables: a@1..2 and b@1..3 (start deltas are relative).
         let data = [b'a', 0, 1, 1, b'b', 0, 0, 2, VARNAME_END];
         let mut reader = Reader::new(&data);
-        let infos = read_variable_info(&mut reader, data.len()).unwrap();
+        let infos = read_variable_info(&alloc, &mut reader, data.len()).unwrap();
         assert_eq!(infos.len(), 2);
         assert_eq!(
             (infos[1].start_addr, infos[1].end_addr),
@@ -279,8 +321,9 @@ mod tests {
 
     #[test]
     fn rejects_unterminated_variable_info() {
+        let alloc = Allocator::default();
         let data = [b'x', 0, 1, 4];
         let mut reader = Reader::new(&data);
-        assert!(read_variable_info(&mut reader, data.len()).is_err());
+        assert!(read_variable_info(&alloc, &mut reader, data.len()).is_err());
     }
 }

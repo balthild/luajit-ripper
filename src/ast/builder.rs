@@ -10,15 +10,16 @@
 //! expression assignment.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
+use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
+
+use super::nodes::*;
+use super::traverse;
 use crate::bytecode::constants::NumConst;
 use crate::bytecode::debuginfo::VariableInfo;
 use crate::bytecode::opcodes::{Mode, Opcode};
 use crate::bytecode::{Chunk, Const, ConstKey, Ins, Prototype};
 use crate::error::{Error, Result};
-
-use super::nodes::*;
 
 /// Instructions that end a block and encode a jump target.
 const JUMP_WARP_INSTRUCTIONS: [Opcode; 5] = [
@@ -62,33 +63,41 @@ fn is_warp(op: Opcode) -> bool {
 
 /// Mutable state of one prototype while it is being built.
 struct Builder<'a> {
-    chunk: &'a Chunk,
-    prototype: &'a Prototype,
+    /// The arena every node of this function goes into.
+    alloc: &'a Allocator,
+    chunk: &'a Chunk<'a>,
+    prototype: &'a Prototype<'a>,
+    /// Instructions of the prototype; the repair passes insert into this copy.
     instructions: Vec<Ins>,
     /// Source line for every instruction address; mutated by the repair passes.
     line_map: Vec<u32>,
     /// Local variable info; mutated by the repair passes.
-    variables: Vec<VariableInfo>,
-    blocks: Vec<NodeRef>,
-    block_starts: HashMap<u32, NodeRef>,
+    variables: Vec<VariableInfo<'a>>,
+    blocks: Vec<NodeRef<'a>>,
+    block_starts: HashMap<u32, NodeRef<'a>>,
     /// Number of trailing instructions consumed by the warp that was just
     /// built.
     warp_shift: u32,
 }
 
-/// Builds the AST of the root prototype of a chunk.
-pub fn build(chunk: &Chunk) -> Result<NodeRef> {
-    build_function(chunk, &chunk.root)
+/// Builds the AST of the root prototype of a chunk into `alloc`.
+pub fn build<'a>(alloc: &'a Allocator, chunk: &'a Chunk<'a>) -> Result<NodeRef<'a>> {
+    build_function(alloc, chunk, chunk.root)
 }
 
 /// Builds the AST of a single prototype.
-pub fn build_function(chunk: &Chunk, prototype: &Prototype) -> Result<NodeRef> {
+pub fn build_function<'a>(
+    alloc: &'a Allocator,
+    chunk: &'a Chunk<'a>,
+    prototype: &'a Prototype<'a>,
+) -> Result<NodeRef<'a>> {
     let mut builder = Builder {
+        alloc,
         chunk,
         prototype,
-        instructions: prototype.instructions.clone(),
-        line_map: prototype.debug.addr_to_line.clone(),
-        variables: prototype.debug.variable_info.clone(),
+        instructions: prototype.instructions.to_vec(),
+        line_map: prototype.debug.addr_to_line.to_vec(),
+        variables: prototype.debug.variable_info.to_vec(),
         blocks: Vec::new(),
         block_starts: HashMap::new(),
         warp_shift: 0,
@@ -97,32 +106,48 @@ pub fn build_function(chunk: &Chunk, prototype: &Prototype) -> Result<NodeRef> {
     builder.build_function_definition(prototype)
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
+    // -- node construction -------------------------------------------------
+
+    /// Allocates a node in the arena this builder writes to.
+    fn node(&self, value: Node<'a>) -> NodeRef<'a> {
+        node(self.alloc, value)
+    }
+
+    /// Allocates a payload struct in the arena this builder writes to.
+    fn payload<T>(&self, value: T) -> ArenaBox<'a, T> {
+        ArenaBox::new_in(value, &self.alloc)
+    }
+
     // -- entry points ------------------------------------------------------
 
-    fn build_function_definition(&mut self, prototype: &Prototype) -> Result<NodeRef> {
+    fn build_function_definition(&mut self, prototype: &Prototype<'a>) -> Result<NodeRef<'a>> {
         let mut arguments = Vec::new();
         for slot in 0..u32::from(prototype.num_params) {
             arguments.push(self.build_slot(0, slot));
         }
         if prototype.flags.is_variadic() {
-            arguments.push(node(Node::Vararg));
+            arguments.push(self.node(Node::Vararg));
         }
 
         let statements = self.build_function_blocks()?;
+        let arguments = identifiers(self.alloc, arguments);
         let definition = FunctionDefinition {
-            arguments: identifiers(arguments),
+            arguments,
             statements,
-            upvalues: prototype.constants.upvalue_refs.clone(),
-            debug: Rc::new(prototype.debug.clone()),
+            upvalues: ArenaVec::from_iter_in(
+                prototype.constants.upvalue_refs.iter().copied(),
+                &self.alloc,
+            ),
+            debug: prototype.debug,
             instruction_count: prototype.instructions.len(),
             meta: Meta::default(),
         };
 
-        Ok(node(Node::FunctionDefinition(Box::new(definition))))
+        Ok(self.node(Node::FunctionDefinition(self.payload(definition))))
     }
 
-    fn build_function_blocks(&mut self) -> Result<NodeRef> {
+    fn build_function_blocks(&mut self) -> Result<NodeRef<'a>> {
         self.blockenize()?;
         self.establish_warps()?;
 
@@ -132,8 +157,8 @@ impl Builder<'_> {
         let mut previous: Option<NodeRef> = None;
 
         for block in blocks {
-            let (first, last, last_body) = self.block_addresses(&block);
-            self.fill_block(&block, first, last, last_body)?;
+            let (first, last, last_body) = self.block_addresses(block);
+            self.fill_block(block, first, last, last_body)?;
 
             // A block that is empty, jumps away and directly follows a
             // conditional branch is an empty `then` body.
@@ -157,17 +182,23 @@ impl Builder<'_> {
             });
 
             if empty_jump_block && previous_is_conditional {
-                self.create_no_op(first, &block);
+                self.create_no_op(first, block);
             }
 
             previous = Some(block);
         }
 
-        Ok(statements(self.blocks.clone()))
+        Ok(statements(self.alloc, self.blocks.iter().copied()))
     }
 
     /// Turns the instructions of a block into statements.
-    fn fill_block(&mut self, block: &NodeRef, first: u32, last: u32, last_body: u32) -> Result<()> {
+    fn fill_block(
+        &mut self,
+        block: NodeRef<'a>,
+        first: u32,
+        last: u32,
+        last_body: u32,
+    ) -> Result<()> {
         for addr in first..=last {
             let instruction = self.instructions[addr as usize];
 
@@ -185,7 +216,7 @@ impl Builder<'_> {
 
             if let Some((statement, marked)) = self.build_statement(addr, instruction)? {
                 let meta = Meta::new(addr, self.line_of(addr));
-                for element in marked.iter().chain(std::iter::once(&statement)) {
+                for element in marked.iter().copied().chain(std::iter::once(statement)) {
                     set_meta(element, meta);
                 }
                 if let Node::Block(inner) = &mut *block.borrow_mut() {
@@ -196,7 +227,7 @@ impl Builder<'_> {
         Ok(())
     }
 
-    fn block_addresses(&self, block: &NodeRef) -> (u32, u32, u32) {
+    fn block_addresses(&self, block: NodeRef<'a>) -> (u32, u32, u32) {
         match &*block.borrow() {
             Node::Block(block) => (
                 block.first_address,
@@ -213,7 +244,7 @@ impl Builder<'_> {
         }
     }
 
-    fn mark_loop(&self, block: &NodeRef) {
+    fn mark_loop(&self, block: NodeRef<'a>) {
         if let Node::Block(inner) = &mut *block.borrow_mut() {
             inner.is_loop = true;
         }
@@ -223,8 +254,9 @@ impl Builder<'_> {
         self.line_map.get(addr as usize).copied().unwrap_or(0)
     }
 
-    fn kgc(&self, index: u32) -> Result<&Const> {
-        self.prototype
+    fn kgc(&self, index: u32) -> Result<&'a Const<'a>> {
+        let prototype = self.prototype;
+        prototype
             .constants
             .kgc_at(index)
             .ok_or_else(|| self.malformed(&format!("constant {index} does not exist")))
@@ -290,12 +322,13 @@ impl Builder<'_> {
 
         let mut previous_last_address = 0u32;
         for (index, last_address) in last_addresses.into_iter().enumerate() {
-            let block = node(Node::Block(Box::new(Block::new(
+            let block = self.node(Node::Block(self.payload(Block::new(
+                self.alloc,
                 index as u32,
                 previous_last_address + 1,
                 last_address,
             ))));
-            self.blocks.push(block.clone());
+            self.blocks.push(block);
             self.block_starts.insert(previous_last_address + 1, block);
             previous_last_address = last_address;
         }
@@ -309,9 +342,9 @@ impl Builder<'_> {
         // Building a warp may insert a placeholder block, so the loop has to
         // walk a snapshot of the block list rather than indices into it.
         let count = self.blocks.len();
-        let blocks: Vec<NodeRef> = self.blocks[..count.saturating_sub(1)].to_vec();
+        let blocks: Vec<NodeRef<'a>> = self.blocks[..count.saturating_sub(1)].to_vec();
         for block in blocks {
-            let (first, last, _) = self.block_addresses(&block);
+            let (first, last, _) = self.block_addresses(block);
 
             let start_addr = std::cmp::max(last - 1, first);
             let end_addr = last + 1;
@@ -321,18 +354,18 @@ impl Builder<'_> {
 
             if let Node::Block(inner) = &mut *block.borrow_mut() {
                 inner.last_body_address = last_body;
-                inner.warp = Some(warp.clone());
+                inner.warp = Some(warp);
             }
-            set_meta(&warp, Meta::new(last_body + 1, 0));
+            set_meta(warp, Meta::new(last_body + 1, 0));
         }
 
         let last_block = self
             .blocks
             .last()
-            .cloned()
+            .copied()
             .ok_or_else(|| self.malformed("function without blocks"))?;
-        let (_, last, _) = self.block_addresses(&last_block);
-        let end_warp = node(Node::EndWarp(Box::new(EndWarp {
+        let (_, last, _) = self.block_addresses(last_block);
+        let end_warp = self.node(Node::EndWarp(self.payload(EndWarp {
             target: None,
             meta: Meta::new(last, 0),
         })));
@@ -346,7 +379,12 @@ impl Builder<'_> {
 
     /// Builds the warp of the block that ends at `last_addr`, from the one or
     /// two instructions that end the block.
-    fn build_warp(&mut self, last_addr: u32, start_addr: u32, end_addr: u32) -> Result<NodeRef> {
+    fn build_warp(
+        &mut self,
+        last_addr: u32,
+        start_addr: u32,
+        end_addr: u32,
+    ) -> Result<NodeRef<'a>> {
         let last = self.instructions[last_addr as usize];
         let span = (end_addr - start_addr) as usize;
 
@@ -364,7 +402,7 @@ impl Builder<'_> {
         }
     }
 
-    fn build_jump_warp(&mut self, last_addr: u32, span: usize) -> Result<NodeRef> {
+    fn build_jump_warp(&mut self, last_addr: u32, span: usize) -> Result<NodeRef<'a>> {
         let last = self.instructions[last_addr as usize];
         let previous = if span == 1 {
             None
@@ -383,7 +421,7 @@ impl Builder<'_> {
         }
     }
 
-    fn build_conditional_warp(&mut self, last_addr: u32) -> Result<NodeRef> {
+    fn build_conditional_warp(&mut self, last_addr: u32) -> Result<NodeRef<'a>> {
         let condition_addr = last_addr - 1;
         let condition = self.instructions[condition_addr as usize];
         let jump = self.instructions[last_addr as usize];
@@ -415,14 +453,15 @@ impl Builder<'_> {
         let true_target = if destination == last_addr + 1
             && !matches!(condition.op, Opcode::ISTC | Opcode::ISFC)
         {
-            let block = node(Node::Block(Box::new(Block::new(
-                block_index(&original_true_target),
+            let block = self.node(Node::Block(self.payload(Block::new(
+                self.alloc,
+                block_index(original_true_target),
                 last_addr + 1,
                 last_addr + 1,
             ))));
-            let flow = node(Node::UnconditionalWarp(Box::new(UnconditionalWarp {
+            let flow = self.node(Node::UnconditionalWarp(self.payload(UnconditionalWarp {
                 kind: UnconditionalWarpKind::Flow,
-                target: Some(original_true_target.clone()),
+                target: Some(original_true_target),
                 is_uclo: false,
                 meta: Meta::new(last_addr, 0),
             })));
@@ -437,26 +476,28 @@ impl Builder<'_> {
             let position = self
                 .blocks
                 .iter()
-                .position(|candidate| Rc::ptr_eq(candidate, &original_true_target))
+                .position(|candidate| traverse::same_node(candidate, original_true_target))
                 .ok_or_else(|| self.malformed("conditional target is not a block"))?;
-            self.blocks.insert(position, block.clone());
-            self.create_no_op(last_addr, &block);
+            self.blocks.insert(position, block);
+            self.create_no_op(last_addr, block);
             block
         } else {
             original_true_target
         };
 
         self.warp_shift = 2;
-        Ok(node(Node::ConditionalWarp(Box::new(ConditionalWarp {
-            condition: Some(expression),
-            true_target: Some(true_target),
-            false_target: Some(false_target),
-            slot,
-            meta: Meta::default(),
-        }))))
+        Ok(
+            self.node(Node::ConditionalWarp(self.payload(ConditionalWarp {
+                condition: Some(expression),
+                true_target: Some(true_target),
+                false_target: Some(false_target),
+                slot,
+                meta: Meta::default(),
+            }))),
+        )
     }
 
-    fn build_unconditional_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef> {
+    fn build_unconditional_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
         let is_uclo = instruction.op == Opcode::UCLO;
         if is_uclo && instruction.jump_offset() == 0 {
             return self.build_flow_warp(addr, instruction);
@@ -465,15 +506,17 @@ impl Builder<'_> {
         let target = self.warp_in_block(destination)?;
 
         self.warp_shift = 1;
-        Ok(node(Node::UnconditionalWarp(Box::new(UnconditionalWarp {
-            kind: UnconditionalWarpKind::Jump,
-            target: Some(target),
-            is_uclo,
-            meta: Meta::default(),
-        }))))
+        Ok(
+            self.node(Node::UnconditionalWarp(self.payload(UnconditionalWarp {
+                kind: UnconditionalWarpKind::Jump,
+                target: Some(target),
+                is_uclo,
+                meta: Meta::default(),
+            }))),
+        )
     }
 
-    fn build_iterator_warp(&mut self, last_addr: u32) -> Result<NodeRef> {
+    fn build_iterator_warp(&mut self, last_addr: u32) -> Result<NodeRef<'a>> {
         let iterator_addr = last_addr - 1;
         let iterator = self.instructions[iterator_addr as usize];
         if !matches!(iterator.op, Opcode::ITERC | Opcode::ITERN) {
@@ -481,11 +524,14 @@ impl Builder<'_> {
         }
 
         let base = iterator.a;
-        let controls = expressions(vec![
-            self.build_slot(iterator_addr, base.wrapping_sub(3)),
-            self.build_slot(iterator_addr, base.wrapping_sub(2)),
-            self.build_slot(iterator_addr, base.wrapping_sub(1)),
-        ]);
+        let controls = expressions(
+            self.alloc,
+            vec![
+                self.build_slot(iterator_addr, base.wrapping_sub(3)),
+                self.build_slot(iterator_addr, base.wrapping_sub(2)),
+                self.build_slot(iterator_addr, base.wrapping_sub(1)),
+            ],
+        );
 
         let last_slot = base + iterator.b - 2;
         let mut loop_variables = Vec::new();
@@ -499,8 +545,8 @@ impl Builder<'_> {
         let body = self.warp_in_block(destination)?;
 
         self.warp_shift = 2;
-        Ok(node(Node::IteratorWarp(Box::new(IteratorWarp {
-            variables: variables(loop_variables),
+        Ok(self.node(Node::IteratorWarp(self.payload(IteratorWarp {
+            variables: variables(self.alloc, loop_variables),
             controls,
             body: Some(body),
             way_out: Some(way_out),
@@ -508,46 +554,53 @@ impl Builder<'_> {
         }))))
     }
 
-    fn build_numeric_loop_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef> {
+    fn build_numeric_loop_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
         let base = instruction.a;
         let index = self.build_slot(addr, base + 3);
-        let controls = expressions(vec![
-            self.build_slot(addr, base),
-            self.build_slot(addr, base + 1),
-            self.build_slot(addr, base + 2),
-        ]);
+        let controls = expressions(
+            self.alloc,
+            vec![
+                self.build_slot(addr, base),
+                self.build_slot(addr, base + 1),
+                self.build_slot(addr, base + 2),
+            ],
+        );
 
         let destination = self.jump_destination(addr, &instruction)?;
         let body = self.warp_in_block(destination)?;
         let way_out = self.warp_in_block(addr + 1)?;
 
         self.warp_shift = 1;
-        Ok(node(Node::NumericLoopWarp(Box::new(NumericLoopWarp {
-            index,
-            controls,
-            body: Some(body),
-            way_out: Some(way_out),
-            meta: Meta::default(),
-        }))))
+        Ok(
+            self.node(Node::NumericLoopWarp(self.payload(NumericLoopWarp {
+                index,
+                controls,
+                body: Some(body),
+                way_out: Some(way_out),
+                meta: Meta::default(),
+            }))),
+        )
     }
 
-    fn build_flow_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef> {
+    fn build_flow_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
         let target = self.warp_in_block(addr + 1)?;
         self.warp_shift = if matches!(instruction.op, Opcode::FORI | Opcode::UCLO) {
             1
         } else {
             0
         };
-        Ok(node(Node::UnconditionalWarp(Box::new(UnconditionalWarp {
-            kind: UnconditionalWarpKind::Flow,
-            target: Some(target),
-            is_uclo: false,
-            meta: Meta::default(),
-        }))))
+        Ok(
+            self.node(Node::UnconditionalWarp(self.payload(UnconditionalWarp {
+                kind: UnconditionalWarpKind::Flow,
+                target: Some(target),
+                is_uclo: false,
+                meta: Meta::default(),
+            }))),
+        )
     }
 
-    fn warp_in_block(&mut self, addr: u32) -> Result<NodeRef> {
-        let block = self.block_starts.get(&addr).cloned().ok_or_else(|| {
+    fn warp_in_block(&mut self, addr: u32) -> Result<NodeRef<'a>> {
+        let block = self.block_starts.get(&addr).copied().ok_or_else(|| {
             self.malformed(&format!("branch target {addr} is not the start of a block"))
         })?;
         if let Node::Block(inner) = &mut *block.borrow_mut() {
@@ -561,8 +614,8 @@ impl Builder<'_> {
         u32::try_from(target).map_err(|_| self.malformed("jump target is outside the function"))
     }
 
-    fn create_no_op(&self, addr: u32, block: &NodeRef) {
-        let statement = node(Node::NoOp(Box::new(NoOp {
+    fn create_no_op(&self, addr: u32, block: NodeRef<'a>) {
+        let statement = self.node(Node::NoOp(self.payload(NoOp {
             meta: Meta::new(addr, self.line_of(addr)),
         })));
         if let Node::Block(inner) = &mut *block.borrow_mut() {
@@ -576,7 +629,7 @@ impl Builder<'_> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<Option<(NodeRef, Vec<NodeRef>)>> {
+    ) -> Result<Option<(NodeRef<'a>, Vec<NodeRef<'a>>)>> {
         if matches!(instruction.def().a, Mode::Dst | Mode::Uv) {
             return self.build_var_assignment(addr, instruction).map(Some);
         }
@@ -606,7 +659,7 @@ impl Builder<'_> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef, Vec<NodeRef>)> {
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let op = instruction.op;
 
         let expression = if op.is_unary() {
@@ -628,9 +681,9 @@ impl Builder<'_> {
         } else if op == Opcode::FNEW {
             self.build_child(instruction.cd)?
         } else if op == Opcode::TNEW {
-            node(Node::TableConstructor(Box::new(TableConstructor {
-                array: records(Vec::new()),
-                records: records(Vec::new()),
+            self.node(Node::TableConstructor(self.payload(TableConstructor {
+                array: records(self.alloc, Vec::new()),
+                records: records(self.alloc, Vec::new()),
                 meta: Meta::default(),
             })))
         } else if op == Opcode::TDUP {
@@ -653,26 +706,28 @@ impl Builder<'_> {
         };
 
         let assignment = Assignment {
-            expressions: expressions(vec![expression.clone()]),
-            destinations: variables(vec![destination]),
+            expressions: expressions(self.alloc, vec![expression]),
+            destinations: variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
 
         Ok((
-            node(Node::Assignment(Box::new(assignment))),
+            self.node(Node::Assignment(self.payload(assignment))),
             vec![expression],
         ))
     }
 
-    fn build_knil(&mut self, addr: u32, instruction: Ins) -> Result<(NodeRef, Vec<NodeRef>)> {
+    fn build_knil(
+        &mut self,
+        addr: u32,
+        instruction: Ins,
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let mut assignment = self.build_range_assignment(addr, instruction.a, instruction.cd);
-        let primitive = node(Node::Primitive(Primitive {
-            kind: PrimitiveKind::Nil,
-        }));
-        assignment.expressions = expressions(vec![primitive.clone()]);
+        let primitive = primitive(self.alloc, PrimitiveKind::Nil);
+        assignment.expressions = expressions(self.alloc, vec![primitive]);
         Ok((
-            node(Node::Assignment(Box::new(assignment))),
+            self.node(Node::Assignment(self.payload(assignment))),
             vec![primitive],
         ))
     }
@@ -681,17 +736,17 @@ impl Builder<'_> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef, Vec<NodeRef>)> {
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let variable = self.build_global_variable(instruction.cd);
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: expressions(vec![expression.clone()]),
-            destinations: variables(vec![variable]),
+            expressions: expressions(self.alloc, vec![expression]),
+            destinations: variables(self.alloc, vec![variable]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
         Ok((
-            node(Node::Assignment(Box::new(assignment))),
+            self.node(Node::Assignment(self.payload(assignment))),
             vec![expression],
         ))
     }
@@ -700,17 +755,17 @@ impl Builder<'_> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef, Vec<NodeRef>)> {
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let destination = self.build_table_element(addr, &instruction)?;
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: expressions(vec![expression.clone()]),
-            destinations: variables(vec![destination]),
+            expressions: expressions(self.alloc, vec![expression]),
+            destinations: variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
         Ok((
-            node(Node::Assignment(Box::new(assignment))),
+            self.node(Node::Assignment(self.payload(assignment))),
             vec![expression],
         ))
     }
@@ -719,68 +774,76 @@ impl Builder<'_> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef, Vec<NodeRef>)> {
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let base = instruction.a;
-        let destination = node(Node::TableElement(Box::new(TableElement {
-            table: self.build_slot(addr, base.wrapping_sub(1)),
-            key: node(Node::MulTres),
+        let table = self.build_slot(addr, base.wrapping_sub(1));
+        let destination = self.node(Node::TableElement(self.payload(TableElement {
+            table,
+            key: self.node(Node::MulTres),
             meta: Meta::default(),
         })));
-        let multres = node(Node::MulTres);
+        let multres = self.node(Node::MulTres);
         let assignment = Assignment {
-            expressions: expressions(vec![multres.clone()]),
-            destinations: variables(vec![destination]),
+            expressions: expressions(self.alloc, vec![multres]),
+            destinations: variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
-        Ok((node(Node::Assignment(Box::new(assignment))), vec![multres]))
+        Ok((
+            self.node(Node::Assignment(self.payload(assignment))),
+            vec![multres],
+        ))
     }
 
     fn build_call(
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<Option<(NodeRef, Vec<NodeRef>)>> {
-        let call = node(Node::FunctionCall(Box::new(FunctionCall {
-            function: self.build_slot(addr, instruction.a),
-            arguments: self.build_call_arguments(addr, &instruction),
+    ) -> Result<Option<(NodeRef<'a>, Vec<NodeRef<'a>>)>> {
+        let function = self.build_slot(addr, instruction.a);
+        let arguments = self.build_call_arguments(addr, &instruction);
+        let call = self.node(Node::FunctionCall(self.payload(FunctionCall {
+            function,
+            arguments,
             is_method: false,
             meta: Meta::default(),
         })));
 
-        let mut marked = vec![call.clone()];
+        let mut marked = vec![call];
 
         let statement = if instruction.op <= Opcode::CALL {
             if instruction.b == 0 {
+                let destinations = variables(self.alloc, vec![self.node(Node::MulTres)]);
                 let assignment = Assignment {
-                    expressions: expressions(vec![call.clone()]),
-                    destinations: variables(vec![node(Node::MulTres)]),
+                    expressions: expressions(self.alloc, vec![call]),
+                    destinations,
                     kind: AssignmentKind::Normal,
                     meta: Meta::default(),
                 };
-                node(Node::Assignment(Box::new(assignment)))
+                self.node(Node::Assignment(self.payload(assignment)))
             } else if instruction.b == 1 {
                 call
             } else {
                 let from_slot = instruction.a;
                 let to_slot = instruction.a + instruction.b - 2;
                 let mut assignment = self.build_range_assignment(addr, from_slot, to_slot);
-                assignment.expressions = expressions(vec![call.clone()]);
-                node(Node::Assignment(Box::new(assignment)))
+                assignment.expressions = expressions(self.alloc, vec![call]);
+                self.node(Node::Assignment(self.payload(assignment)))
             }
         } else {
-            let return_node = node(Node::Return(Box::new(Return {
-                returns: expressions(vec![call.clone()]),
+            let returns = expressions(self.alloc, vec![call]);
+            let return_node = self.node(Node::Return(self.payload(Return {
+                returns,
                 meta: Meta::default(),
             })));
-            marked.push(return_node.clone());
+            marked.push(return_node);
             return_node
         };
 
         Ok(Some((statement, marked)))
     }
 
-    fn build_call_arguments(&mut self, addr: u32, instruction: &Ins) -> NodeRef {
+    fn build_call_arguments(&mut self, addr: u32, instruction: &Ins) -> NodeRef<'a> {
         let base = instruction.a;
         let is_variadic = matches!(instruction.op, Opcode::CALLM | Opcode::CALLMT);
         let mut last_argument_slot = i64::from(base) + i64::from(instruction.cd);
@@ -803,34 +866,46 @@ impl Builder<'_> {
             slot += 1;
         }
         if is_variadic {
-            arguments.push(node(Node::MulTres));
+            arguments.push(self.node(Node::MulTres));
         }
 
-        expressions(arguments)
+        expressions(self.alloc, arguments)
     }
 
-    fn build_vararg(&mut self, addr: u32, instruction: Ins) -> Result<(NodeRef, Vec<NodeRef>)> {
+    fn build_vararg(
+        &mut self,
+        addr: u32,
+        instruction: Ins,
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let base = instruction.a;
         let last_slot = i64::from(base) + i64::from(instruction.b) - 2;
-        let vararg = node(Node::Vararg);
+        let vararg = self.node(Node::Vararg);
 
         let assignment = if last_slot < i64::from(base) {
+            let destinations = variables(self.alloc, vec![self.node(Node::MulTres)]);
             Assignment {
-                expressions: expressions(vec![vararg.clone()]),
-                destinations: variables(vec![node(Node::MulTres)]),
+                expressions: expressions(self.alloc, vec![vararg]),
+                destinations,
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             }
         } else {
             let mut assignment = self.build_range_assignment(addr, base, last_slot as u32);
-            assignment.expressions = expressions(vec![vararg.clone()]);
+            assignment.expressions = expressions(self.alloc, vec![vararg]);
             assignment
         };
 
-        Ok((node(Node::Assignment(Box::new(assignment))), vec![vararg]))
+        Ok((
+            self.node(Node::Assignment(self.payload(assignment))),
+            vec![vararg],
+        ))
     }
 
-    fn build_return(&mut self, addr: u32, instruction: Ins) -> Result<(NodeRef, Vec<NodeRef>)> {
+    fn build_return(
+        &mut self,
+        addr: u32,
+        instruction: Ins,
+    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let base = instruction.a;
         let mut last_slot = i64::from(base) + i64::from(instruction.cd) - 1;
         if instruction.op != Opcode::RETM {
@@ -844,20 +919,26 @@ impl Builder<'_> {
             slot += 1;
         }
         if instruction.op == Opcode::RETM {
-            returns.push(node(Node::MulTres));
+            returns.push(self.node(Node::MulTres));
         }
 
-        let return_node = node(Node::Return(Box::new(Return {
-            returns: expressions(returns.clone()),
+        let returns_node = expressions(self.alloc, returns.iter().copied());
+        let return_node = self.node(Node::Return(self.payload(Return {
+            returns: returns_node,
             meta: Meta::default(),
         })));
 
-        let mut marked = vec![return_node.clone()];
+        let mut marked = vec![return_node];
         marked.extend(returns);
         Ok((return_node, marked))
     }
 
-    fn build_range_assignment(&mut self, addr: u32, from_slot: u32, to_slot: u32) -> Assignment {
+    fn build_range_assignment(
+        &mut self,
+        addr: u32,
+        from_slot: u32,
+        to_slot: u32,
+    ) -> Assignment<'a> {
         let mut destinations = Vec::new();
         let mut slot = from_slot;
         while slot <= to_slot {
@@ -865,8 +946,8 @@ impl Builder<'_> {
             slot += 1;
         }
         Assignment {
-            expressions: expressions(Vec::new()),
-            destinations: variables(destinations),
+            expressions: expressions(self.alloc, Vec::new()),
+            destinations: variables(self.alloc, destinations),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         }
@@ -874,7 +955,7 @@ impl Builder<'_> {
 
     // -- expressions -------------------------------------------------------
 
-    fn build_binary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_binary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let kind = binary_operator_kind(instruction.op)
             .ok_or_else(|| self.malformed("unknown binary operator"))?;
 
@@ -895,7 +976,7 @@ impl Builder<'_> {
             )
         };
 
-        Ok(node(Node::BinaryOperator(Box::new(BinaryOperator {
+        Ok(self.node(Node::BinaryOperator(self.payload(BinaryOperator {
             kind,
             left,
             right,
@@ -903,12 +984,13 @@ impl Builder<'_> {
         }))))
     }
 
-    fn build_bitop_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_bitop_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let kind = match instruction.op {
             Opcode::BNOT => {
-                return Ok(node(Node::UnaryOperator(Box::new(UnaryOperator {
+                let operand = self.build_slot(addr, instruction.cd);
+                return Ok(self.node(Node::UnaryOperator(self.payload(UnaryOperator {
                     kind: UnaryOperatorKind::BitNot,
-                    operand: self.build_slot(addr, instruction.cd),
+                    operand,
                     meta: Meta::default(),
                 }))));
             }
@@ -921,15 +1003,17 @@ impl Builder<'_> {
             _ => return Err(self.malformed("unknown bit operator")),
         };
 
-        Ok(node(Node::BinaryOperator(Box::new(BinaryOperator {
+        let left = self.build_slot(addr, instruction.b);
+        let right = self.build_slot(addr, instruction.cd);
+        Ok(self.node(Node::BinaryOperator(self.payload(BinaryOperator {
             kind,
-            left: self.build_slot(addr, instruction.b),
-            right: self.build_slot(addr, instruction.cd),
+            left,
+            right,
             meta: Meta::default(),
         }))))
     }
 
-    fn build_concat_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_concat_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let mut slot = instruction.b;
         let mut operator = BinaryOperator {
             kind: BinaryOperatorKind::Concat,
@@ -940,19 +1024,21 @@ impl Builder<'_> {
         slot += 2;
 
         while slot <= instruction.cd {
+            let left = self.node(Node::BinaryOperator(self.payload(operator)));
+            let right = self.build_slot(addr, slot);
             operator = BinaryOperator {
                 kind: BinaryOperatorKind::Concat,
-                left: node(Node::BinaryOperator(Box::new(operator))),
-                right: self.build_slot(addr, slot),
+                left,
+                right,
                 meta: Meta::default(),
             };
             slot += 1;
         }
 
-        Ok(node(Node::BinaryOperator(Box::new(operator))))
+        Ok(self.node(Node::BinaryOperator(self.payload(operator))))
     }
 
-    fn build_const_expression(&mut self, instruction: &Ins) -> Result<NodeRef> {
+    fn build_const_expression(&mut self, instruction: &Ins) -> Result<NodeRef<'a>> {
         match instruction.def().c {
             Mode::Str => self.build_string_constant(instruction.cd),
             Mode::CData => self.build_cdata_constant(instruction.cd),
@@ -964,21 +1050,21 @@ impl Builder<'_> {
         }
     }
 
-    fn build_table_element(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_table_element(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let table = self.build_slot(addr, instruction.b);
         let key = if instruction.def().c == Mode::Var {
             self.build_slot(addr, instruction.cd)
         } else {
             self.build_const_expression(instruction)?
         };
-        Ok(node(Node::TableElement(Box::new(TableElement {
+        Ok(self.node(Node::TableElement(self.payload(TableElement {
             table,
             key,
             meta: Meta::default(),
         }))))
     }
 
-    fn build_comparison_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_comparison_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let left = self.build_slot(addr, instruction.a);
         let right = match instruction.def().c {
             Mode::Str => self.build_string_constant(instruction.cd)?,
@@ -1003,7 +1089,7 @@ impl Builder<'_> {
             _ => return Err(self.malformed("not a comparison instruction")),
         };
 
-        Ok(node(Node::BinaryOperator(Box::new(BinaryOperator {
+        Ok(self.node(Node::BinaryOperator(self.payload(BinaryOperator {
             kind,
             left,
             right,
@@ -1011,7 +1097,7 @@ impl Builder<'_> {
         }))))
     }
 
-    fn build_unary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef> {
+    fn build_unary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let variable = self.build_slot(addr, instruction.cd);
 
         // Mind the inversion: these copy the value unchanged and only test it.
@@ -1028,157 +1114,162 @@ impl Builder<'_> {
             _ => return Err(self.malformed("not a unary instruction")),
         };
 
-        Ok(node(Node::UnaryOperator(Box::new(UnaryOperator {
+        Ok(self.node(Node::UnaryOperator(self.payload(UnaryOperator {
             kind,
             operand: variable,
             meta: Meta::default(),
         }))))
     }
 
-    fn build_child(&mut self, index: u32) -> Result<NodeRef> {
+    fn build_child(&mut self, index: u32) -> Result<NodeRef<'a>> {
         let child = match self.kgc(index)? {
-            Const::Child(child) => child.clone(),
+            Const::Child(child) => *child,
             _ => return Err(self.malformed("FNEW does not refer to a prototype")),
         };
-        build_function(self.chunk, &child)
+        build_function(self.alloc, self.chunk, child)
     }
 
-    fn build_table_copy(&mut self, index: u32) -> Result<NodeRef> {
+    fn build_table_copy(&mut self, index: u32) -> Result<NodeRef<'a>> {
         let table = match self.kgc(index)? {
-            Const::Table(table) => table.clone(),
+            Const::Table(table) => table,
             _ => return Err(self.malformed("TDUP does not refer to a table")),
         };
 
         let mut array = Vec::new();
         for value in &table.array {
-            array.push(node(Node::ArrayRecord(Box::new(ArrayRecord {
-                value: self.build_table_record_item(value),
+            let value = self.build_table_record_item(value);
+            array.push(self.node(Node::ArrayRecord(self.payload(ArrayRecord {
+                value,
                 meta: Meta::default(),
             }))));
         }
 
         let mut hash = Vec::new();
         for (key, value) in &table.hash {
-            hash.push(node(Node::TableRecord(Box::new(TableRecord {
+            hash.push(self.node(Node::TableRecord(self.payload(TableRecord {
                 key: self.build_table_record_item(key),
                 value: self.build_table_record_item(value),
                 meta: Meta::default(),
             }))));
         }
 
-        Ok(node(Node::TableConstructor(Box::new(TableConstructor {
-            array: records(array),
-            records: records(hash),
-            meta: Meta::default(),
-        }))))
+        Ok(
+            self.node(Node::TableConstructor(self.payload(TableConstructor {
+                array: records(self.alloc, array),
+                records: records(self.alloc, hash),
+                meta: Meta::default(),
+            }))),
+        )
     }
 
-    fn build_table_record_item(&self, value: &ConstKey) -> NodeRef {
+    fn build_table_record_item(&self, value: &ConstKey<'a>) -> NodeRef<'a> {
         match value {
-            ConstKey::Nil | ConstKey::KeyMarker => node(Node::Primitive(Primitive {
-                kind: PrimitiveKind::Nil,
-            })),
-            ConstKey::False => node(Node::Primitive(Primitive {
-                kind: PrimitiveKind::False,
-            })),
-            ConstKey::True => node(Node::Primitive(Primitive {
-                kind: PrimitiveKind::True,
-            })),
-            ConstKey::Int(number) => node(Node::Constant(Box::new(Constant {
+            ConstKey::Nil | ConstKey::KeyMarker => primitive(self.alloc, PrimitiveKind::Nil),
+            ConstKey::False => primitive(self.alloc, PrimitiveKind::False),
+            ConstKey::True => primitive(self.alloc, PrimitiveKind::True),
+            ConstKey::Int(number) => self.node(Node::Constant(self.payload(Constant {
                 value: ConstantValue::Integer(*number),
                 meta: Meta::default(),
             }))),
-            ConstKey::Float(number) => node(Node::Constant(Box::new(Constant {
+            ConstKey::Float(number) => self.node(Node::Constant(self.payload(Constant {
                 value: ConstantValue::Float(*number),
                 meta: Meta::default(),
             }))),
-            ConstKey::Str(bytes) => node(Node::Constant(Box::new(Constant {
-                value: ConstantValue::String(bytes.clone()),
+            // A template table borrows its strings from the prototype instead
+            // of copying them into the arena.
+            ConstKey::Str(bytes) => self.node(Node::Constant(self.payload(Constant {
+                value: ConstantValue::String(bytes),
                 meta: Meta::default(),
             }))),
         }
     }
 
-    fn build_slot(&self, addr: u32, slot: u32) -> NodeRef {
-        node(Node::Identifier(Box::new(Identifier::new(
-            IdentifierKind::Slot,
+    fn build_slot(&self, addr: u32, slot: u32) -> NodeRef<'a> {
+        let identifier =
+            Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::new(addr, 0));
+        self.node(Node::Identifier(self.payload(identifier)))
+    }
+
+    fn build_upvalue(&self, addr: u32, slot: u32) -> NodeRef<'a> {
+        let name = self.prototype.debug.upvalue_name(slot);
+        let mut identifier = Identifier::new(
+            self.alloc,
+            IdentifierKind::Upvalue,
             slot,
             Meta::new(addr, 0),
-        ))))
-    }
-
-    fn build_upvalue(&self, addr: u32, slot: u32) -> NodeRef {
-        let name = self.prototype.debug.upvalue_name(slot).map(str::to_string);
-        let mut identifier = Identifier::new(IdentifierKind::Upvalue, slot, Meta::new(addr, 0));
+        );
         identifier.name = name;
-        node(Node::Identifier(Box::new(identifier)))
+        self.node(Node::Identifier(self.payload(identifier)))
     }
 
-    fn build_global_variable(&self, index: u32) -> NodeRef {
-        let mut identifier = Identifier::new(IdentifierKind::Builtin, 0, Meta::default());
-        identifier.name = Some("_env".to_string());
-        let table = node(Node::Identifier(Box::new(identifier)));
-        let key = self.build_string_constant(index).unwrap_or_else(|_| {
-            node(Node::Constant(Box::new(Constant {
-                value: ConstantValue::String(Box::new([])),
-                meta: Meta::default(),
-            })))
-        });
-        node(Node::TableElement(Box::new(TableElement {
+    fn build_global_variable(&self, index: u32) -> NodeRef<'a> {
+        let mut identifier =
+            Identifier::new(self.alloc, IdentifierKind::Builtin, 0, Meta::default());
+        identifier.name = Some("_env");
+        let table = self.node(Node::Identifier(self.payload(identifier)));
+        let empty = self.node(Node::Constant(self.payload(Constant {
+            value: ConstantValue::String(&[]),
+            meta: Meta::default(),
+        })));
+        let key = self.build_string_constant(index).unwrap_or(empty);
+        self.node(Node::TableElement(self.payload(TableElement {
             table,
             key,
             meta: Meta::default(),
         })))
     }
 
-    fn build_string_constant(&self, index: u32) -> Result<NodeRef> {
+    fn build_string_constant(&self, index: u32) -> Result<NodeRef<'a>> {
         match self.kgc(index)? {
-            Const::Str(bytes) => Ok(node(Node::Constant(Box::new(Constant {
-                value: ConstantValue::String(bytes.clone()),
+            // The string is borrowed from the prototype's constants rather than
+            // copied into the arena.
+            Const::Str(bytes) => Ok(self.node(Node::Constant(self.payload(Constant {
+                value: ConstantValue::String(bytes),
                 meta: Meta::default(),
             })))),
             _ => Err(self.malformed("expected a string constant")),
         }
     }
 
-    fn build_cdata_constant(&self, index: u32) -> Result<NodeRef> {
+    fn build_cdata_constant(&self, index: u32) -> Result<NodeRef<'a>> {
         let value = match self.kgc(index)? {
             Const::Int64(number) => number.to_string(),
             Const::Uint64(number) => number.to_string(),
             Const::Complex(real, imaginary) => format!("{real}+{imaginary}i"),
             _ => return Err(self.malformed("expected a cdata constant")),
         };
-        Ok(node(Node::Constant(Box::new(Constant {
-            value: ConstantValue::CData(value.into_bytes().into()),
+        let bytes = self.alloc.alloc_slice_copy(value.as_bytes());
+        Ok(self.node(Node::Constant(self.payload(Constant {
+            value: ConstantValue::CData(bytes),
             meta: Meta::default(),
         }))))
     }
 
-    fn build_numeric_constant(&self, index: u32) -> Result<NodeRef> {
+    fn build_numeric_constant(&self, index: u32) -> Result<NodeRef<'a>> {
         let value = match self.knum(index)? {
             NumConst::Int(number) => ConstantValue::Integer(number),
             NumConst::Float(number) => ConstantValue::Float(number),
         };
-        Ok(node(Node::Constant(Box::new(Constant {
+        Ok(self.node(Node::Constant(self.payload(Constant {
             value,
             meta: Meta::default(),
         }))))
     }
 
-    fn build_literal(&self, value: i64) -> NodeRef {
-        node(Node::Constant(Box::new(Constant {
+    fn build_literal(&self, value: i64) -> NodeRef<'a> {
+        self.node(Node::Constant(self.payload(Constant {
             value: ConstantValue::Integer(value as i32),
             meta: Meta::default(),
         })))
     }
 
-    fn build_primitive(&self, value: u64) -> NodeRef {
+    fn build_primitive(&self, value: u64) -> NodeRef<'a> {
         let kind = match value {
             1 => PrimitiveKind::False,
             2 => PrimitiveKind::True,
             _ => PrimitiveKind::Nil,
         };
-        node(Node::Primitive(Primitive { kind }))
+        primitive(self.alloc, kind)
     }
 
     // -- instruction repair passes -----------------------------------------
@@ -1476,7 +1567,7 @@ fn binary_operator_kind(op: Opcode) -> Option<BinaryOperatorKind> {
     })
 }
 
-fn block_index(block: &NodeRef) -> u32 {
+fn block_index(block: NodeRef<'_>) -> u32 {
     match &*block.borrow() {
         Node::Block(block) => block.index,
         _ => 0,

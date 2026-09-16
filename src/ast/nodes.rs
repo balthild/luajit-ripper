@@ -1,20 +1,34 @@
 //! The decompiler's intermediate representation.
 //!
-//! The representation mirrors ljd's AST: every node is reference counted so
-//! that passes can hold on to a node, compare identities and rewrite nodes in
-//! place, exactly like the Python implementation does with its objects.
+//! The representation mirrors ljd's AST: every node lives in an
+//! [`oxc_allocator::Allocator`] and passes hold [`NodeRef`]s to it, so that they
+//! can hold on to a node, compare identities and rewrite nodes in place, exactly
+//! like the Python implementation does with its objects. Because the nodes are
+//! arena allocated, the control flow graph's cycles cost nothing to free: the
+//! whole arena is released at once when the decompiler is done with it.
 //!
 //! Child nodes are always [`NodeRef`]s, including lists: a statement list is a
 //! node of its own so that a pass can find it and rewrite its contents.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
+
+use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::bytecode::DebugInfo;
 
 /// A shared, mutable AST node.
-pub type NodeRef = Rc<RefCell<Node>>;
+///
+/// Nodes are allocated in an arena and never freed individually, so a plain
+/// shared reference to a [`RefCell`] is all that is needed: identity is the
+/// address of the node, and the borrow flag is what keeps the passes honest.
+pub type NodeRef<'a> = &'a RefCell<Node<'a>>;
+
+/// Wraps a node into an arena allocated node.
+pub fn node<'a>(alloc: &'a Allocator, node: Node<'a>) -> NodeRef<'a> {
+    alloc.alloc(RefCell::new(node))
+}
 
 /// Where a node came from in the bytecode.
 ///
@@ -43,122 +57,146 @@ impl Meta {
     }
 }
 
-/// Wraps a node into a reference counted node.
-pub fn node(node: Node) -> NodeRef {
-    Rc::new(RefCell::new(node))
-}
-
 /// Creates a statement list node.
-pub fn statements(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::Statements(contents))
+pub fn statements<'a>(
+    alloc: &'a Allocator,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) -> NodeRef<'a> {
+    node(
+        alloc,
+        Node::Statements(ArenaVec::from_iter_in(contents, &alloc)),
+    )
 }
 
 /// Creates an expression list node.
-pub fn expressions(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::Expressions(contents))
+pub fn expressions<'a>(
+    alloc: &'a Allocator,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) -> NodeRef<'a> {
+    node(
+        alloc,
+        Node::Expressions(ArenaVec::from_iter_in(contents, &alloc)),
+    )
 }
 
 /// Creates a variable list node.
-pub fn variables(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::Variables(contents))
+pub fn variables<'a>(
+    alloc: &'a Allocator,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) -> NodeRef<'a> {
+    node(
+        alloc,
+        Node::Variables(ArenaVec::from_iter_in(contents, &alloc)),
+    )
 }
 
 /// Creates an identifier list node.
-pub fn identifiers(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::Identifiers(contents))
+pub fn identifiers<'a>(
+    alloc: &'a Allocator,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) -> NodeRef<'a> {
+    node(
+        alloc,
+        Node::Identifiers(ArenaVec::from_iter_in(contents, &alloc)),
+    )
 }
 
 /// Creates a record list node.
-pub fn records(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::Records(contents))
+pub fn records<'a>(
+    alloc: &'a Allocator,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) -> NodeRef<'a> {
+    node(
+        alloc,
+        Node::Records(ArenaVec::from_iter_in(contents, &alloc)),
+    )
 }
 
 /// Creates a `nil`, `true` or `false` node.
-pub fn primitive(kind: PrimitiveKind) -> NodeRef {
-    node(Node::Primitive(Primitive { kind }))
+pub fn primitive<'a>(alloc: &'a Allocator, kind: PrimitiveKind) -> NodeRef<'a> {
+    node(alloc, Node::Primitive(Primitive { kind }))
 }
-
 /// Every kind of node the decompiler knows about.
 #[derive(Debug)]
-pub enum Node {
+pub enum Node<'a> {
     // -- lists -------------------------------------------------------------
     /// A list of statements.
-    Statements(Vec<NodeRef>),
+    Statements(ArenaVec<'a, NodeRef<'a>>),
     /// A list of expressions.
-    Expressions(Vec<NodeRef>),
+    Expressions(ArenaVec<'a, NodeRef<'a>>),
     /// A list of assignable variables.
-    Variables(Vec<NodeRef>),
+    Variables(ArenaVec<'a, NodeRef<'a>>),
     /// A list of identifiers.
-    Identifiers(Vec<NodeRef>),
+    Identifiers(ArenaVec<'a, NodeRef<'a>>),
     /// A list of table constructor records.
-    Records(Vec<NodeRef>),
+    Records(ArenaVec<'a, NodeRef<'a>>),
 
     // -- statements --------------------------------------------------------
     /// An assignment; `kind` distinguishes `local x = 1` from `x = 1`.
-    Assignment(Box<Assignment>),
+    Assignment(ArenaBox<'a, Assignment<'a>>),
     /// A function call used as a statement.
-    FunctionCall(Box<FunctionCall>),
+    FunctionCall(ArenaBox<'a, FunctionCall<'a>>),
     /// A `return` statement.
-    Return(Box<Return>),
+    Return(ArenaBox<'a, Return<'a>>),
     /// A `break` statement.
     Break,
     /// A no-op, used as a placeholder for empty blocks.
-    NoOp(Box<NoOp>),
+    NoOp(ArenaBox<'a, NoOp>),
     /// An `if` statement.
-    If(Box<If>),
+    If(ArenaBox<'a, If<'a>>),
     /// A `while` loop.
-    While(Box<While>),
+    While(ArenaBox<'a, While<'a>>),
     /// A `repeat ... until` loop.
-    RepeatUntil(Box<RepeatUntil>),
+    RepeatUntil(ArenaBox<'a, RepeatUntil<'a>>),
     /// A numeric `for` loop.
-    NumericFor(Box<NumericFor>),
+    NumericFor(ArenaBox<'a, NumericFor<'a>>),
     /// A generic `for ... in` loop.
-    IteratorFor(Box<IteratorFor>),
+    IteratorFor(ArenaBox<'a, IteratorFor<'a>>),
     /// A `function ... end` definition, as a statement or as an expression.
-    FunctionDefinition(Box<FunctionDefinition>),
+    FunctionDefinition(ArenaBox<'a, FunctionDefinition<'a>>),
     /// An `elseif` branch.
-    ElseIf(Box<ElseIf>),
+    ElseIf(ArenaBox<'a, ElseIf<'a>>),
 
     // -- expressions -------------------------------------------------------
     /// A variable reference.
-    Identifier(Box<Identifier>),
+    Identifier(ArenaBox<'a, Identifier<'a>>),
     /// A table indexing expression.
-    TableElement(Box<TableElement>),
+    TableElement(ArenaBox<'a, TableElement<'a>>),
     /// A literal constant.
-    Constant(Box<Constant>),
+    Constant(ArenaBox<'a, Constant<'a>>),
     /// `nil`, `true` or `false`.
     Primitive(Primitive),
     /// A table constructor.
-    TableConstructor(Box<TableConstructor>),
+    TableConstructor(ArenaBox<'a, TableConstructor<'a>>),
     /// `...`
     Vararg,
     /// The result of a previous multi result call.
     MulTres,
     /// A binary operator.
-    BinaryOperator(Box<BinaryOperator>),
+    BinaryOperator(ArenaBox<'a, BinaryOperator<'a>>),
     /// A unary operator.
-    UnaryOperator(Box<UnaryOperator>),
+    UnaryOperator(ArenaBox<'a, UnaryOperator<'a>>),
     /// An array element inside a table constructor.
-    ArrayRecord(Box<ArrayRecord>),
+    ArrayRecord(ArenaBox<'a, ArrayRecord<'a>>),
     /// A key/value pair inside a table constructor.
-    TableRecord(Box<TableRecord>),
+    TableRecord(ArenaBox<'a, TableRecord<'a>>),
 
     // -- control flow graph ------------------------------------------------
     /// A basic block. Only present before unwarping.
-    Block(Box<Block>),
+    Block(ArenaBox<'a, Block<'a>>),
     /// An unconditional jump or fallthrough.
-    UnconditionalWarp(Box<UnconditionalWarp>),
+    UnconditionalWarp(ArenaBox<'a, UnconditionalWarp<'a>>),
     /// A conditional branch.
-    ConditionalWarp(Box<ConditionalWarp>),
+    ConditionalWarp(ArenaBox<'a, ConditionalWarp<'a>>),
     /// A generic `for ... in` loop head.
-    IteratorWarp(Box<IteratorWarp>),
+    IteratorWarp(ArenaBox<'a, IteratorWarp<'a>>),
     /// A numeric `for` loop head.
-    NumericLoopWarp(Box<NumericLoopWarp>),
+    NumericLoopWarp(ArenaBox<'a, NumericLoopWarp<'a>>),
     /// The end of a function.
-    EndWarp(Box<EndWarp>),
+    EndWarp(ArenaBox<'a, EndWarp<'a>>),
 }
 
-impl Node {
+impl<'a> Node<'a> {
     /// Human readable node kind, used in error messages.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -276,7 +314,7 @@ impl Node {
     }
 
     /// The contents of a list node.
-    pub fn list(&self) -> Option<&Vec<NodeRef>> {
+    pub fn list(&self) -> Option<&ArenaVec<'a, NodeRef<'a>>> {
         match self {
             Node::Statements(items)
             | Node::Expressions(items)
@@ -288,7 +326,7 @@ impl Node {
     }
 
     /// The contents of a list node, for mutation.
-    pub fn list_mut(&mut self) -> Option<&mut Vec<NodeRef>> {
+    pub fn list_mut(&mut self) -> Option<&mut ArenaVec<'a, NodeRef<'a>>> {
         match self {
             Node::Statements(items)
             | Node::Expressions(items)
@@ -300,7 +338,7 @@ impl Node {
     }
 
     /// The identifier payload, if this is an identifier.
-    pub fn identifier(&self) -> Option<&Identifier> {
+    pub fn identifier(&self) -> Option<&Identifier<'a>> {
         match self {
             Node::Identifier(identifier) => Some(identifier),
             _ => None,
@@ -308,7 +346,7 @@ impl Node {
     }
 }
 
-impl fmt::Display for Node {
+impl fmt::Display for Node<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Node::Identifier(identifier) => f.write_str(&identifier.name_or_slot()),
@@ -318,18 +356,32 @@ impl fmt::Display for Node {
 }
 
 /// Reads the contents of a list node.
-pub fn list_contents(node: &NodeRef) -> Vec<NodeRef> {
-    node.borrow().list().cloned().unwrap_or_default()
+///
+/// The copy is a plain `Vec`: it is a snapshot the caller works on, not part of
+/// the tree.
+pub fn list_contents<'a>(node: NodeRef<'a>) -> Vec<NodeRef<'a>> {
+    match node.borrow().list() {
+        Some(items) => items.iter().copied().collect(),
+        None => Vec::new(),
+    }
 }
+
 /// Replaces the contents of a list node.
-pub fn set_list_contents(node: &NodeRef, contents: Vec<NodeRef>) {
+pub fn set_list_contents<'a>(
+    alloc: &'a Allocator,
+    node: NodeRef<'a>,
+    contents: impl IntoIterator<Item = NodeRef<'a>>,
+) {
     if let Some(items) = node.borrow_mut().list_mut() {
-        *items = contents;
+        *items = ArenaVec::from_iter_in(contents, &alloc);
     }
 }
 
 /// Appends to a list node.
-pub fn push(node: &NodeRef, child: NodeRef) {
+///
+/// The list already knows the arena it was allocated in, so no allocator is
+/// needed here.
+pub fn push<'a>(node: NodeRef<'a>, child: NodeRef<'a>) {
     if let Some(items) = node.borrow_mut().list_mut() {
         items.push(child);
     }
@@ -338,21 +390,21 @@ pub fn push(node: &NodeRef, child: NodeRef) {
 /// Replaces the metadata of a node.
 ///
 /// Nodes that carry no metadata of their own are left alone.
-pub fn set_meta(node: &NodeRef, meta: Meta) {
+pub fn set_meta<'a>(node: NodeRef<'a>, meta: Meta) {
     if let Some(target) = node.borrow_mut().meta_mut() {
         *target = meta;
     }
 }
 
 /// Records that a pass gave up on `node`.
-pub fn mark_error(node: &NodeRef) {
+pub fn mark_error<'a>(node: NodeRef<'a>) {
     if let Some(meta) = node.borrow_mut().meta_mut() {
         meta.error_here = true;
     }
 }
 
 /// Whether a pass gave up on `node`.
-pub fn has_error(node: &NodeRef) -> bool {
+pub fn has_error<'a>(node: NodeRef<'a>) -> bool {
     node.borrow().meta().is_some_and(|meta| meta.error_here)
 }
 
@@ -367,90 +419,93 @@ pub enum AssignmentKind {
 
 /// An assignment statement.
 #[derive(Debug)]
-pub struct Assignment {
-    pub expressions: NodeRef,
-    pub destinations: NodeRef,
+pub struct Assignment<'a> {
+    pub expressions: NodeRef<'a>,
+    pub destinations: NodeRef<'a>,
     pub kind: AssignmentKind,
     pub meta: Meta,
 }
 
 /// A function call.
 #[derive(Debug)]
-pub struct FunctionCall {
-    pub function: NodeRef,
-    pub arguments: NodeRef,
+pub struct FunctionCall<'a> {
+    pub function: NodeRef<'a>,
+    pub arguments: NodeRef<'a>,
     pub is_method: bool,
     pub meta: Meta,
 }
 
 /// A `return` statement.
 #[derive(Debug)]
-pub struct Return {
-    pub returns: NodeRef,
+pub struct Return<'a> {
+    pub returns: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// An `if` statement.
 #[derive(Debug)]
-pub struct If {
-    pub expression: NodeRef,
-    pub then_block: NodeRef,
-    pub elseifs: Vec<NodeRef>,
-    pub else_block: NodeRef,
+pub struct If<'a> {
+    pub expression: NodeRef<'a>,
+    pub then_block: NodeRef<'a>,
+    pub elseifs: ArenaVec<'a, NodeRef<'a>>,
+    pub else_block: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// An `elseif` branch.
 #[derive(Debug)]
-pub struct ElseIf {
-    pub expression: NodeRef,
-    pub then_block: NodeRef,
+pub struct ElseIf<'a> {
+    pub expression: NodeRef<'a>,
+    pub then_block: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A `while` loop.
 #[derive(Debug)]
-pub struct While {
-    pub expression: NodeRef,
-    pub statements: NodeRef,
+pub struct While<'a> {
+    pub expression: NodeRef<'a>,
+    pub statements: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A `repeat ... until` loop.
 #[derive(Debug)]
-pub struct RepeatUntil {
-    pub expression: NodeRef,
-    pub statements: NodeRef,
+pub struct RepeatUntil<'a> {
+    pub expression: NodeRef<'a>,
+    pub statements: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A numeric `for` loop.
 #[derive(Debug)]
-pub struct NumericFor {
-    pub variable: NodeRef,
-    pub expressions: NodeRef,
-    pub statements: NodeRef,
+pub struct NumericFor<'a> {
+    pub variable: NodeRef<'a>,
+    pub expressions: NodeRef<'a>,
+    pub statements: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A generic `for ... in` loop.
 #[derive(Debug)]
-pub struct IteratorFor {
-    pub identifiers: NodeRef,
-    pub expressions: NodeRef,
-    pub statements: NodeRef,
+pub struct IteratorFor<'a> {
+    pub identifiers: NodeRef<'a>,
+    pub expressions: NodeRef<'a>,
+    pub statements: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A function definition.
 #[derive(Debug)]
-pub struct FunctionDefinition {
-    pub arguments: NodeRef,
-    pub statements: NodeRef,
+pub struct FunctionDefinition<'a> {
+    pub arguments: NodeRef<'a>,
+    pub statements: NodeRef<'a>,
     /// Raw upvalue references of the prototype.
-    pub upvalues: Vec<u16>,
+    pub upvalues: ArenaVec<'a, u16>,
     /// Debug information of the prototype.
-    pub debug: Rc<DebugInfo>,
+    ///
+    /// This is shared with the prototype the function was built from rather
+    /// than copied, because every instruction of the function points into it.
+    pub debug: &'a DebugInfo<'a>,
     /// Number of instructions, header included.
     pub instruction_count: usize,
     pub meta: Meta,
@@ -471,44 +526,44 @@ pub enum IdentifierKind {
 
 /// A variable reference.
 #[derive(Debug)]
-pub struct Identifier {
+pub struct Identifier<'a> {
     pub kind: IdentifierKind,
     /// Name, once one is known.
-    pub name: Option<String>,
+    pub name: Option<&'a str>,
     pub slot: u32,
     /// Identifier of the assignment this value came from, filled in by the
     /// slot handling passes.
     pub id: Option<u32>,
     /// Identifiers a reference may refer to, when the slot handling passes
     /// cannot pin down a single one.
-    pub possible_ids: Vec<u32>,
+    pub possible_ids: ArenaVec<'a, u32>,
     /// First address the local variable that named this identifier is dead at.
     pub local_end: Option<u32>,
     pub meta: Meta,
 }
 
-impl Identifier {
-    pub fn new(kind: IdentifierKind, slot: u32, meta: Meta) -> Self {
+impl<'a> Identifier<'a> {
+    pub fn new(alloc: &'a Allocator, kind: IdentifierKind, slot: u32, meta: Meta) -> Self {
         Identifier {
             kind,
             name: None,
             slot,
             id: None,
-            possible_ids: Vec::new(),
+            possible_ids: ArenaVec::new_in(&alloc),
             local_end: None,
             meta,
         }
     }
 
     /// The name to print, falling back to a synthetic one.
-    pub fn name_or_slot(&self) -> String {
-        if let Some(name) = &self.name {
-            return name.clone();
+    pub fn name_or_slot(&self) -> Cow<'a, str> {
+        if let Some(name) = self.name {
+            return Cow::Borrowed(name);
         }
         match self.kind {
-            IdentifierKind::Upvalue => format!("uv{}", self.slot),
-            IdentifierKind::Builtin => "_env".to_string(),
-            _ => format!("slot{}", self.slot),
+            IdentifierKind::Upvalue => Cow::Owned(format!("uv{}", self.slot)),
+            IdentifierKind::Builtin => Cow::Borrowed("_env"),
+            _ => Cow::Owned(format!("slot{}", self.slot)),
         }
     }
 
@@ -520,29 +575,29 @@ impl Identifier {
 
 /// A table indexing expression.
 #[derive(Debug)]
-pub struct TableElement {
-    pub table: NodeRef,
-    pub key: NodeRef,
+pub struct TableElement<'a> {
+    pub table: NodeRef<'a>,
+    pub key: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// The value of a literal constant.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ConstantValue {
+pub enum ConstantValue<'a> {
     /// An integer constant.
     Integer(i32),
     /// A floating point constant.
     Float(f64),
     /// A string constant, as raw bytes.
-    String(Box<[u8]>),
+    String(&'a [u8]),
     /// A `cdata` constant, already rendered.
-    CData(Box<[u8]>),
+    CData(&'a [u8]),
 }
 
 /// A literal constant.
 #[derive(Debug)]
-pub struct Constant {
-    pub value: ConstantValue,
+pub struct Constant<'a> {
+    pub value: ConstantValue<'a>,
     pub meta: Meta,
 }
 
@@ -562,33 +617,33 @@ pub struct Primitive {
 
 /// A table constructor.
 #[derive(Debug)]
-pub struct TableConstructor {
-    pub array: NodeRef,
-    pub records: NodeRef,
+pub struct TableConstructor<'a> {
+    pub array: NodeRef<'a>,
+    pub records: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// An array part entry of a table constructor.
 #[derive(Debug)]
-pub struct ArrayRecord {
-    pub value: NodeRef,
+pub struct ArrayRecord<'a> {
+    pub value: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A hash part entry of a table constructor.
 #[derive(Debug)]
-pub struct TableRecord {
-    pub key: NodeRef,
-    pub value: NodeRef,
+pub struct TableRecord<'a> {
+    pub key: NodeRef<'a>,
+    pub value: NodeRef<'a>,
     pub meta: Meta,
 }
 
 /// A binary operator.
 #[derive(Debug)]
-pub struct BinaryOperator {
+pub struct BinaryOperator<'a> {
     pub kind: BinaryOperatorKind,
-    pub left: NodeRef,
-    pub right: NodeRef,
+    pub left: NodeRef<'a>,
+    pub right: NodeRef<'a>,
     pub meta: Meta,
 }
 
@@ -696,9 +751,9 @@ pub enum Precedence {
 
 /// A unary operator.
 #[derive(Debug)]
-pub struct UnaryOperator {
+pub struct UnaryOperator<'a> {
     pub kind: UnaryOperatorKind,
-    pub operand: NodeRef,
+    pub operand: NodeRef<'a>,
     pub meta: Meta,
 }
 
@@ -751,7 +806,7 @@ impl UnaryOperatorKind {
 
 /// A basic block of the control flow graph.
 #[derive(Debug)]
-pub struct Block {
+pub struct Block<'a> {
     pub index: u32,
     pub first_address: u32,
     pub last_address: u32,
@@ -762,12 +817,12 @@ pub struct Block {
     pub warpins_count: u32,
     /// Whether the block contains a loop marker instruction.
     pub is_loop: bool,
-    pub contents: Vec<NodeRef>,
-    pub warp: Option<NodeRef>,
+    pub contents: ArenaVec<'a, NodeRef<'a>>,
+    pub warp: Option<NodeRef<'a>>,
 }
 
-impl Block {
-    pub fn new(index: u32, first_address: u32, last_address: u32) -> Self {
+impl<'a> Block<'a> {
+    pub fn new(alloc: &'a Allocator, index: u32, first_address: u32, last_address: u32) -> Self {
         Block {
             index,
             first_address,
@@ -775,7 +830,7 @@ impl Block {
             last_body_address: last_address,
             warpins_count: 0,
             is_loop: false,
-            contents: Vec::new(),
+            contents: ArenaVec::new_in(&alloc),
             warp: None,
         }
     }
@@ -796,29 +851,29 @@ pub struct NoOp {
 
 /// The end of a function.
 #[derive(Debug)]
-pub struct EndWarp {
+pub struct EndWarp<'a> {
     /// Where control would have gone, if the block that ends here had a warp
     /// that pointed somewhere. Keeping it lets the passes look through a
     /// region that has already been closed off.
-    pub target: Option<NodeRef>,
+    pub target: Option<NodeRef<'a>>,
     pub meta: Meta,
 }
 
 /// An unconditional jump or a fallthrough.
 #[derive(Debug)]
-pub struct UnconditionalWarp {
+pub struct UnconditionalWarp<'a> {
     pub kind: UnconditionalWarpKind,
-    pub target: Option<NodeRef>,
+    pub target: Option<NodeRef<'a>>,
     pub is_uclo: bool,
     pub meta: Meta,
 }
 
 /// A conditional branch.
 #[derive(Debug)]
-pub struct ConditionalWarp {
-    pub condition: Option<NodeRef>,
-    pub true_target: Option<NodeRef>,
-    pub false_target: Option<NodeRef>,
+pub struct ConditionalWarp<'a> {
+    pub condition: Option<NodeRef<'a>>,
+    pub true_target: Option<NodeRef<'a>>,
+    pub false_target: Option<NodeRef<'a>>,
     /// Register the condition was computed into.
     ///
     /// A comparison leaves the condition in no register at all, so this is
@@ -830,20 +885,20 @@ pub struct ConditionalWarp {
 
 /// A generic `for ... in` loop head.
 #[derive(Debug)]
-pub struct IteratorWarp {
-    pub variables: NodeRef,
-    pub controls: NodeRef,
-    pub body: Option<NodeRef>,
-    pub way_out: Option<NodeRef>,
+pub struct IteratorWarp<'a> {
+    pub variables: NodeRef<'a>,
+    pub controls: NodeRef<'a>,
+    pub body: Option<NodeRef<'a>>,
+    pub way_out: Option<NodeRef<'a>>,
     pub meta: Meta,
 }
 
 /// A numeric `for` loop head.
 #[derive(Debug)]
-pub struct NumericLoopWarp {
-    pub index: NodeRef,
-    pub controls: NodeRef,
-    pub body: Option<NodeRef>,
-    pub way_out: Option<NodeRef>,
+pub struct NumericLoopWarp<'a> {
+    pub index: NodeRef<'a>,
+    pub controls: NodeRef<'a>,
+    pub body: Option<NodeRef<'a>>,
+    pub way_out: Option<NodeRef<'a>>,
     pub meta: Meta,
 }

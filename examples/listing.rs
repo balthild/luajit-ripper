@@ -22,7 +22,8 @@ fn main() -> ExitCode {
         }
     };
 
-    match luajit_ripper::bytecode::parse(&data) {
+    let alloc = oxc_allocator::Allocator::default();
+    match luajit_ripper::bytecode::parse(&alloc, &data) {
         Ok(chunk) => {
             print!("{}", luajit_ripper::listing::dump(&chunk));
             ExitCode::SUCCESS

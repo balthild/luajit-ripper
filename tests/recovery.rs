@@ -7,70 +7,93 @@
 
 mod support;
 
-use std::rc::Rc;
-
 use luajit_ripper::ast::nodes::*;
 use luajit_ripper::ast::traverse;
 use luajit_ripper::bytecode::DebugInfo;
 use luajit_ripper::lua::writer;
+use oxc_allocator::{ArenaBox, ArenaVec};
+use support::arena;
 
 /// Builds a function definition holding `contents`.
-fn function(contents: Vec<NodeRef>) -> NodeRef {
-    node(Node::FunctionDefinition(Box::new(FunctionDefinition {
-        arguments: identifiers(Vec::new()),
-        statements: statements(contents),
-        upvalues: Vec::new(),
-        debug: Rc::new(DebugInfo::default()),
-        instruction_count: 0,
-        meta: Meta::default(),
-    })))
+fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
+    let alloc = arena();
+    node(
+        alloc,
+        Node::FunctionDefinition(ArenaBox::new_in(
+            FunctionDefinition {
+                arguments: identifiers(alloc, Vec::new()),
+                statements: statements(alloc, contents),
+                upvalues: ArenaVec::new_in(&alloc),
+                debug: alloc.alloc(DebugInfo::new_in(alloc)),
+                instruction_count: 0,
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    )
 }
 
 /// An assignment of `value` to the local `name`.
-fn assignment(name: &str, value: i32) -> NodeRef {
-    let destination = node(Node::Identifier(Box::new(Identifier::new(
-        IdentifierKind::Local,
-        0,
-        Meta::default(),
-    ))));
+fn assignment(name: &str, value: i32) -> NodeRef<'static> {
+    let alloc = arena();
+
+    let destination = node(
+        alloc,
+        Node::Identifier(ArenaBox::new_in(
+            Identifier::new(alloc, IdentifierKind::Local, 0, Meta::default()),
+            &alloc,
+        )),
+    );
     if let Node::Identifier(inner) = &mut *destination.borrow_mut() {
-        inner.name = Some(name.to_string());
+        inner.name = Some(alloc.alloc_str(name));
     }
 
-    let source = node(Node::Constant(Box::new(Constant {
-        value: ConstantValue::Integer(value),
-        meta: Meta::default(),
-    })));
+    let source = node(
+        alloc,
+        Node::Constant(ArenaBox::new_in(
+            Constant {
+                value: ConstantValue::Integer(value),
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    );
 
-    node(Node::Assignment(Box::new(Assignment {
-        expressions: expressions(vec![source]),
-        destinations: variables(vec![destination]),
-        kind: AssignmentKind::Normal,
-        meta: Meta::default(),
-    })))
+    node(
+        alloc,
+        Node::Assignment(ArenaBox::new_in(
+            Assignment {
+                expressions: expressions(alloc, vec![source]),
+                destinations: variables(alloc, vec![destination]),
+                kind: AssignmentKind::Normal,
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    )
 }
 
 /// Renders a function definition with the default options.
-fn render(function: &NodeRef) -> String {
-    writer::write_function(function, &writer::Options::default()).expect("renderable")
+fn render(function: NodeRef<'static>) -> String {
+    writer::write_function(arena(), function, &writer::Options::default()).expect("renderable")
 }
 
 #[test]
 fn a_marked_statement_is_pointed_out_in_the_output() {
     let statement = assignment("a", 1);
-    let root = function(vec![statement.clone()]);
+    let root = function(vec![statement]);
 
-    assert!(!has_error(&statement), "nothing has been marked yet");
-    let clean = render(&root);
+    assert!(!has_error(statement), "nothing has been marked yet");
+    let clean = render(root);
     assert!(
         !clean.contains("Decompilation error"),
         "an unmarked function must not carry the comment: {clean}"
     );
 
-    mark_error(&statement);
-    assert!(has_error(&statement), "the mark has to stick");
+    mark_error(statement);
+    assert!(has_error(statement), "the mark has to stick");
 
-    let marked = render(&root);
+    let marked = render(root);
     assert!(
         marked.contains("-- Decompilation error in this vicinity:"),
         "the mark has to reach the output: {marked}"
@@ -87,12 +110,12 @@ fn a_marker_survives_a_deep_clone() {
     // mark on the original has to come along, or the loss it records would be
     // reported in only one of the two places.
     let statement = assignment("a", 1);
-    mark_error(&statement);
+    mark_error(statement);
 
-    let copy = traverse::deep_clone(&statement);
-    assert!(has_error(&copy), "the copy carries the mark");
+    let copy = traverse::deep_clone(arena(), statement);
+    assert!(has_error(copy), "the copy carries the mark");
     assert!(
-        !Rc::ptr_eq(&statement, &copy),
+        !traverse::same_node(statement, copy),
         "the clone is a node of its own"
     );
 }
@@ -101,13 +124,13 @@ fn a_marker_survives_a_deep_clone() {
 fn marking_a_list_or_a_primitive_is_harmless() {
     // List nodes and `Primitive` have nowhere to keep a mark; asking for one
     // must not panic.
-    let list = statements(Vec::new());
-    let primitive = primitive(PrimitiveKind::Nil);
+    let list = statements(arena(), Vec::new());
+    let primitive = primitive(arena(), PrimitiveKind::Nil);
 
-    assert!(!has_error(&list));
-    mark_error(&list);
-    assert!(!has_error(&list));
+    assert!(!has_error(list));
+    mark_error(list);
+    assert!(!has_error(list));
 
-    mark_error(&primitive);
-    assert!(!has_error(&primitive));
+    mark_error(primitive);
+    assert!(!has_error(primitive));
 }

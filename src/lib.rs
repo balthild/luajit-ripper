@@ -48,13 +48,15 @@ pub mod ast;
 #[doc(hidden)]
 pub mod lua;
 
-pub use crate::error::{Error, Result};
-pub use crate::lua::writer::{BitOpStyle, Indent};
+use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::ast::nodes::{
-    Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node, NodeRef,
+    Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node, NodeRef, node,
 };
 use crate::ast::traverse;
+use crate::ast::unwarper::Recovery;
+pub use crate::error::{Error, Result};
+pub use crate::lua::writer::{BitOpStyle, Indent};
 
 /// What to do when a function cannot be decompiled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,19 +107,30 @@ impl Default for Options {
 /// The result is a complete chunk: running it defines everything the original
 /// dump did. A function that cannot be decompiled is reported through
 /// [`Options::on_function_error`].
+///
+/// The whole decompilation is built in one arena, which is released in one go
+/// when this function returns.
 pub fn decompile(data: &[u8], options: &Options) -> Result<String> {
-    let chunk = bytecode::parse(data)?;
-    let root = ast::builder::build(&chunk)?;
-    decompile_ast(&root, options)
+    let alloc = Allocator::new();
+    let chunk = bytecode::parse(&alloc, data)?;
+    let root = ast::builder::build(&alloc, &chunk)?;
+    decompile_ast(&alloc, root, options)
 }
 
 /// Decompiles an AST that the builder has already produced.
-pub fn decompile_ast(root: &NodeRef, options: &Options) -> Result<String> {
-    ast::mutator::pre_pass(root);
+///
+/// The AST has to live in `alloc`, because the passes allocate new nodes in it.
+pub fn decompile_ast<'a>(
+    alloc: &'a Allocator,
+    root: NodeRef<'a>,
+    options: &Options,
+) -> Result<String> {
+    ast::mutator::pre_pass(alloc, root);
 
     ast::locals::mark_locals(root, false);
 
     ast::slotworks::eliminate_temporary(
+        alloc,
         root,
         ast::slotworks::Options {
             identify_slots: true,
@@ -125,14 +138,14 @@ pub fn decompile_ast(root: &NodeRef, options: &Options) -> Result<String> {
         },
     )?;
 
-    unwarp_chunk(root, options)?;
+    unwarp_chunk(alloc, root, options)?;
 
-    ast::locals::mark_local_definitions(root);
+    ast::locals::mark_local_definitions(alloc, root);
 
-    ast::mutator::primary_pass(root);
+    ast::mutator::primary_pass(alloc, root);
 
     ast::locals::mark_locals(root, true);
-    ast::locals::mark_local_definitions(root);
+    ast::locals::mark_local_definitions(alloc, root);
 
     let writer_options = lua::writer::Options {
         indent: options.indent,
@@ -142,14 +155,14 @@ pub fn decompile_ast(root: &NodeRef, options: &Options) -> Result<String> {
         ..Default::default()
     };
 
-    lua::writer::write_function(root, &writer_options)
+    lua::writer::write_function(alloc, root, &writer_options)
 }
 
 /// Rebuilds the control flow of every function of a chunk.
 ///
 /// Each function is done on its own, so that a function that cannot be
 /// decompiled does not take the rest of the chunk down with it.
-fn unwarp_chunk(root: &NodeRef, options: &Options) -> Result<()> {
+fn unwarp_chunk<'a>(alloc: &'a Allocator, root: NodeRef<'a>, options: &Options) -> Result<()> {
     // The nested functions come first, so that a function is finished before
     // the one that contains it is looked at.
     let mut functions = traverse::functions(root);
@@ -159,18 +172,18 @@ fn unwarp_chunk(root: &NodeRef, options: &Options) -> Result<()> {
     // whole: a function that cannot be structured is then written as far as it
     // got instead of being reported.
     let recovery = match options.on_function_error {
-        OnFunctionError::Fail => ast::unwarper::Recovery::Off,
-        OnFunctionError::Mark => ast::unwarper::Recovery::On,
+        OnFunctionError::Fail => Recovery::Off,
+        OnFunctionError::Mark => Recovery::On,
     };
 
     for function in functions {
         // Recovering already handles the regions a pass gives up on, so the
         // fallback is only reached by a function that could not be written at
         // all, such as one whose control flow never got structured.
-        if let Err(error) = ast::unwarper::unwarp(&function, recovery) {
+        if let Err(error) = ast::unwarper::unwarp(alloc, function, recovery) {
             match options.on_function_error {
                 OnFunctionError::Fail => return Err(error),
-                OnFunctionError::Mark => mark_function_failed(&function),
+                OnFunctionError::Mark => mark_function_failed(alloc, function),
             }
         }
     }
@@ -179,30 +192,48 @@ fn unwarp_chunk(root: &NodeRef, options: &Options) -> Result<()> {
 }
 
 /// Replaces the body of a function with a call that reports the failure.
-fn mark_function_failed(function: &NodeRef) {
-    let error_name = crate::ast::nodes::node(Node::Identifier(Box::new(Identifier {
-        kind: IdentifierKind::Builtin,
-        name: Some("error".to_string()),
-        slot: 0,
-        id: None,
-        possible_ids: Vec::new(),
-        local_end: None,
-        meta: Meta::default(),
-    })));
+fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
+    let error_name = node(
+        alloc,
+        Node::Identifier(ArenaBox::new_in(
+            Identifier {
+                kind: IdentifierKind::Builtin,
+                name: Some("error"),
+                slot: 0,
+                id: None,
+                possible_ids: ArenaVec::new_in(&alloc),
+                local_end: None,
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    );
 
-    let message = crate::ast::nodes::node(Node::Constant(Box::new(Constant {
-        value: ConstantValue::String(b"Decompilation failed".to_vec().into_boxed_slice()),
-        meta: Meta::default(),
-    })));
+    let message = node(
+        alloc,
+        Node::Constant(ArenaBox::new_in(
+            Constant {
+                value: ConstantValue::String(alloc.alloc_slice_copy(b"Decompilation failed")),
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    );
 
-    let call = crate::ast::nodes::node(Node::FunctionCall(Box::new(FunctionCall {
-        function: error_name,
-        arguments: crate::ast::nodes::statements(vec![message]),
-        is_method: false,
-        meta: Meta::default(),
-    })));
+    let call = node(
+        alloc,
+        Node::FunctionCall(ArenaBox::new_in(
+            FunctionCall {
+                function: error_name,
+                arguments: crate::ast::nodes::statements(alloc, [message]),
+                is_method: false,
+                meta: Meta::default(),
+            },
+            &alloc,
+        )),
+    );
 
     if let Node::FunctionDefinition(inner) = &mut *function.borrow_mut() {
-        traverse::set_list_contents(&inner.statements, vec![call]);
+        crate::ast::nodes::set_list_contents(alloc, inner.statements, [call]);
     }
 }

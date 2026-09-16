@@ -1,6 +1,9 @@
 //! Prototype constants: upvalue references, GC constants and number
 //! constants.
 
+use oxc_allocator::{Allocator, ArenaVec};
+
+use super::arena_bytes;
 use super::prototype::Prototype;
 use super::reader::{Reader, as_signed_32, assemble_double};
 use crate::error::{Error, Result};
@@ -32,12 +35,12 @@ pub const KTAB_NUM: u32 = 4;
 pub const KTAB_STR: u32 = 5;
 
 /// A constant of a GC type.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Const {
+#[derive(Debug, PartialEq)]
+pub enum Const<'a> {
     /// A child prototype, referenced by `FNEW`.
-    Child(Box<Prototype>),
+    Child(&'a Prototype<'a>),
     /// A template table, referenced by `TDUP`.
-    Table(Table),
+    Table(Table<'a>),
     /// A 64 bit signed integer constant.
     Int64(i64),
     /// A 64 bit unsigned integer constant.
@@ -45,12 +48,12 @@ pub enum Const {
     /// A complex double constant.
     Complex(f64, f64),
     /// A string constant.
-    Str(Box<[u8]>),
+    Str(&'a [u8]),
 }
 
-impl Const {
+impl<'a> Const<'a> {
     /// Interprets this constant as a string, if it is one.
-    pub fn as_str(&self) -> Option<&[u8]> {
+    pub fn as_str(&self) -> Option<&'a [u8]> {
         match self {
             Const::Str(value) => Some(value),
             _ => None,
@@ -58,7 +61,7 @@ impl Const {
     }
 
     /// Interprets this constant as a template table, if it is one.
-    pub fn as_table(&self) -> Option<&Table> {
+    pub fn as_table(&'a self) -> Option<&'a Table<'a>> {
         match self {
             Const::Table(value) => Some(value),
             _ => None,
@@ -66,7 +69,7 @@ impl Const {
     }
 
     /// Interprets this constant as a child prototype, if it is one.
-    pub fn as_child(&self) -> Option<&Prototype> {
+    pub fn as_child(&self) -> Option<&'a Prototype<'a>> {
         match self {
             Const::Child(value) => Some(value),
             _ => None,
@@ -75,8 +78,8 @@ impl Const {
 }
 
 /// A key or value inside a template table.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConstKey {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstKey<'a> {
     /// `nil`.
     Nil,
     /// A hash value that LuaJIT uses as a marker meaning "this key must be
@@ -91,10 +94,10 @@ pub enum ConstKey {
     /// A double.
     Float(f64),
     /// A string.
-    Str(Box<[u8]>),
+    Str(&'a [u8]),
 }
 
-impl ConstKey {
+impl ConstKey<'_> {
     /// Interprets this key as a string, if it is one.
     pub fn as_str(&self) -> Option<&[u8]> {
         match self {
@@ -105,12 +108,22 @@ impl ConstKey {
 }
 
 /// A template table.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Table {
+#[derive(Debug, PartialEq)]
+pub struct Table<'a> {
     /// The array part, holes included.
-    pub array: Vec<ConstKey>,
+    pub array: ArenaVec<'a, ConstKey<'a>>,
     /// The hash part, kept in dump order so that output stays stable.
-    pub hash: Vec<(ConstKey, ConstKey)>,
+    pub hash: ArenaVec<'a, (ConstKey<'a>, ConstKey<'a>)>,
+}
+
+impl<'a> Table<'a> {
+    /// Creates an empty template table.
+    pub fn new_in(alloc: &'a Allocator) -> Self {
+        Table {
+            array: ArenaVec::new_in(&alloc),
+            hash: ArenaVec::new_in(&alloc),
+        }
+    }
 }
 
 /// A numeric constant.
@@ -133,20 +146,29 @@ impl NumConst {
 }
 
 /// All constants of a prototype.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Constants {
+#[derive(Debug, PartialEq)]
+pub struct Constants<'a> {
     /// Raw upvalue references, including the `PROTO_UV_LOCAL` and
     /// `PROTO_UV_IMMUTABLE` marker bits.
-    pub upvalue_refs: Vec<u16>,
+    pub upvalue_refs: ArenaVec<'a, u16>,
     /// Constants of a GC type, in dump order.
-    pub kgc: Vec<Const>,
+    pub kgc: ArenaVec<'a, Const<'a>>,
     /// Numeric constants, in dump order.
-    pub knum: Vec<NumConst>,
+    pub knum: ArenaVec<'a, NumConst>,
 }
 
-impl Constants {
+impl<'a> Constants<'a> {
+    /// Creates an empty constant table.
+    pub fn new_in(alloc: &'a Allocator) -> Self {
+        Constants {
+            upvalue_refs: ArenaVec::new_in(&alloc),
+            kgc: ArenaVec::new_in(&alloc),
+            knum: ArenaVec::new_in(&alloc),
+        }
+    }
+
     /// The GC constant at `index`.
-    pub fn kgc_at(&self, index: u32) -> Option<&Const> {
+    pub fn kgc_at(&self, index: u32) -> Option<&Const<'a>> {
         self.kgc.get(index as usize)
     }
 
@@ -156,7 +178,7 @@ impl Constants {
     }
 
     /// The string constant at `index`, if it is a string.
-    pub fn string_at(&self, index: u32) -> Option<&[u8]> {
+    pub fn string_at(&self, index: u32) -> Option<&'a [u8]> {
         self.kgc_at(index).and_then(Const::as_str)
     }
 }
@@ -166,24 +188,25 @@ impl Constants {
 ///
 /// `children` is the stack of already read prototypes; `KGC_CHILD` constants
 /// pop from it.
-pub fn read(
+pub fn read<'a>(
+    alloc: &'a Allocator,
     reader: &mut Reader<'_>,
     num_uv: usize,
     num_kgc: usize,
     num_kn: usize,
-    children: &mut Vec<Prototype>,
-) -> Result<Constants> {
-    let mut upvalue_refs = Vec::with_capacity(num_uv.min(reader.remaining() / 2));
+    children: &mut ArenaVec<&'a Prototype<'a>>,
+) -> Result<Constants<'a>> {
+    let mut upvalue_refs = ArenaVec::with_capacity_in(num_uv.min(reader.remaining() / 2), &alloc);
     for _ in 0..num_uv {
         upvalue_refs.push(reader.read_u16()?);
     }
 
-    let mut kgc = Vec::with_capacity(num_kgc.min(reader.remaining()));
+    let mut kgc = ArenaVec::with_capacity_in(num_kgc.min(reader.remaining()), &alloc);
     for _ in 0..num_kgc {
-        kgc.push(read_kgc(reader, children)?);
+        kgc.push(read_kgc(alloc, reader, children)?);
     }
 
-    let mut knum = Vec::with_capacity(num_kn.min(reader.remaining()));
+    let mut knum = ArenaVec::with_capacity_in(num_kn.min(reader.remaining()), &alloc);
     for _ in 0..num_kn {
         knum.push(read_knum(reader)?);
     }
@@ -195,19 +218,23 @@ pub fn read(
     })
 }
 
-fn read_kgc(reader: &mut Reader<'_>, children: &mut Vec<Prototype>) -> Result<Const> {
+fn read_kgc<'a>(
+    alloc: &'a Allocator,
+    reader: &mut Reader<'_>,
+    children: &mut ArenaVec<&'a Prototype<'a>>,
+) -> Result<Const<'a>> {
     let tag = reader.read_uleb128()?;
     if tag >= KGC_STR {
         let length = (tag - KGC_STR) as usize;
-        return Ok(Const::Str(reader.read_bytes(length)?.into()));
+        return Ok(Const::Str(arena_bytes(alloc, reader.read_bytes(length)?)));
     }
     match tag {
-        KGC_TAB => Ok(Const::Table(read_table(reader)?)),
+        KGC_TAB => Ok(Const::Table(read_table(alloc, reader)?)),
         KGC_CHILD => {
             let child = children.pop().ok_or_else(|| {
                 Error::Malformed("child prototype constant without a preceding prototype".into())
             })?;
-            Ok(Const::Child(Box::new(child)))
+            Ok(Const::Child(child))
         }
         KGC_I64 => {
             let low = reader.read_uleb128()?;
@@ -240,7 +267,7 @@ fn read_knum(reader: &mut Reader<'_>) -> Result<NumConst> {
     }
 }
 
-fn read_table(reader: &mut Reader<'_>) -> Result<Table> {
+fn read_table<'a>(alloc: &'a Allocator, reader: &mut Reader<'_>) -> Result<Table<'a>> {
     let array_count = reader.read_uleb128()? as usize;
     let hash_count = reader.read_uleb128()? as usize;
 
@@ -252,26 +279,33 @@ fn read_table(reader: &mut Reader<'_>) -> Result<Table> {
         ));
     }
 
-    let mut array = Vec::with_capacity(array_count);
+    let mut array = ArenaVec::with_capacity_in(array_count, &alloc);
     for _ in 0..array_count {
-        array.push(read_table_item(reader, false)?);
+        array.push(read_table_item(alloc, reader, false)?);
     }
 
-    let mut hash = Vec::with_capacity(hash_count);
+    let mut hash = ArenaVec::with_capacity_in(hash_count, &alloc);
     for _ in 0..hash_count {
-        let key = read_table_item(reader, false)?;
-        let value = read_table_item(reader, true)?;
+        let key = read_table_item(alloc, reader, false)?;
+        let value = read_table_item(alloc, reader, true)?;
         hash.push((key, value));
     }
 
     Ok(Table { array, hash })
 }
 
-fn read_table_item(reader: &mut Reader<'_>, is_hash_value: bool) -> Result<ConstKey> {
+fn read_table_item<'a>(
+    alloc: &'a Allocator,
+    reader: &mut Reader<'_>,
+    is_hash_value: bool,
+) -> Result<ConstKey<'a>> {
     let tag = reader.read_uleb128()?;
     if tag >= KTAB_STR {
         let length = (tag - KTAB_STR) as usize;
-        return Ok(ConstKey::Str(reader.read_bytes(length)?.into()));
+        return Ok(ConstKey::Str(arena_bytes(
+            alloc,
+            reader.read_bytes(length)?,
+        )));
     }
     match tag {
         KTAB_INT => Ok(ConstKey::Int(as_signed_32(reader.read_uleb128()?))),
@@ -360,35 +394,41 @@ mod tests {
 
     #[test]
     fn reads_string_constants() {
-        let mut children = Vec::new();
+        let alloc = Allocator::default();
+        let mut children = ArenaVec::new_in(&&alloc);
         // tag 5 + 3 = length 3, then "abc"
         let data = [8, b'a', b'b', b'c'];
         let mut r = reader(&data);
-        let constant = read_kgc(&mut r, &mut children).unwrap();
-        assert_eq!(constant, Const::Str(b"abc"[..].into()));
+        let constant = read_kgc(&alloc, &mut r, &mut children).unwrap();
+        assert_eq!(constant, Const::Str(&b"abc"[..]));
         assert!(r.is_eof());
     }
 
     #[test]
     fn reads_64_bit_integer_constants() {
-        let mut children = Vec::new();
+        let alloc = Allocator::default();
+        let mut children = ArenaVec::new_in(&&alloc);
         let mut data = vec![KGC_I64 as u8];
         data.extend_from_slice(&uleb(0xffff_ffff));
         data.extend_from_slice(&uleb(0xffff_ffff));
         let mut r = reader(&data);
-        assert_eq!(read_kgc(&mut r, &mut children).unwrap(), Const::Int64(-1));
+        assert_eq!(
+            read_kgc(&alloc, &mut r, &mut children).unwrap(),
+            Const::Int64(-1)
+        );
         assert!(r.is_eof());
     }
 
     #[test]
     fn reads_complex_constants() {
-        let mut children = Vec::new();
+        let alloc = Allocator::default();
+        let mut children = ArenaVec::new_in(&&alloc);
         let mut data = vec![KGC_COMPLEX as u8];
         data.extend_from_slice(&kgc_double(1.5));
         data.extend_from_slice(&kgc_double(-2.0));
         let mut r = reader(&data);
         assert_eq!(
-            read_kgc(&mut r, &mut children).unwrap(),
+            read_kgc(&alloc, &mut r, &mut children).unwrap(),
             Const::Complex(1.5, -2.0)
         );
         assert!(r.is_eof());
@@ -420,42 +460,43 @@ mod tests {
 
     #[test]
     fn reads_template_tables() {
+        let alloc = Allocator::default();
         let data = [2, 1, 0, 0, 3, 2, 6, b'k'];
         let mut r = reader(&data);
-        let table = read_table(&mut r).unwrap();
-        assert_eq!(table.array, vec![ConstKey::Nil, ConstKey::Nil]);
-        assert_eq!(
-            table.hash,
-            vec![(ConstKey::Int(2), ConstKey::Str(b"k"[..].into()))]
-        );
+        let table = read_table(&alloc, &mut r).unwrap();
+        assert_eq!(table.array, [ConstKey::Nil, ConstKey::Nil]);
+        assert_eq!(table.hash, [(ConstKey::Int(2), ConstKey::Str(&b"k"[..]))]);
         assert!(r.is_eof());
     }
 
     #[test]
     fn nil_hash_values_become_key_markers() {
+        let alloc = Allocator::default();
         let data = [0, 1, 6, b'k', 0];
         let mut r = reader(&data);
-        let table = read_table(&mut r).unwrap();
+        let table = read_table(&alloc, &mut r).unwrap();
         assert_eq!(
             table.hash,
-            vec![(ConstKey::Str(b"k"[..].into()), ConstKey::KeyMarker)]
+            [(ConstKey::Str(&b"k"[..]), ConstKey::KeyMarker)]
         );
     }
 
     #[test]
     fn rejects_unknown_constant_tags() {
-        let mut children = Vec::new();
+        let alloc = Allocator::default();
+        let mut children = ArenaVec::new_in(&&alloc);
         let mut r = reader(&[9]);
-        assert!(read_kgc(&mut r, &mut children).is_err());
+        assert!(read_kgc(&alloc, &mut r, &mut children).is_err());
         let mut r = reader(&[8]);
-        assert!(read_table_item(&mut r, false).is_err());
+        assert!(read_table_item(&alloc, &mut r, false).is_err());
     }
 
     #[test]
     fn rejects_oversized_template_tables() {
+        let alloc = Allocator::default();
         let mut data = uleb(u32::MAX);
         data.push(0);
         let mut r = reader(&data);
-        assert!(read_table(&mut r).is_err());
+        assert!(read_table(&alloc, &mut r).is_err());
     }
 }

@@ -12,8 +12,8 @@ use std::process::Command;
 use support::*;
 /// Collects every prototype of a chunk, including nested ones.
 fn all_prototypes(
-    root: &luajit_ripper::bytecode::Prototype,
-) -> Vec<&luajit_ripper::bytecode::Prototype> {
+    root: &'static luajit_ripper::bytecode::Prototype<'static>,
+) -> Vec<&'static luajit_ripper::bytecode::Prototype<'static>> {
     let mut out = vec![root];
     let mut index = 0;
     while index < out.len() {
@@ -36,8 +36,7 @@ fn every_fixture_parses() {
 
         for debug in [true, false] {
             let dump = compile(&luajit, &name, &source, debug);
-            let chunk = luajit_ripper::bytecode::parse(&dump)
-                .unwrap_or_else(|error| panic!("{name} (debug={debug}): {error}"));
+            let chunk = parse_dump(&dump);
 
             assert_eq!(chunk.header.flags.stripped, !debug, "{name}: strip flag");
             assert_eq!(
@@ -51,7 +50,7 @@ fn every_fixture_parses() {
                 "{name}: debug information presence"
             );
 
-            for prototype in all_prototypes(&chunk.root) {
+            for prototype in all_prototypes(chunk.root) {
                 assert_eq!(
                     prototype.instructions.len(),
                     prototype.body().len() + 1,
@@ -88,14 +87,14 @@ fn debug_information_matches_the_source() {
 
     let source = "local alpha = 1\nlocal beta = alpha + 1\nreturn beta\n";
     let dump = compile_source(&luajit, "debug_info", source, true);
-    let chunk = luajit_ripper::bytecode::parse(&dump).unwrap();
+    let chunk = parse_dump(&dump);
 
     let names: Vec<&str> = chunk
         .root
         .debug
         .variable_info
         .iter()
-        .map(|info| info.name.as_str())
+        .map(|info| info.name)
         .collect();
     assert_eq!(names, vec!["alpha", "beta"]);
     assert_eq!(chunk.root.line_for(1), 1);
@@ -115,7 +114,7 @@ fn constant_kinds_are_decoded() {
 
     let source = "local a = 1\nlocal b = 1.5\nlocal c = \"text\"\nreturn a, b, c\n";
     let dump = compile_source(&luajit, "constants", source, true);
-    let chunk = luajit_ripper::bytecode::parse(&dump).unwrap();
+    let chunk = parse_dump(&dump);
 
     assert!(
         chunk
@@ -160,16 +159,20 @@ fn every_fixture_builds_a_control_flow_graph() {
         let source = fixtures_dir().join(format!("{name}.lua"));
         for debug in [true, false] {
             let dump = compile(&luajit, &name, &source, debug);
-            let chunk = luajit_ripper::bytecode::parse(&dump).unwrap();
-            let root = luajit_ripper::ast::builder::build(&chunk)
+            let chunk = parse_dump(&dump);
+            let root = luajit_ripper::ast::builder::build(arena(), chunk)
                 .unwrap_or_else(|error| panic!("{name} (debug={debug}): {error}"));
 
-            let Node::FunctionDefinition(definition) = &*root.borrow() else {
-                panic!("{name}: the root must be a function definition");
+            let statements = match &*root.borrow() {
+                Node::FunctionDefinition(definition) => definition.statements,
+                other => panic!(
+                    "{name}: expected a function definition, found {}",
+                    other.kind()
+                ),
             };
 
-            let blocks = match &*definition.statements.borrow() {
-                Node::Statements(blocks) => blocks.clone(),
+            let blocks = match &*statements.borrow() {
+                Node::Statements(blocks) => blocks.iter().copied().collect::<Vec<_>>(),
                 other => panic!("{name}: expected blocks, found {}", other.kind()),
             };
             assert!(!blocks.is_empty(), "{name}: no blocks");
@@ -203,7 +206,7 @@ fn bit_operators_use_the_current_opcode_numbering() {
 
     let source = fixtures_dir().join("bitops.lua");
     let dump = compile(&luajit, "bitops", &source, true);
-    let chunk = luajit_ripper::bytecode::parse(&dump).unwrap();
+    let chunk = parse_dump(&dump);
 
     assert!(
         chunk.header.flags.bitop,
@@ -215,7 +218,7 @@ fn bit_operators_use_the_current_opcode_numbering() {
     // never stored in a dump, so seeing them proves the modern numbering.
     let base = luajit_ripper::bytecode::Opcode::BNOT as u8;
     let mut seen: Vec<u8> = Vec::new();
-    for prototype in all_prototypes(&chunk.root) {
+    for prototype in all_prototypes(chunk.root) {
         for instruction in prototype.instructions.iter() {
             if instruction.op.is_bitop() {
                 seen.push(instruction.op as u8 - base);
@@ -244,9 +247,8 @@ fn listing_matches_luajit() {
         // `luajit -bl` lists the freshly compiled function, which still has its
         // debug information, so our dump has to keep it as well.
         let dump = compile(&luajit, &name, &source, true);
-        let chunk =
-            luajit_ripper::bytecode::parse(&dump).unwrap_or_else(|error| panic!("{name}: {error}"));
-        let actual = luajit_ripper::listing::dump(&chunk);
+        let chunk = parse_dump(&dump);
+        let actual = luajit_ripper::listing::dump(chunk);
 
         let listed = Command::new(&luajit)
             .arg("-bl")

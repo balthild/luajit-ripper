@@ -9,14 +9,14 @@ use super::nodes::*;
 use super::traverse;
 
 /// Renders the AST rooted at `root`.
-pub fn dump(root: &NodeRef) -> String {
+pub fn dump(root: NodeRef<'_>) -> String {
     let mut out = String::new();
     write_node(&mut out, root, 0);
     out
 }
 
 /// Renders one node, recursively, one node per line.
-pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
+pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
     let indent = "  ".repeat(depth);
     let borrowed = node.borrow();
 
@@ -53,8 +53,8 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
         Node::EndWarp(_) => out.push_str(&format!("{indent}end-warp\n")),
         Node::Assignment(inner) => {
             let _ = writeln!(out, "{indent}assign ({:?})", inner.kind);
-            write_node(out, &inner.destinations, depth + 1);
-            write_node(out, &inner.expressions, depth + 1);
+            write_node(out, inner.destinations, depth + 1);
+            write_node(out, inner.expressions, depth + 1);
         }
         Node::FunctionCall(inner) => {
             let _ = writeln!(
@@ -62,87 +62,87 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
                 "{indent}call{}",
                 if inner.is_method { " (method)" } else { "" }
             );
-            write_node(out, &inner.function, depth + 1);
-            write_node(out, &inner.arguments, depth + 1);
+            write_node(out, inner.function, depth + 1);
+            write_node(out, inner.arguments, depth + 1);
         }
         Node::Return(inner) => {
             let _ = writeln!(out, "{indent}return");
-            write_node(out, &inner.returns, depth + 1);
+            write_node(out, inner.returns, depth + 1);
         }
         Node::If(inner) => {
             let _ = writeln!(out, "{indent}if");
-            write_node(out, &inner.expression, depth + 1);
-            write_node(out, &inner.then_block, depth + 1);
+            write_node(out, inner.expression, depth + 1);
+            write_node(out, inner.then_block, depth + 1);
             for branch in &inner.elseifs {
                 write_node(out, branch, depth + 1);
             }
-            if !traverse::block_contents(&inner.else_block).is_empty()
+            if !traverse::block_contents(inner.else_block).is_empty()
                 || matches!(&*inner.else_block.borrow(), Node::Statements(items) if !items.is_empty())
             {
                 let _ = writeln!(out, "{indent}else");
-                write_node(out, &inner.else_block, depth + 1);
+                write_node(out, inner.else_block, depth + 1);
             }
         }
         Node::ElseIf(inner) => {
             let _ = writeln!(out, "{indent}elseif");
-            write_node(out, &inner.expression, depth + 1);
-            write_node(out, &inner.then_block, depth + 1);
+            write_node(out, inner.expression, depth + 1);
+            write_node(out, inner.then_block, depth + 1);
         }
         Node::While(inner) => {
             let _ = writeln!(out, "{indent}while");
-            write_node(out, &inner.expression, depth + 1);
-            write_node(out, &inner.statements, depth + 1);
+            write_node(out, inner.expression, depth + 1);
+            write_node(out, inner.statements, depth + 1);
         }
         Node::RepeatUntil(inner) => {
             let _ = writeln!(out, "{indent}repeat");
-            write_node(out, &inner.statements, depth + 1);
+            write_node(out, inner.statements, depth + 1);
             let _ = writeln!(out, "{indent}until");
-            write_node(out, &inner.expression, depth + 1);
+            write_node(out, inner.expression, depth + 1);
         }
         Node::NumericFor(inner) => {
             let _ = writeln!(out, "{indent}numeric-for");
-            write_node(out, &inner.variable, depth + 1);
-            write_node(out, &inner.expressions, depth + 1);
-            write_node(out, &inner.statements, depth + 1);
+            write_node(out, inner.variable, depth + 1);
+            write_node(out, inner.expressions, depth + 1);
+            write_node(out, inner.statements, depth + 1);
         }
         Node::IteratorFor(inner) => {
             let _ = writeln!(out, "{indent}iterator-for");
-            write_node(out, &inner.identifiers, depth + 1);
-            write_node(out, &inner.expressions, depth + 1);
-            write_node(out, &inner.statements, depth + 1);
+            write_node(out, inner.identifiers, depth + 1);
+            write_node(out, inner.expressions, depth + 1);
+            write_node(out, inner.statements, depth + 1);
         }
         Node::FunctionDefinition(inner) => {
             let _ = writeln!(out, "{indent}function");
-            write_node(out, &inner.arguments, depth + 1);
-            write_node(out, &inner.statements, depth + 1);
+            write_node(out, inner.arguments, depth + 1);
+            write_node(out, inner.statements, depth + 1);
         }
         Node::TableElement(inner) => {
             let _ = writeln!(out, "{indent}index");
-            write_node(out, &inner.table, depth + 1);
-            write_node(out, &inner.key, depth + 1);
+            write_node(out, inner.table, depth + 1);
+            write_node(out, inner.key, depth + 1);
         }
         Node::TableConstructor(inner) => {
             let _ = writeln!(out, "{indent}table");
-            write_node(out, &inner.array, depth + 1);
-            write_node(out, &inner.records, depth + 1);
+            write_node(out, inner.array, depth + 1);
+            write_node(out, inner.records, depth + 1);
         }
         Node::BinaryOperator(inner) => {
             let _ = writeln!(out, "{indent}binary {}", inner.kind.as_str());
-            write_node(out, &inner.left, depth + 1);
-            write_node(out, &inner.right, depth + 1);
+            write_node(out, inner.left, depth + 1);
+            write_node(out, inner.right, depth + 1);
         }
         Node::UnaryOperator(inner) => {
             let _ = writeln!(out, "{indent}unary {}", inner.kind.as_str());
-            write_node(out, &inner.operand, depth + 1);
+            write_node(out, inner.operand, depth + 1);
         }
         Node::ArrayRecord(inner) => {
             let _ = writeln!(out, "{indent}array-record");
-            write_node(out, &inner.value, depth + 1);
+            write_node(out, inner.value, depth + 1);
         }
         Node::TableRecord(inner) => {
             let _ = writeln!(out, "{indent}table-record");
-            write_node(out, &inner.key, depth + 1);
-            write_node(out, &inner.value, depth + 1);
+            write_node(out, inner.key, depth + 1);
+            write_node(out, inner.value, depth + 1);
         }
         Node::Block(inner) => {
             let _ = writeln!(
@@ -173,7 +173,7 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
                 inner
                     .target
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner.is_uclo
             );
@@ -189,12 +189,12 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
                 inner
                     .true_target
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .false_target
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string())
             );
             if let Some(condition) = &inner.condition {
@@ -208,16 +208,16 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
                 inner
                     .body
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .way_out
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string())
             );
-            write_node(out, &inner.variables, depth + 1);
-            write_node(out, &inner.controls, depth + 1);
+            write_node(out, inner.variables, depth + 1);
+            write_node(out, inner.controls, depth + 1);
         }
         Node::NumericLoopWarp(inner) => {
             let _ = writeln!(
@@ -226,21 +226,21 @@ pub fn write_node(out: &mut String, node: &NodeRef, depth: usize) {
                 inner
                     .body
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .way_out
                     .as_ref()
-                    .map(describe_block)
+                    .map(|block| describe_block(block))
                     .unwrap_or_else(|| "?".to_string())
             );
-            write_node(out, &inner.index, depth + 1);
-            write_node(out, &inner.controls, depth + 1);
+            write_node(out, inner.index, depth + 1);
+            write_node(out, inner.controls, depth + 1);
         }
     }
 }
 
-fn describe_block(block: &NodeRef) -> String {
+fn describe_block(block: NodeRef<'_>) -> String {
     match &*block.borrow() {
         Node::Block(inner) => format!("block#{}", inner.index),
         other => other.kind().to_string(),

@@ -90,22 +90,43 @@ pub fn compile_source(luajit: &str, name: &str, source: &str, debug: bool) -> Ve
 }
 
 /// Compiles a snippet and parses the resulting dump.
-pub fn chunk_from_source(luajit: &str, name: &str, source: &str) -> Chunk {
+pub fn chunk_from_source(luajit: &str, name: &str, source: &str) -> &'static Chunk<'static> {
     let dump = compile_source(luajit, name, source, true);
-    luajit_ripper::bytecode::parse(&dump)
-        .unwrap_or_else(|error| panic!("{name}: cannot parse the dump: {error}"))
+    parse_dump(&dump)
+}
+
+/// An allocator that lives for the rest of the program.
+///
+/// Tests keep the whole AST alive while they inspect it, so leaking the arena
+/// keeps the call sites the same shape they had before the ast was moved off
+/// `Rc`.
+pub fn arena() -> &'static oxc_allocator::Allocator {
+    Box::leak(Box::new(oxc_allocator::Allocator::default()))
+}
+
+/// Parses a dump into a chunk that lives for the rest of the program.
+pub fn parse_dump(dump: &[u8]) -> &'static Chunk<'static> {
+    try_parse_dump(dump).unwrap_or_else(|error| panic!("cannot parse the dump: {error}"))
+}
+
+/// Parses a dump, keeping the error instead of panicking.
+pub fn try_parse_dump(dump: &[u8]) -> Result<&'static Chunk<'static>, luajit_ripper::Error> {
+    let chunk = luajit_ripper::bytecode::parse(arena(), dump)?;
+    Ok(Box::leak(Box::new(chunk)))
 }
 
 /// Builds the AST of a chunk and runs the passes that come before unwarping.
 ///
 /// This is the order the decompiler uses: the graph is repaired, the local
 /// variable names are recovered, and the temporary registers are inlined.
-pub fn prepare(chunk: &Chunk) -> Result<NodeRef, luajit_ripper::Error> {
-    let root = luajit_ripper::ast::builder::build(chunk)?;
-    luajit_ripper::ast::mutator::pre_pass(&root);
-    luajit_ripper::ast::locals::mark_locals(&root, false);
+pub fn prepare(chunk: &'static Chunk<'static>) -> Result<NodeRef<'static>, luajit_ripper::Error> {
+    let alloc = arena();
+    let root = luajit_ripper::ast::builder::build(alloc, chunk)?;
+    luajit_ripper::ast::mutator::pre_pass(alloc, root);
+    luajit_ripper::ast::locals::mark_locals(root, false);
     luajit_ripper::ast::slotworks::eliminate_temporary(
-        &root,
+        alloc,
+        root,
         luajit_ripper::ast::slotworks::Options {
             identify_slots: true,
             ..Default::default()
@@ -115,4 +136,4 @@ pub fn prepare(chunk: &Chunk) -> Result<NodeRef, luajit_ripper::Error> {
 }
 
 /// A shared, mutable AST node.
-pub type NodeRef = std::rc::Rc<std::cell::RefCell<luajit_ripper::ast::nodes::Node>>;
+pub use luajit_ripper::ast::nodes::NodeRef;
