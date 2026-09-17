@@ -9,20 +9,6 @@ mod support;
 
 use std::process::Command;
 
-/// Collects every prototype of a chunk, including nested ones.
-fn all_prototypes(
-    root: &'static luajit_ripper::bytecode::Prototype<'static>,
-) -> Vec<&'static luajit_ripper::bytecode::Prototype<'static>> {
-    let mut out = vec![root];
-    let mut index = 0;
-    while index < out.len() {
-        let children: Vec<_> = out[index].children().collect();
-        out.extend(children);
-        index += 1;
-    }
-    out
-}
-
 #[test]
 fn every_fixture_parses() {
     let Some(luajit) = support::luajit() else {
@@ -49,7 +35,7 @@ fn every_fixture_parses() {
                 "{name}: debug information presence"
             );
 
-            for prototype in all_prototypes(chunk.root) {
+            for prototype in support::prototypes(chunk) {
                 assert_eq!(
                     prototype.instructions.len(),
                     prototype.body().len() + 1,
@@ -217,7 +203,7 @@ fn bit_operators_use_the_current_opcode_numbering() {
     // never stored in a dump, so seeing them proves the modern numbering.
     let base = luajit_ripper::bytecode::Opcode::BNOT as u8;
     let mut seen: Vec<u8> = Vec::new();
-    for prototype in all_prototypes(chunk.root) {
+    for prototype in support::prototypes(chunk) {
         for instruction in prototype.instructions.iter() {
             if instruction.op.is_bitop() {
                 seen.push(instruction.op as u8 - base);

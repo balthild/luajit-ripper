@@ -1,7 +1,11 @@
 //! End to end tests for the public API.
 //!
-//! These compile a snippet, decompile it and compile the result again, so that
-//! what is checked is the whole pipeline rather than one pass.
+//! These compile a snippet or a fixture, decompile it and compile the result
+//! again, so that what is checked is the whole pipeline rather than one pass.
+//! What the decompiler writes is then decompiled once more, and the last two
+//! passes have to agree: a round trip is held to settling, which is what makes
+//! the decompiler answer for its own output rather than for writing something
+//! that merely compiles.
 
 mod support;
 
@@ -32,9 +36,9 @@ fn a_chunk_decompiles_to_source_that_compiles_again() {
         "return M\n",
     );
 
-    let dump = support::compile_source(&luajit, "chunk", source, true);
-    let text =
-        luajit_ripper::decompile(&dump, &Default::default()).expect("the chunk must decompile");
+    let texts =
+        support::round_trip(&luajit, "chunk", source, 3).expect("the chunk must round trip");
+    let text = &texts[0];
 
     eprintln!("{text}");
     assert!(text.contains("local M = {"), "{text}");
@@ -46,9 +50,61 @@ fn a_chunk_decompiles_to_source_that_compiles_again() {
         "{text}"
     );
 
-    // The result has to be Lua the same compiler accepts.
-    let recompiled = support::compile_source(&luajit, "chunk_again", &text, false);
-    support::parse_dump(&recompiled);
+    assert!(
+        support::settled(&texts),
+        "the round trip never settled:\n{}",
+        support::describe(&texts)
+    );
+}
+/// Every fixture has to reach a fixed point under a round trip.
+///
+/// `a_chunk_decompiles_to_source_that_compiles_again` only proves that the
+/// source written out is Lua. This compiles the written source again and
+/// decompiles the result, which is what makes the decompiler answer for what it
+/// wrote: losing a branch, swapping a constant or dropping a local all show up
+/// as a second pass that reads something else than the first one wrote.
+#[test]
+fn every_fixture_round_trips() {
+    let Some(luajit) = support::luajit() else {
+        eprintln!("luajit not found, skipping");
+        return;
+    };
+
+    let names = support::fixture_names();
+    let mut failures: Vec<String> = Vec::new();
+    let mut first_pass = 0usize;
+
+    for name in &names {
+        let source = std::fs::read_to_string(support::fixture_path(name))
+            .expect("the fixture should be readable");
+
+        match support::round_trip(&luajit, name, &source, 3) {
+            Ok(texts) => {
+                if support::settled(&texts) {
+                    // Settling on the first round trip is the common case: the
+                    // compiler gives the written source back unchanged.
+                    first_pass += usize::from(support::settled_after(&texts) == 1);
+                } else {
+                    failures.push(format!(
+                        "{name}: the round trip never settled:\n{}",
+                        support::describe(&texts)
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} fixture(s) did not round trip:\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+    eprintln!(
+        "{first_pass} of {} fixtures settled on the first round trip",
+        names.len()
+    );
 }
 
 #[test]

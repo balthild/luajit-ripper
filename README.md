@@ -96,7 +96,9 @@ cargo test # library and compiler round trips, seconds
 cargo test --features cli # the same, plus the command line tool
 ```
 
-The round trips compile the decompiled source again, so they need a LuaJIT: `LUAJIT=<path>` picks one, and `luajit` on `PATH` is the default.
+The round trips compile the decompiled source again, so they need a LuaJIT: `LUAJIT=<path>` picks one, and `luajit` on `PATH` is the default. They also require the output to settle: compiling what the decompiler wrote and decompiling that has to reach a source that no longer changes, which holds the decompiler to what it wrote rather than to writing something that merely compiles.
+
+The corpus tests read a directory of dumps from `LJR_CORPUS` and check a random sample of it, so a checkout without one still runs everything else: `LJR_SAMPLE=<n>` looks at `n` dumps, `LJR_SAMPLE=full` at all of them, and `LJR_SEED=<n>` repeats a run whose seed was reported as it sampled.
 
 ## Limitations
 
