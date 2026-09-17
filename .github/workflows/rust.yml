@@ -83,7 +83,7 @@ jobs:
 
       - name: Test
         if: ${{ matrix.test }}
-        run: cargo test --target="${{ matrix.target }}"
+        run: cargo test --features cli --target="${{ matrix.target }}"
 
       - name: Build
         run: |
