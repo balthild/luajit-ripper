@@ -320,7 +320,7 @@ fn the_layout_of_the_input_is_mirrored() {
     assert!(
         mirror
             .stderr
-            .contains("3 files: 3 decompiled, 0 partial, 0 failed"),
+            .contains("3 files processed: 3 successful, 0 partial, 0 failed"),
         "{}",
         mirror.stderr
     );
@@ -512,7 +512,7 @@ fn an_incremental_run_leaves_a_source_of_the_same_age_alone() {
     assert!(
         second
             .stderr
-            .contains("1 files: 0 decompiled, 0 partial, 0 failed, 1 skipped"),
+            .contains("1 files processed: 0 successful, 0 partial, 0 failed, 1 skipped"),
         "{}",
         second.stderr
     );
@@ -556,7 +556,7 @@ fn an_incremental_run_writes_a_source_of_a_different_age() {
     assert!(
         second
             .stderr
-            .contains("1 files: 1 decompiled, 0 partial, 0 failed"),
+            .contains("1 files processed: 1 successful, 0 partial, 0 failed"),
         "{}",
         second.stderr
     );
@@ -623,7 +623,7 @@ fn an_incremental_run_still_reports_a_dump_it_cannot_read() {
     assert!(!run_.succeeded());
     assert!(
         run_.stderr
-            .contains("1 files: 0 decompiled, 0 partial, 1 failed"),
+            .contains("1 files processed: 0 successful, 0 partial, 1 failed"),
         "{}",
         run_.stderr
     );
@@ -652,7 +652,7 @@ fn a_dump_that_cannot_be_read_does_not_stop_the_others() {
     assert!(!temp.join("out/broken.lua").exists());
     assert!(
         run_.stderr
-            .contains("2 files: 1 decompiled, 0 partial, 1 failed"),
+            .contains("2 files processed: 1 successful, 0 partial, 1 failed"),
         "{}",
         run_.stderr
     );
@@ -691,7 +691,7 @@ fn the_number_of_threads_does_not_change_the_output() {
         assert!(run_.succeeded(), "{}", run_.stderr);
         assert!(
             run_.stderr
-                .contains("8 files: 8 decompiled, 0 partial, 0 failed"),
+                .contains("8 files processed: 8 successful, 0 partial, 0 failed"),
             "{}",
             run_.stderr
         );
@@ -764,7 +764,7 @@ fn every_dump_is_announced_as_it_comes_out() {
     // reader is left with whatever went by above it.
     assert_eq!(
         lines.last(),
-        Some(&"3 files: 3 decompiled, 0 partial, 0 failed")
+        Some(&"3 files processed: 3 successful, 0 partial, 0 failed")
     );
 }
 
@@ -803,7 +803,7 @@ fn a_dump_that_fails_is_announced_by_its_input_path() {
 
     assert_eq!(
         lines.last(),
-        Some(&"2 files: 1 decompiled, 0 partial, 1 failed")
+        Some(&"2 files processed: 1 successful, 0 partial, 1 failed")
     );
 }
 

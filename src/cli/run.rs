@@ -298,6 +298,9 @@ pub struct Summary {
     /// Dumps the input produced.
     total: usize,
     /// Dumps that were written.
+    ///
+    /// The report calls their number successful, less the ones that came out in
+    /// part; this is the count of sources that reached the filesystem at all.
     written: usize,
     /// Dumps that were written but had to be given up on in part.
     ///
@@ -309,7 +312,7 @@ pub struct Summary {
     /// Dumps that were left alone because their source was already there.
     ///
     /// These are counted nowhere else: no work was done for them, so they are
-    /// neither decompiled nor failed, and the two together are not the total.
+    /// neither successful nor failed, and the two together are not the total.
     skipped: usize,
     /// Output paths that were written more than once.
     collisions: usize,
@@ -413,7 +416,7 @@ impl Summary {
 
         // The last line accounts for every dump, so that however much detail
         // the lines above carry, the run is summed up in one place. A dump that
-        // came out in part counts as decompiled, because it was written: what
+        // came out in part counts as successful, because it was written: what
         // it does not promise is that the source is a faithful rendering. The
         // dumps that were skipped are said only when there are any, since a run
         // without `--incremental` has none to speak of and its last line is the
@@ -424,7 +427,7 @@ impl Summary {
             String::new()
         };
         eprintln!(
-            "{} files: {} decompiled, {} partial, {} failed{skipped}",
+            "{} files processed: {} successful, {} partial, {} failed{skipped}",
             self.total,
             self.written - self.partial,
             self.partial,
