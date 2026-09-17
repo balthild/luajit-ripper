@@ -110,10 +110,8 @@ fn chunk_name(file: &Path) -> Option<String> {
     let data = fs::read(file).ok()?;
     with_allocator(|alloc| {
         let mut reader = bytecode::Reader::new(&data);
-        bytecode::header::read(alloc, &mut reader)
-            .ok()?
-            .name
-            .map(str::to_owned)
+        let header = bytecode::header::read(alloc, &mut reader).ok()?;
+        header.name.map(str::to_owned)
     })
 }
 
@@ -178,13 +176,12 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
         // The channel is closed because the bridge dropped the sender, so there
         // is nothing left to wait for but the pool itself.
         let bridged = bridge.join().expect("the bridge thread does not panic");
-        if bridged.is_err() {
+        bridged.inspect_err(|_| {
             // The pool never ran, so there is no line to keep: it is cleared
             // here so that the failure that follows is not reported on top of
             // a name that never finished.
             progress.finish().ok();
-        }
-        bridged?;
+        })?;
 
         progress.finish().map_err(Error::Progress)?;
         Ok::<_, Error>(collected)

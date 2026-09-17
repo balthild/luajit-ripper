@@ -320,22 +320,20 @@ pub fn module_relative_path(chunk_name: &str) -> Option<PathBuf> {
         return None;
     }
 
+    // The name is read as a path so that it is split the way the machine that
+    // made the dump splits paths: on Windows a `\` in the name is a separator
+    // rather than part of a file name, which is what lets a `..` hidden behind
+    // one be seen for what it is.
     let mut path = PathBuf::new();
-    for part in chunk_name.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
+    for component in Path::new(chunk_name).components() {
+        // Only a plain name may decide where we write: a root, a prefix or a
+        // parent is refused rather than followed.
+        let Component::Normal(part) = component else {
             return None;
-        }
+        };
         path.push(part);
     }
     if path.as_os_str().is_empty() {
-        return None;
-    }
-    // Everything has to be a plain name: a component that is not normal means
-    // a root, a prefix or a parent, none of which may decide where we write.
-    if !path
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)))
-    {
         return None;
     }
 
@@ -405,8 +403,31 @@ mod tests {
     fn names_that_climb_out_are_refused() {
         assert_eq!(module_relative_path("@modules/../../outside.lua"), None);
         assert_eq!(module_relative_path("@modules/../outside.lua"), None);
-        assert_eq!(module_relative_path("@modules//twin.lua"), None);
-        assert_eq!(module_relative_path("@modules/./here.lua"), None);
+    }
+
+    #[test]
+    fn redundant_separators_are_normalised_away() {
+        // An empty step and a `.` step cannot leave the output root, so they
+        // are folded into the plain names around them rather than refused.
+        assert_eq!(
+            module_relative_path("@modules//twin.lua"),
+            Some(PathBuf::from("@modules/twin.lua"))
+        );
+        assert_eq!(
+            module_relative_path("@modules/./here.lua"),
+            Some(PathBuf::from("@modules/here.lua"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_is_a_separator_on_windows() {
+        assert_eq!(
+            module_relative_path("@modules\\logic\\Foo.lua"),
+            Some(PathBuf::from("@modules/logic/Foo.lua"))
+        );
+        // A parent spelled with the Windows separator still climbs out.
+        assert_eq!(module_relative_path("@modules\\..\\..\\outside.lua"), None);
     }
 
     #[test]
