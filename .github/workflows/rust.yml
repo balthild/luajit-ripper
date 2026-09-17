@@ -52,11 +52,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
-        if: ${{ runner.os != 'Windows' }}
-        uses: mlugg/setup-zig@v1
+        if: ${{ matrix.glibc }}
+        uses: mlugg/setup-zig@v2
 
       - name: Install Cargo Zigbuild
-        if: ${{ runner.os != 'Windows' }}
+        if: ${{ matrix.glibc }}
         run: cargo install cargo-zigbuild
 
       - name: Build Configurations
@@ -72,12 +72,18 @@ jobs:
 
           echo "BUILD_COMMAND=$BUILD_COMMAND" >> "$GITHUB_ENV"
           echo "BUILD_TARGET=$BUILD_TARGET" >> "$GITHUB_ENV"
+          echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
           echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
           echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
           echo "RELEASE_FILE=$RELEASE_FILE" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo "${{ env.BUILD_COMMAND }}" --target="${{ env.BUILD_TARGET }}" --release
+        run: |
+          cargo "${{ env.BUILD_COMMAND }}" \
+            --bin "${{ env.BINARY_NAME }}" \
+            --features cli \
+            --target="${{ env.BUILD_TARGET }}" \
+            --release
 
       - name: Rename
         working-directory: ${{ env.OUTPUT_DIR }}
