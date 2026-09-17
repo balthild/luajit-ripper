@@ -20,6 +20,8 @@ use super::nodes::*;
 use super::traverse::{self, Visitor};
 use crate::bytecode::{DebugInfo, VarKind};
 
+// MARK: entry points
+
 /// Gives every register reference its source level name, where one is known.
 pub fn mark_locals<'a>(root: NodeRef<'a>, alt_mode: bool) {
     traverse::traverse(&mut LocalsMarker::new(alt_mode), root);
@@ -69,7 +71,7 @@ fn identifier_slot<'a>(node: NodeRef<'a>) -> Option<(IdentifierKind, u32)> {
     }
 }
 
-// -- naming registers ------------------------------------------------------
+// MARK: naming registers
 
 struct LocalsState<'a> {
     /// Register references that have not been resolved to a variable yet.
@@ -315,7 +317,7 @@ impl<'a> Visitor<'a> for LocalsMarker<'a> {
     }
 }
 
-// -- marking definitions ---------------------------------------------------
+// MARK: marking definitions
 
 struct DefinitionsState {
     /// For every register, the variable it holds, if one is known.

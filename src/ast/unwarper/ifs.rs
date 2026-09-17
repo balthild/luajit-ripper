@@ -21,6 +21,8 @@ use super::expressions::{compile_expression, invert};
 use super::*;
 use crate::error::{Error, Result};
 
+// MARK: rebuilding ifs
+
 /// Rebuilds the `if` statements of one block list.
 pub fn unwarp_ifs<'a>(
     alloc: &'a Allocator,
@@ -130,8 +132,10 @@ fn unwarp_if_region<'a>(
     Ok(remove_processed_blocks(&blocks, &boundaries))
 }
 
-/// Whether the block opens with a constant that an expression left behind.
-/// One line describing a block, its warp and where the warp goes.
+// MARK: debug trace
+
+/// One line describing a block, its warp and where the warp goes, for the
+/// `LJR_DEBUG_IF` trace.
 fn debug_block<'a>(block: NodeRef<'a>) -> String {
     let index = block_index(block);
     let range = traverse::block_range(block).unwrap_or((0, 0));
@@ -154,6 +158,10 @@ fn debug_block<'a>(block: NodeRef<'a>) -> String {
     )
 }
 
+// MARK: unreachable branches
+
+/// Whether the block assigns `false` and is followed by a block that assigns
+/// `true` and is reached from nowhere else.
 fn unreachable_true_assignment<'a>(
     start: NodeRef<'a>,
     blocks: &[NodeRef<'a>],
@@ -198,6 +206,8 @@ fn unreachable_true_assignment<'a>(
                 .is_some_and(|expression| matches!(&*expression.borrow(), Node::Primitive(primitive)
                     if primitive.kind == PrimitiveKind::True)))
 }
+
+// MARK: statement construction
 
 fn unwarp_if_statement<'a>(
     alloc: &'a Allocator,
@@ -330,6 +340,8 @@ fn unwarp_if_statement<'a>(
     traverse::set_block_contents(alloc, start, contents);
     Ok(())
 }
+
+// MARK: condition
 
 /// Splits the region into the part that holds the condition and the body.
 fn extract_if_expression<'a>(

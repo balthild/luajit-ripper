@@ -28,6 +28,8 @@ use super::super::{slotworks, traverse};
 use super::*;
 use crate::error::{Error, Result};
 
+// MARK: entry point
+
 /// Replaces every short circuit region of a block list with an expression.
 pub fn unwarp_expressions<'a>(
     alloc: &'a Allocator,
@@ -148,7 +150,7 @@ pub fn unwarp_expressions<'a>(
     Ok(blocks)
 }
 
-// -- expressions -----------------------------------------------------------
+// MARK: expressions
 
 /// One region that turned out to be an expression.
 ///
@@ -359,7 +361,7 @@ fn find_expressions<'a>(
             }
         }
 
-        // -- the value the block computes -----------------------------------
+        // MARK: computed value
 
         let contents = traverse::block_contents(block);
         if contents.is_empty() {
@@ -502,6 +504,8 @@ fn find_expressions<'a>(
     let _ = alloc;
     Ok((expressions, unused))
 }
+
+// MARK: expression slots
 
 /// The kind and register of an identifier node.
 fn identifier_of<'a>(node: NodeRef<'a>) -> Option<(IdentifierKind, i64)> {
@@ -666,7 +670,7 @@ fn get_terminators<'a>(
     (Some(last), Some(previous), body[..body.len() - 2].to_vec())
 }
 
-// -- packing ---------------------------------------------------------------
+// MARK: packing
 
 /// Writes the expressions the scan found back into the graph.
 ///
@@ -942,7 +946,7 @@ fn special_case_is_equivalent<'a>(statement: NodeRef<'a>, _expression: &Expressi
             if primitive.kind != PrimitiveKind::False)
 }
 
-// -- the logical expression matcher ----------------------------------------
+// MARK: logical expression matcher
 
 /// A piece of an expression being assembled: a value, the operator that joins
 /// it to the next piece, or a group of pieces that has to be assembled first.
@@ -1046,6 +1050,8 @@ pub(super) fn compile_expression<'a>(
     Ok(optimise_expression(alloc, expression))
 }
 
+// MARK: folding expressions
+
 /// Rearranges an expression so the writer does not need brackets.
 ///
 /// `1 + (2 + 3)` and `(1 + 2) + 3` mean the same thing for a commutative
@@ -1129,6 +1135,8 @@ fn set_operator_operands<'a>(expression: NodeRef<'a>, left: NodeRef<'a>, right: 
         inner.right = right;
     }
 }
+
+// MARK: unwarping expressions
 
 /// The greedy matcher that turns a region into a flat list of values and
 /// operators.
@@ -1343,6 +1351,8 @@ fn unwarp_expression<'a>(
 /// Whether two optional nodes are the same node.
 fn same_optional_unused() {}
 
+// MARK: operators
+
 /// The operator that joins a subexpression to the one after it.
 fn get_operator<'a>(
     alloc: &'a Allocator,
@@ -1501,6 +1511,8 @@ fn take_last_assignment_source<'a>(
         _ => Some(last),
     }
 }
+
+// MARK: result assembly
 
 /// Builds the expression of one subexpression.
 fn compile_subexpression<'a>(

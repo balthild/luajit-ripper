@@ -6,6 +6,8 @@
 //! synthesises them), but keeping them in the table matches LuaJIT exactly and
 //! makes `[JI]FUNC*` decoding well defined.
 
+// MARK: opcode table
+
 /// Operand mode of a single instruction element, mirroring LuaJIT's `BCMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -197,7 +199,11 @@ impl Opcode {
     pub fn name(self) -> &'static str {
         self.def().name
     }
+}
 
+// MARK: predicates
+
+impl Opcode {
     /// The five arithmetic opcodes `ADDVN..MODVN`.
     pub fn is_vn_arith(self) -> bool {
         (ADDVN..=MODVN).contains(&self)
@@ -259,6 +265,8 @@ impl Opcode {
     }
 }
 
+// MARK: operand layouts
+
 /// A single row of the opcode table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpDef {
@@ -288,6 +296,8 @@ impl OpDef {
         matches!(self.c, Mode::Str | Mode::Tab | Mode::Func | Mode::CData)
     }
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

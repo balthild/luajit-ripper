@@ -138,9 +138,7 @@ pub fn prepare(chunk: &'static Chunk<'static>) -> Result<NodeRef<'static>, luaji
 /// A shared, mutable AST node.
 pub use luajit_ripper::ast::nodes::NodeRef;
 
-// ---------------------------------------------------------------------------
-// The corpus
-// ---------------------------------------------------------------------------
+// MARK: corpus
 
 /// How many dumps a run over the corpus looks at by default.
 ///

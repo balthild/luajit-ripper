@@ -35,6 +35,8 @@ use super::nodes::*;
 use super::traverse::{self, Visitor};
 use crate::error::{Error, Result};
 
+// MARK: passes
+
 /// What [`eliminate_temporary`] is allowed to do.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -100,7 +102,7 @@ fn internal(message: &str) -> Error {
     Error::Internal(message.to_string())
 }
 
-// -- statements the pass deleted -------------------------------------------
+// MARK: deleted statements
 
 /// Statements a pass has decided to remove.
 ///
@@ -165,7 +167,7 @@ impl<'a> Visitor<'a> for TreeCleanup<'a, '_> {
     }
 }
 
-// -- node helpers ----------------------------------------------------------
+// MARK: identifier accessors
 
 /// The register of an identifier that still stands for a register.
 fn is_slot_identifier<'a>(node: NodeRef<'a>) -> Option<u32> {
@@ -230,6 +232,8 @@ fn forget_possible_id<'a>(node: NodeRef<'a>, id: u32) {
     }
 }
 
+// MARK: path helpers
+
 fn is_list<'a>(node: NodeRef<'a>) -> bool {
     matches!(
         &*node.borrow(),
@@ -249,6 +253,8 @@ fn get_holder<'a>(path: &[NodeRef<'a>]) -> Option<NodeRef<'a>> {
         .copied()
 }
 
+// MARK: assignment source
+
 /// The value an assignment computes.
 fn assignment_source<'a>(assignment: NodeRef<'a>) -> Result<NodeRef<'a>> {
     let borrowed = assignment.borrow();
@@ -262,6 +268,8 @@ fn assignment_source<'a>(assignment: NodeRef<'a>) -> Result<NodeRef<'a>> {
         .next()
         .ok_or_else(|| internal("an assignment without a value"))
 }
+
+// MARK: replacement helpers
 
 fn replace_in_list<'a>(
     alloc: &'a Allocator,
@@ -294,7 +302,7 @@ fn replace_node<'a>(
     traverse::replace_child(holder, original, replacement)
 }
 
-// -- slot bookkeeping ------------------------------------------------------
+// MARK: slot bookkeeping
 
 /// One place a register is read.
 struct SlotReference<'a> {
@@ -355,7 +363,7 @@ fn new_info<'a>(
 /// most recent one, which is what a plain reference to the register means.
 type KnownSlots<'a> = HashMap<u32, HashMap<i64, Info<'a>>>;
 
-// -- collecting ------------------------------------------------------------
+// MARK: collecting
 
 struct CollectorState<'a> {
     known_slots: KnownSlots<'a>,
@@ -544,6 +552,8 @@ impl<'a> SlotsCollector<'a> {
         (!found.is_empty()).then_some(found)
     }
 
+    // MARK: registering slots
+
     fn commit_info(&mut self, info: Info<'a>) {
         match info.borrow().references.len() {
             0 => {}
@@ -623,6 +633,8 @@ impl<'a> SlotsCollector<'a> {
             identifier: node,
         });
     }
+
+    // MARK: collector walk
 
     fn visit_assignment(
         &mut self,
@@ -790,7 +802,7 @@ fn sort_slots<'a>(slots: &mut [Info<'a>]) {
     slots.sort_by_key(|info| info.borrow().slot_id);
 }
 
-// -- eliminating -----------------------------------------------------------
+// MARK: eliminating
 
 /// One reference that can be replaced by the value it reads.
 struct SimpleReference<'a> {
@@ -844,6 +856,8 @@ fn eliminate_collected<'a>(
 
     Ok(())
 }
+
+// MARK: filling references
 
 /// Decides what to do with every collected register.
 fn fill_refs<'a>(
@@ -952,6 +966,8 @@ fn fill_simple_refs<'a>(
     Ok(())
 }
 
+// MARK: massive references
+
 fn fill_massive_refs<'a>(
     alloc: &'a Allocator,
     info: Info<'a>,
@@ -1050,6 +1066,8 @@ fn fill_massive_refs<'a>(
 
     Ok(())
 }
+
+// MARK: simple cases
 
 /// Inlines the value a register holds into the place that reads it.
 fn eliminate_simple_cases<'a>(
@@ -1306,7 +1324,7 @@ fn eliminate_iterators<'a>(
     Ok(())
 }
 
-// -- rechecking -------------------------------------------------------------
+// MARK: rechecking
 
 /// Runs the pass again over the parts of the tree that hold references which
 /// could not be eliminated the first time round.
@@ -1392,7 +1410,7 @@ fn recheck_unsafe_cases<'a>(
     Ok(())
 }
 
-// -- simplification ---------------------------------------------------------
+// MARK: simplification
 
 /// Marks the calls that are really method calls.
 ///
@@ -1508,7 +1526,7 @@ impl<'a> Visitor<'a> for SimplifyVisitor<'a, '_> {
     }
 }
 
-// -- multiple results -------------------------------------------------------
+// MARK: multiple results
 
 /// Moves the results of a call back to the statement that consumed them.
 ///

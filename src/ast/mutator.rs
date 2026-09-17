@@ -35,6 +35,8 @@ pub fn primary_pass<'a>(alloc: &'a Allocator, root: NodeRef<'a>) {
     traverse::traverse(&mut MutatorVisitor { alloc }, root);
 }
 
+// MARK: primary pass
+
 struct MutatorVisitor<'a> {
     alloc: &'a Allocator,
 }
@@ -92,6 +94,8 @@ fn merge_elseif<'a>(alloc: &'a Allocator, if_node: NodeRef<'a>) {
         inner.else_block = sub_else_block;
     }
 }
+
+// MARK: folding constructors
 
 /// Folds `t.k = v` statements that follow `t = {}` into the constructor.
 fn fill_constructors<'a>(alloc: &'a Allocator, statements: NodeRef<'a>) {
@@ -178,6 +182,8 @@ fn fill_constructor<'a>(
     consumed
 }
 
+// MARK: warp helpers
+
 /// The position of a block in its list.
 fn block_index(block: NodeRef<'_>) -> u32 {
     match &*block.borrow() {
@@ -243,6 +249,8 @@ fn conditional_targets<'a>(
         _ => None,
     }
 }
+
+// MARK: swapping loop warps
 
 struct LoopWarpSwapper<'a> {
     /// `(body, way_out)` of every loop seen so far in this function.
@@ -338,6 +346,8 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
         traverse::set_block_warp(end, start_warp);
         traverse::set_block_warp(start, warp);
     }
+
+    // MARK: unreachable branches
 
     /// Replaces a conditional warp with two identical targets by a branch on
     /// the constant `false`.
@@ -455,6 +465,8 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
         traverse::set_block_contents(self.alloc, target, contents);
     }
 
+    // MARK: materialised conditions
+
     /// Inserts the block that reads the value a condition was stored in.
     ///
     /// LuaJIT evaluates a condition into a register of its own when the source
@@ -530,6 +542,8 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
 
         new_block
     }
+
+    // MARK: walking blocks
 
     /// Remembers a `return` that only closes an upvalue, so that it can be
     /// turned into a `break` once the surrounding loops are known.

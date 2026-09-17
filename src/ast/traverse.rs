@@ -12,6 +12,8 @@ use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 use super::nodes::*;
 pub use super::nodes::{list_contents, set_list_contents};
 
+// MARK: children
+
 /// The direct children of a node, in the order ljd visits them.
 ///
 /// Warp targets are not included: they are part of the graph, not of the tree.
@@ -68,6 +70,8 @@ pub fn children<'a>(node: &Node<'a>) -> Vec<NodeRef<'a>> {
     }
 }
 
+// MARK: identity
+
 /// The address of a node, which is what identity means in this tree.
 ///
 /// The arena never moves what it has handed out, so the address of a node is a
@@ -80,6 +84,8 @@ pub fn node_key(node: NodeRef<'_>) -> usize {
 pub fn same_node(a: NodeRef<'_>, b: NodeRef<'_>) -> bool {
     node_key(a) == node_key(b)
 }
+
+// MARK: walking with visitors
 
 /// Every node reachable from `root`, in depth first order.
 ///
@@ -167,6 +173,8 @@ fn walk_into<'a>(visitor: &mut impl Visitor<'a>, node: NodeRef<'a>, seen: &mut H
     }
     visitor.leave(node);
 }
+
+// MARK: copying
 
 /// Copies a node and everything below it into `alloc`.
 ///
@@ -465,6 +473,8 @@ fn clone_shallow<'a>(
     }
 }
 
+// MARK: lookups
+
 /// Every function definition in the tree, including the root.
 pub fn functions<'a>(root: NodeRef<'a>) -> Vec<NodeRef<'a>> {
     walk(root)
@@ -512,6 +522,8 @@ fn collect_own_statement_lists<'a>(
         collect_own_statement_lists(child, false, result);
     }
 }
+
+// MARK: replacing
 
 /// Replaces the child `old` of `parent` with `new`.
 ///
@@ -640,6 +652,8 @@ fn replace_in_list<'a>(
     false
 }
 
+// MARK: blocks
+
 /// The targets a warp can jump to.
 pub fn block_targets<'a>(warp: &Node<'a>) -> Vec<NodeRef<'a>> {
     match warp {
@@ -735,6 +749,8 @@ pub fn jump_target<'a>(warp: &Node<'a>) -> Option<NodeRef<'a>> {
         _ => None,
     }
 }
+
+// MARK: list lookups
 
 /// Whether `items` contains `node`, comparing identity.
 pub fn contains<'a>(items: &[NodeRef<'a>], node: NodeRef<'a>) -> bool {

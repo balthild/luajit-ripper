@@ -8,6 +8,8 @@ use super::prototype::Prototype;
 use super::reader::{Reader, as_signed_32, assemble_double};
 use crate::error::{Error, Result};
 
+// MARK: constants
+
 /// GC constant tag: a child prototype.
 pub const KGC_CHILD: u32 = 0;
 /// GC constant tag: a template table.
@@ -183,6 +185,8 @@ impl<'a> Constants<'a> {
     }
 }
 
+// MARK: reading
+
 /// Reads the upvalue references, GC constants and number constants of a
 /// prototype.
 ///
@@ -336,6 +340,8 @@ pub fn assemble_i64(low: u32, high: u32) -> i64 {
 pub fn assemble_u64(low: u32, high: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

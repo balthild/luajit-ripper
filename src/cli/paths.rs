@@ -18,6 +18,8 @@ use walkdir::WalkDir;
 
 use crate::cli::Error;
 
+// MARK: job
+
 /// Extension of the dumps this tool reads.
 pub const DUMP_EXTENSION: &str = "ljbc";
 /// Extension given to the decompiled output.
@@ -64,6 +66,8 @@ pub struct Target {
     /// Whether `path` comes from the chunk name rather than the input location.
     pub from_module: bool,
 }
+
+// MARK: resolving paths
 
 /// Works out where a run reads from and writes to.
 ///
@@ -193,6 +197,8 @@ pub fn dumps(input: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(files)
 }
 
+// MARK: targets
+
 impl Tree {
     /// Where the dump `file` is written, given the chunk name it carries.
     ///
@@ -240,6 +246,8 @@ impl Tree {
         unchanged(&target.path, file).then_some(target)
     }
 }
+
+// MARK: stamps
 
 /// Whether `source` was written at the very moment `dump` was made.
 ///
@@ -295,6 +303,8 @@ pub fn stamp(source: &Path, dump: &Path) -> Result<(), Error> {
         .and_then(|file| file.set_modified(time))
         .map_err(|error| io_error(source, error))
 }
+
+// MARK: module paths
 
 /// Turns the chunk name of a dump into a path relative to the output root.
 ///
@@ -355,6 +365,8 @@ fn io_error(path: &Path, source: io::Error) -> Error {
         source,
     }
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

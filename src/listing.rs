@@ -17,6 +17,8 @@ use crate::bytecode::constants::{Const, NumConst};
 use crate::bytecode::opcodes::Mode;
 use crate::bytecode::{Chunk, Ins, Opcode, Prototype};
 
+// MARK: listing
+
 /// Renders the whole chunk, nested functions included, the way `luajit -bl`
 /// does.
 pub fn dump(chunk: &Chunk) -> String {
@@ -198,6 +200,8 @@ fn location(chunk: &Chunk, line: u32) -> String {
     format!("{}:{line}", short_source_name(chunk))
 }
 
+// MARK: names
+
 /// Chunk names are `@path/file.lua`, `=literal` or raw; LuaJIT prints the
 /// basename for `@` names.
 pub fn short_source_name(chunk: &Chunk) -> String {
@@ -208,6 +212,8 @@ pub fn short_source_name(chunk: &Chunk) -> String {
         _ => name.to_string(),
     }
 }
+
+// MARK: values
 
 /// Renders a string constant the way LuaJIT's listing does.
 ///
@@ -271,6 +277,8 @@ pub fn format_double(value: f64) -> String {
     };
     fixed.to_string()
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

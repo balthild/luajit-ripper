@@ -24,6 +24,8 @@ use crate::cli::paths::{self, Job, Sink, Tree};
 use crate::cli::progress::Progress;
 use crate::cli::{Error, Failure};
 
+// MARK: running jobs
+
 /// Decompiles everything `job` asks for.
 pub fn run(job: &Job, options: &Options, threads: usize) -> Result<Summary, Error> {
     match &job.sink {
@@ -114,6 +116,8 @@ fn chunk_name(file: &Path) -> Option<String> {
             .map(str::to_owned)
     })
 }
+
+// MARK: writing trees
 
 /// Walks the input directory and decompiles everything it holds.
 fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Result<Summary, Error> {
@@ -256,6 +260,8 @@ fn write_to(path: &Path, source: &str) -> Result<(), Error> {
     })
 }
 
+// MARK: outcomes
+
 /// What happened to one dump.
 struct Outcome {
     /// Dump this is about.
@@ -300,6 +306,8 @@ fn below(root: &Path, path: &Path) -> String {
         .display()
         .to_string()
 }
+
+// MARK: summary
 
 /// What a run did.
 #[derive(Debug, Default)]
@@ -444,6 +452,8 @@ impl Summary {
         );
     }
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

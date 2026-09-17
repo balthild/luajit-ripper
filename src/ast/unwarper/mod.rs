@@ -20,6 +20,8 @@ use super::nodes::*;
 use super::{slotworks, traverse};
 use crate::error::{Error, Result};
 
+// MARK: unwarper
+
 /// How the passes react to a graph they cannot structure.
 ///
 /// Some control flow graphs cannot be turned back into statements: a jump does
@@ -167,7 +169,7 @@ fn warpins<'a>(block: NodeRef<'a>) -> u32 {
     }
 }
 
-// -- control flow helpers --------------------------------------------------
+// MARK: control flow helpers
 
 /// Identity of a node, for the sets the passes keep.
 fn node_key<'a>(node: NodeRef<'a>) -> usize {
@@ -416,6 +418,8 @@ fn contains_primitive_condition<'a>(block: NodeRef<'a>) -> bool {
     false
 }
 
+// MARK: body extraction
+
 /// The region that starts at `start_index`: its body, its end, and the position
 /// of that end.
 fn extract_if_body<'a>(
@@ -470,6 +474,8 @@ fn create_next_block<'a>(alloc: &'a Allocator, original: NodeRef<'a>) -> NodeRef
         )),
     )
 }
+
+// MARK: cleanups
 
 /// Merges blocks that are only reachable through the fallthrough edge of their
 /// predecessor.
@@ -645,7 +651,7 @@ pub fn trim_redundant_returns<'a>(alloc: &'a Allocator, root: NodeRef<'a>) -> Re
     Ok(())
 }
 
-// -- helpers ---------------------------------------------------------------
+// MARK: block index
 
 fn block_index<'a>(block: NodeRef<'a>) -> u32 {
     match &*block.borrow() {

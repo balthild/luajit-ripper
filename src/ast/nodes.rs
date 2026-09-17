@@ -18,6 +18,8 @@ use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::bytecode::DebugInfo;
 
+// MARK: building nodes
+
 /// A shared, mutable AST node.
 ///
 /// Nodes are allocated in an arena and never freed individually, so a plain
@@ -125,10 +127,11 @@ pub fn records<'a>(
 pub fn primitive<'a>(alloc: &'a Allocator, kind: PrimitiveKind) -> NodeRef<'a> {
     node(alloc, Node::Primitive(Primitive { kind }))
 }
+
 /// Every kind of node the decompiler knows about.
 #[derive(Debug)]
 pub enum Node<'a> {
-    // -- lists -------------------------------------------------------------
+    // MARK: list kinds
     /// A list of statements.
     Statements(ArenaVec<'a, NodeRef<'a>>),
     /// A list of expressions.
@@ -140,7 +143,7 @@ pub enum Node<'a> {
     /// A list of table constructor records.
     Records(ArenaVec<'a, NodeRef<'a>>),
 
-    // -- statements --------------------------------------------------------
+    // MARK: statement kinds
     /// An assignment; `kind` distinguishes `local x = 1` from `x = 1`.
     Assignment(ArenaBox<'a, Assignment<'a>>),
     /// A function call used as a statement.
@@ -166,7 +169,7 @@ pub enum Node<'a> {
     /// An `elseif` branch.
     ElseIf(ArenaBox<'a, ElseIf<'a>>),
 
-    // -- expressions -------------------------------------------------------
+    // MARK: expression kinds
     /// A variable reference.
     Identifier(ArenaBox<'a, Identifier<'a>>),
     /// A table indexing expression.
@@ -190,7 +193,7 @@ pub enum Node<'a> {
     /// A key/value pair inside a table constructor.
     TableRecord(ArenaBox<'a, TableRecord<'a>>),
 
-    // -- control flow graph ------------------------------------------------
+    // MARK: control flow kinds
     /// A basic block. Only present before unwarping.
     Block(ArenaBox<'a, Block<'a>>),
     /// An unconditional jump or fallthrough.
@@ -204,6 +207,8 @@ pub enum Node<'a> {
     /// The end of a function.
     EndWarp(ArenaBox<'a, EndWarp<'a>>),
 }
+
+// MARK: accessors
 
 impl<'a> Node<'a> {
     /// Human readable node kind, used in error messages.
@@ -364,6 +369,8 @@ impl fmt::Display for Node<'_> {
     }
 }
 
+// MARK: lists
+
 /// Reads the contents of a list node.
 ///
 /// The copy is a plain `Vec`: it is a snapshot the caller works on, not part of
@@ -396,6 +403,8 @@ pub fn push<'a>(node: NodeRef<'a>, child: NodeRef<'a>) {
     }
 }
 
+// MARK: metadata
+
 /// Replaces the metadata of a node.
 ///
 /// Nodes that carry no metadata of their own are left alone.
@@ -404,6 +413,8 @@ pub fn set_meta<'a>(node: NodeRef<'a>, meta: Meta) {
         *target = meta;
     }
 }
+
+// MARK: recovery markers
 
 /// Records that a pass gave up on `node`.
 pub fn mark_error<'a>(node: NodeRef<'a>) {
@@ -437,6 +448,8 @@ pub fn has_failure<'a>(node: NodeRef<'a>) -> bool {
 pub fn has_recovery<'a>(node: NodeRef<'a>) -> bool {
     has_error(node) || has_failure(node)
 }
+
+// MARK: statements
 
 /// `local x = 1` versus `x = 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,6 +554,8 @@ pub struct FunctionDefinition<'a> {
     pub meta: Meta,
 }
 
+// MARK: identifiers
+
 /// What an identifier refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierKind {
@@ -603,6 +618,8 @@ impl<'a> Identifier<'a> {
     }
 }
 
+// MARK: table elements
+
 /// A table indexing expression.
 #[derive(Debug)]
 pub struct TableElement<'a> {
@@ -610,6 +627,8 @@ pub struct TableElement<'a> {
     pub key: NodeRef<'a>,
     pub meta: Meta,
 }
+
+// MARK: constants
 
 /// The value of a literal constant.
 #[derive(Debug, Clone, PartialEq)]
@@ -631,6 +650,8 @@ pub struct Constant<'a> {
     pub meta: Meta,
 }
 
+// MARK: primitives
+
 /// `nil`, `false` or `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimitiveKind {
@@ -644,6 +665,8 @@ pub enum PrimitiveKind {
 pub struct Primitive {
     pub kind: PrimitiveKind,
 }
+
+// MARK: tables
 
 /// A table constructor.
 #[derive(Debug)]
@@ -667,6 +690,8 @@ pub struct TableRecord<'a> {
     pub value: NodeRef<'a>,
     pub meta: Meta,
 }
+
+// MARK: operators
 
 /// A binary operator.
 #[derive(Debug)]
@@ -833,6 +858,8 @@ impl UnaryOperatorKind {
         }
     }
 }
+
+// MARK: control flow graph
 
 /// A basic block of the control flow graph.
 #[derive(Debug)]

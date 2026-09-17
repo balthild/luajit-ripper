@@ -17,6 +17,8 @@ use super::expressions::compile_expression;
 use super::*;
 use crate::error::{Error, Result};
 
+// MARK: entry point
+
 /// Which kind of `break` a block holds, for the pass that retargets the warps
 /// that leave a loop.
 const BREAK_INFINITE: u8 = 0;
@@ -133,6 +135,8 @@ pub fn fix_loops<'a>(
     validate_block_list(&blocks)?;
     Ok(blocks)
 }
+
+// MARK: finding loops
 
 /// Verifies that no back edge is left over.
 ///
@@ -292,6 +296,8 @@ fn find_all_loops<'a>(
     Ok(loops)
 }
 
+// MARK: cleaning up nested loops
+
 /// Retargets the jumps back to the start of nested loops, so that each one ends
 /// at the block that follows its body.
 fn cleanup_breaks_and_if_ends<'a>(
@@ -429,6 +435,8 @@ fn handle_single_loop<'a>(
     new_blocks.extend_from_slice(&blocks[end_index..]);
     Ok(new_blocks)
 }
+
+// MARK: breaking out
 
 /// Puts the loop into a block of its own and turns the jumps back into it into
 /// `break`s.
@@ -651,6 +659,8 @@ fn unwarp_breaks<'a>(
     Ok(())
 }
 
+// MARK: jump ends
+
 /// The blocks a jump chain can end at, starting at `block`.
 fn gather_possible_ends<'a>(block: NodeRef<'a>) -> Result<HashSet<usize>> {
     let mut ends: HashSet<usize> = HashSet::new();
@@ -684,6 +694,8 @@ struct BuiltLoop<'a> {
     node: NodeRef<'a>,
     body: Vec<NodeRef<'a>>,
 }
+
+// MARK: loop node construction
 
 /// Builds the loop node of a region.
 fn unwarp_loop<'a>(
@@ -1035,6 +1047,8 @@ fn unwarp_loop<'a>(
     })
 }
 
+// MARK: nested ifs
+
 /// Gives the last block of a loop body a place to leave the loop from.
 ///
 /// Both targets of a branch cannot point at the same block, so a block is added
@@ -1093,6 +1107,8 @@ fn fix_expression<'a>(blocks: &[NodeRef<'a>], start: NodeRef<'a>, end: NodeRef<'
         }
     }
 }
+
+// MARK: validation
 
 /// Checks that everything a loop body branches to is inside it.
 fn validate_loop_body<'a>(body: &[NodeRef<'a>]) -> Result<()> {
@@ -1174,6 +1190,8 @@ fn validate_block_list<'a>(blocks: &[NodeRef<'a>]) -> Result<()> {
 
     Ok(())
 }
+
+// MARK: block list helpers
 
 /// The block list of a loop node.
 fn set_statements<'a>(alloc: &'a Allocator, loop_node: NodeRef<'a>, body: &[NodeRef<'a>]) {

@@ -27,6 +27,8 @@ use crate::ast::traverse;
 use crate::bytecode::{SLOT_FALSE, SLOT_TRUE};
 use crate::error::{Error, Result};
 
+// MARK: options
+
 /// How the output is indented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Indent {
@@ -96,6 +98,8 @@ impl Default for Options {
         }
     }
 }
+
+// MARK: entry point
 
 /// Renders a function definition and everything inside it.
 ///
@@ -198,7 +202,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    // -- the printing queue ------------------------------------------------
+    // MARK: queue rendering
 
     fn start_statement(&mut self, statement: Statement) {
         self.state().current_statement = statement;
@@ -253,7 +257,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.visit_node(key);
     }
 
-    // -- statements --------------------------------------------------------
+    // MARK: statements
 
     fn visit_function_definition(&mut self, node: NodeRef<'a>) {
         let (arguments, statements) = {
@@ -493,6 +497,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(statement);
     }
 
+    // MARK: expression statements
+
     fn visit_binary_operator(&mut self, node: NodeRef<'a>) {
         let (kind, left, right) = {
             let borrowed = node.borrow();
@@ -701,6 +707,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
+    // MARK: control flow
+
     fn visit_if(&mut self, node: NodeRef<'a>) {
         let (expression, then_block, elseifs, else_block) = {
             let borrowed = node.borrow();
@@ -875,7 +883,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::Break);
     }
 
-    // -- lists and values --------------------------------------------------
+    // MARK: lists
 
     fn visit_statements_list(&mut self, node: NodeRef<'a>) {
         if self.states.len() > 1 {
@@ -941,6 +949,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.visit_node(contents.last().expect("checked above"));
         self.end_line();
     }
+
+    // MARK: values
 
     fn visit_identifier(&mut self, node: NodeRef<'a>) {
         enum Action {
@@ -1130,7 +1140,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.write(text);
     }
 
-    // -- the walk ----------------------------------------------------------
+    // MARK: walk
 
     /// Prints a node and its children.
     fn visit_node(&mut self, node: NodeRef<'a>) {
@@ -1281,6 +1291,8 @@ enum Action {
     Nothing,
 }
 
+// MARK: operators
+
 /// The `bit` library function for an operator, when there is one.
 fn bit_library_name(kind: BinaryOperatorKind) -> Option<&'static str> {
     use BinaryOperatorKind::*;
@@ -1323,6 +1335,8 @@ fn binary_kind_of(node: NodeRef<'_>) -> Option<BinaryOperatorKind> {
         _ => None,
     }
 }
+
+// MARK: node predicates
 
 /// Whether a node is a register that stands for one of the constants `false`
 /// and `true`.
@@ -1411,6 +1425,8 @@ fn is_method(destination: NodeRef<'_>, function: NodeRef<'_>) -> bool {
     matches!(&*destination.borrow(), Node::TableElement(_))
 }
 
+// MARK: names
+
 /// Whether a key can be written as a name.
 fn is_valid_name(key: NodeRef<'_>) -> bool {
     let Node::Constant(constant) = &*key.borrow() else {
@@ -1439,6 +1455,8 @@ const RESERVED_WORDS: [&str; 21] = [
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local",
     "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
 ];
+
+// MARK: value formatting
 
 /// Reads the bytes of a string constant as text.
 ///
@@ -1541,7 +1559,7 @@ fn format_number(value: f64) -> String {
     text
 }
 
-// -- printing the queue ----------------------------------------------------
+// MARK: queue rendering
 
 /// The next command that is neither a line break nor text.
 fn next_significant(queue: &[Command], index: usize) -> Option<&Command> {

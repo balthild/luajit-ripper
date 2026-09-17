@@ -21,6 +21,8 @@ use crate::bytecode::opcodes::{Mode, Opcode};
 use crate::bytecode::{Chunk, Const, ConstKey, Ins, Prototype};
 use crate::error::{Error, Result};
 
+// MARK: instruction tables
+
 /// Instructions that end a block and encode a jump target.
 const JUMP_WARP_INSTRUCTIONS: [Opcode; 5] = [
     Opcode::UCLO,
@@ -46,12 +48,16 @@ const WARP_INSTRUCTIONS: [Opcode; 12] = [
     Opcode::LOOP,
 ];
 
+// MARK: sentinel slots
+
 /// Register slot number that stands for the constant `true`.
 const SLOT_TRUE: u32 = 2_000_000_001;
 
 /// Register slot number that stands for the constant `false`.
 #[allow(dead_code)]
 const SLOT_FALSE: u32 = 2_000_000_000;
+
+// MARK: warp predicates
 
 fn is_jump_warp(op: Opcode) -> bool {
     JUMP_WARP_INSTRUCTIONS.contains(&op)
@@ -60,6 +66,8 @@ fn is_jump_warp(op: Opcode) -> bool {
 fn is_warp(op: Opcode) -> bool {
     WARP_INSTRUCTIONS.contains(&op)
 }
+
+// MARK: builder
 
 /// Mutable state of one prototype while it is being built.
 struct Builder<'a> {
@@ -107,7 +115,7 @@ pub fn build_function<'a>(
 }
 
 impl<'a> Builder<'a> {
-    // -- node construction -------------------------------------------------
+    // MARK: node construction
 
     /// Allocates a node in the arena this builder writes to.
     fn node(&self, value: Node<'a>) -> NodeRef<'a> {
@@ -119,7 +127,7 @@ impl<'a> Builder<'a> {
         ArenaBox::new_in(value, &self.alloc)
     }
 
-    // -- entry points ------------------------------------------------------
+    // MARK: entry points
 
     fn build_function_definition(&mut self, prototype: &Prototype<'a>) -> Result<NodeRef<'a>> {
         let mut arguments = Vec::new();
@@ -276,7 +284,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    // -- block splitting ---------------------------------------------------
+    // MARK: block splitting
 
     fn blockenize(&mut self) -> Result<()> {
         self.fix_inverted_comparison_expressions();
@@ -623,7 +631,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    // -- statements --------------------------------------------------------
+    // MARK: statements
 
     fn build_statement(
         &mut self,
@@ -953,7 +961,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    // -- expressions -------------------------------------------------------
+    // MARK: expressions
 
     fn build_binary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
         let kind = binary_operator_kind(instruction.op)
@@ -1272,7 +1280,7 @@ impl<'a> Builder<'a> {
         primitive(self.alloc, kind)
     }
 
-    // -- instruction repair passes -----------------------------------------
+    // MARK: instruction repair passes
 
     /// LuaJIT sometimes emits `constant < variable`; rewrite it as
     /// `variable > constant`.
@@ -1554,6 +1562,8 @@ impl<'a> Builder<'a> {
     }
 }
 
+// MARK: operator lookup
+
 fn binary_operator_kind(op: Opcode) -> Option<BinaryOperatorKind> {
     use BinaryOperatorKind::*;
     Some(match op {
@@ -1566,6 +1576,8 @@ fn binary_operator_kind(op: Opcode) -> Option<BinaryOperatorKind> {
         _ => return None,
     })
 }
+
+// MARK: block index
 
 fn block_index(block: NodeRef<'_>) -> u32 {
     match &*block.borrow() {

@@ -7,6 +7,8 @@ use super::arena_str;
 use super::reader::Reader;
 use crate::error::{Error, Result};
 
+// MARK: debug info
+
 /// Terminator of the variable info list.
 pub const VARNAME_END: u8 = 0;
 
@@ -125,6 +127,8 @@ impl<'a> DebugInfo<'a> {
     }
 }
 
+// MARK: reading
+
 /// Reads the debug information of a prototype, storing it in `alloc`.
 ///
 /// `block_end` is the offset one past the end of the prototype's data, which is
@@ -212,6 +216,8 @@ fn read_variable_info<'a>(
         "variable info is not terminated before the end of the prototype".into(),
     ))
 }
+
+// MARK: tests
 
 #[cfg(test)]
 mod tests {

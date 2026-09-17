@@ -10,6 +10,8 @@ use super::opcodes::Opcode;
 use super::reader::Reader;
 use crate::error::{Error, Result};
 
+// MARK: flags
+
 /// The prototype has child prototypes.
 pub const PROTO_CHILD: u8 = 0x01;
 /// The prototype is a vararg function.
@@ -76,6 +78,8 @@ impl ProtoFlags {
         self.0 & PROTO_BITOP != 0
     }
 }
+
+// MARK: prototype
 
 /// A single LuaJIT function prototype.
 #[derive(Debug, PartialEq)]
@@ -150,6 +154,8 @@ impl<'a> Prototype<'a> {
         self.constants.knum_at(index)
     }
 }
+
+// MARK: reading
 
 /// Reads every prototype of a dump.
 ///
