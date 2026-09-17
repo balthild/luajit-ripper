@@ -57,13 +57,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Zig
-        if: ${{ matrix.glibc }}
-        uses: mlugg/setup-zig@v2
-
       - name: Install Cargo Zigbuild
         if: ${{ matrix.glibc }}
-        run: cargo install cargo-zigbuild
+        run: |
+          pipx install cargo-zigbuild --include-deps
+          ln -s "$HOME/.local/bin/python-zig" "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build Configurations
         run: |
