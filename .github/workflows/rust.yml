@@ -61,8 +61,6 @@ jobs:
         if: ${{ matrix.glibc }}
         run: |
           pipx install cargo-zigbuild --include-deps
-          pipx list
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "CARGO_ZIGBUILD_ZIG_PATH=python-zig" >> "$GITHUB_ENV"
 
       - name: Build Configurations
