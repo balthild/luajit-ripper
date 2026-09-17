@@ -233,6 +233,12 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
         )),
     );
 
+    // The function is marked as well as emptied: what it says is written out,
+    // so nothing that reads the source can tell it apart from a function that
+    // was decompiled. `has_recovery` is what tells a caller the chunk it just
+    // got back is only partly decompiled.
+    crate::ast::nodes::mark_failure(function);
+
     if let Node::FunctionDefinition(inner) = &mut *function.borrow_mut() {
         crate::ast::nodes::set_list_contents(alloc, inner.statements, [call]);
     }

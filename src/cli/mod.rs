@@ -6,6 +6,7 @@
 
 pub mod allocator;
 pub mod paths;
+pub mod progress;
 pub mod run;
 
 use std::io;
@@ -54,6 +55,10 @@ pub enum Error {
     /// The source could not be written to stdout.
     #[error("cannot write to stdout: {0}")]
     Stdout(io::Error),
+
+    /// The progress could not be written to stderr.
+    #[error("cannot write to stderr: {0}")]
+    Progress(io::Error),
 }
 
 /// A failure for one dump.

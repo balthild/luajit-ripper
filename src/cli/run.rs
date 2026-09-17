@@ -3,17 +3,25 @@
 //! Dumps are decompiled on a thread pool and written as they finish, but the
 //! report is printed once every worker is done and in input order, so what a
 //! run says does not depend on how many threads it used.
+//!
+//! A run over a directory also says where it is as it goes: every dump that
+//! comes out is announced on stderr. The workers do not write anything
+//! themselves — they send a message down a channel, and the thread that started
+//! the run is the only one that ever writes, so the lines cannot be interleaved
+//! and the terminal is not asked to render something half written.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use luajit_ripper::{Options, ast, bytecode, decompile_ast};
 use rayon::prelude::*;
 
 use crate::cli::allocator::with_allocator;
 use crate::cli::paths::{self, Job, Sink, Tree};
+use crate::cli::progress::Progress;
 use crate::cli::{Error, Failure};
 
 /// Decompiles everything `job` asks for.
@@ -21,11 +29,11 @@ pub fn run(job: &Job, options: &Options, threads: usize) -> Result<Summary, Erro
     match &job.sink {
         Sink::Stdout => to_stdout(&job.input, options),
         Sink::File(path) => {
-            let (source, _) = decompile(&job.input, options).map_err(|failure| Error::Failed {
+            let decompiled = decompile(&job.input, options).map_err(|failure| Error::Failed {
                 path: job.input.clone(),
                 reason: failure.to_string(),
             })?;
-            write_to(path, &source)?;
+            write_to(path, &decompiled.source)?;
             Ok(Summary::one())
         }
         Sink::Tree(tree) => to_tree(&job.input, tree, options, threads),
@@ -34,25 +42,39 @@ pub fn run(job: &Job, options: &Options, threads: usize) -> Result<Summary, Erro
 
 /// Decompiles one dump, writing the source to stdout.
 fn to_stdout(input: &Path, options: &Options) -> Result<Summary, Error> {
-    let (source, _) = decompile(input, options).map_err(|failure| Error::Failed {
+    let decompiled = decompile(input, options).map_err(|failure| Error::Failed {
         path: input.to_path_buf(),
         reason: failure.to_string(),
     })?;
 
     let mut stdout = io::stdout().lock();
     stdout
-        .write_all(source.as_bytes())
+        .write_all(decompiled.source.as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(Error::Stdout)?;
     Ok(Summary::one())
 }
 
-/// Reads a dump and decompiles it, giving back the source and the chunk name.
+/// A dump that was decompiled.
+struct Decompiled {
+    /// The source of the chunk.
+    source: String,
+    /// The name the chunk was compiled from, when it records one.
+    name: Option<String>,
+    /// Whether any part of the chunk had to be given up on.
+    ///
+    /// This is what tells a chunk that came out whole from one that only came
+    /// out in part; see [`ast::nodes::has_recovery`].
+    recovered: bool,
+}
+
+/// Reads a dump and decompiles it.
 ///
 /// The allocator the passes work in belongs to the calling thread, and is
 /// emptied on the way out: everything that has to survive the call is copied
-/// into the returned values first.
-fn decompile(file: &Path, options: &Options) -> Result<(String, Option<String>), Failure> {
+/// into the returned values first. The walk over the chunk is the last thing
+/// done inside it, since it is what has to look at the nodes before they go.
+fn decompile(file: &Path, options: &Options) -> Result<Decompiled, Failure> {
     let data = fs::read(file).map_err(Failure::Read)?;
     with_allocator(|alloc| {
         let chunk = bytecode::parse(alloc, &data)?;
@@ -61,7 +83,14 @@ fn decompile(file: &Path, options: &Options) -> Result<(String, Option<String>),
         let name = chunk.header.name.map(str::to_owned);
         let root = ast::builder::build(alloc, &chunk)?;
         let source = decompile_ast(alloc, root, options)?;
-        Ok::<_, luajit_ripper::Error>((source, name))
+        let recovered = ast::traverse::walk(root)
+            .into_iter()
+            .any(ast::nodes::has_recovery);
+        Ok::<_, luajit_ripper::Error>(Decompiled {
+            source,
+            name,
+            recovered,
+        })
     })
     .map_err(Failure::Decompile)
 }
@@ -69,20 +98,69 @@ fn decompile(file: &Path, options: &Options) -> Result<(String, Option<String>),
 /// Walks the input directory and decompiles everything it holds.
 fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Result<Summary, Error> {
     let files = paths::dumps(input)?;
+    let mut progress = Progress::stderr(files.len());
 
-    // `num_threads(0)` asks rayon to pick a number itself, which is what the
-    // default of `--threads` means.
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(Error::Pool)?;
+    // The workers report on a channel rather than writing themselves: the lines
+    // would otherwise be interleaved, and a half written line on a terminal is
+    // not something a second writer can take back.
+    let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
 
-    let outcomes: Vec<Outcome> = pool.install(|| {
-        files
-            .par_iter()
-            .map(|file| work(file, input, tree, options))
-            .collect()
-    });
+    // The pool runs on a thread of its own so that building it, handing it the
+    // work and closing the channel are one step: the bridge owns the sender, and
+    // dropping it is what ends the loop below, which is why it is the bridge
+    // rather than the main thread that has to hold it. Installing the pool from
+    // the main thread would mean sending every outcome before the report can
+    // start, which is exactly what the report does not need.
+    let outcomes = std::thread::scope(|scope| {
+        // `dumps` is borrowed rather than moved, so that the main thread keeps
+        // the list it needs for the report.
+        let dumps = &files;
+        let bridge = scope.spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(Error::Pool)?;
+
+            pool.install(|| {
+                dumps.par_iter().enumerate().for_each(|(index, file)| {
+                    let outcome = work(file, input, tree, options);
+                    // A closed channel means the receiver is gone, which can only
+                    // happen after a failure to write the progress, and the run
+                    // is ending anyway.
+                    let _ = sender.send((index, outcome));
+                });
+            });
+
+            Ok::<_, Error>(())
+        });
+
+        // The outcomes are named here, as they arrive: this is the only thread
+        // that writes, and it writes in the order the dumps were finished. The
+        // report is built afterwards and in input order, so how many threads
+        // ran the work still does not change what the run says.
+        let mut collected: Vec<Option<Outcome>> = (0..files.len()).map(|_| None).collect();
+        for (index, outcome) in receiver {
+            progress.step(&outcome.shown).map_err(Error::Progress)?;
+            collected[index] = Some(outcome);
+        }
+
+        // The channel is closed because the bridge dropped the sender, so there
+        // is nothing left to wait for but the pool itself.
+        let bridged = bridge.join().expect("the bridge thread does not panic");
+        if bridged.is_err() {
+            // The pool never ran, so there is no line to keep: it is cleared
+            // here so that the failure that follows is not reported on top of
+            // a name that never finished.
+            progress.finish().ok();
+        }
+        bridged?;
+
+        progress.finish().map_err(Error::Progress)?;
+        Ok::<_, Error>(collected)
+    })?;
+
+    // A worker sends exactly one outcome per dump, so every slot is filled.
+    let outcomes: Vec<Outcome> = outcomes.into_iter().flatten().collect();
 
     Ok(Summary::of(&files, &outcomes, tree.module_structure))
 }
@@ -90,18 +168,27 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
 /// Decompiles one dump and writes it below the output root.
 fn work(file: &Path, input: &Path, tree: &Tree, options: &Options) -> Outcome {
     let written = (|| {
-        let (source, name) = decompile(file, options)?;
-        let target = tree.target(input, file, name.as_deref());
+        let decompiled = decompile(file, options)?;
+        let target = tree.target(input, file, decompiled.name.as_deref());
         tree.prepare(&target.path)?;
-        write_to(&target.path, &source)?;
+        write_to(&target.path, &decompiled.source)?;
         Ok::<_, Failure>(Written {
             target: target.path,
             from_module: target.from_module,
+            recovered: decompiled.recovered,
         })
     })();
 
+    // A dump that was written is named by its output path, one that failed by
+    // its input path: there is no output path to name it by.
+    let shown = match &written {
+        Ok(written) => below(&tree.root, &written.target),
+        Err(_) => below(input, file),
+    };
+
     Outcome {
         input: file.to_path_buf(),
+        shown,
         result: written.map_err(|failure| failure.to_string()),
     }
 }
@@ -118,6 +205,14 @@ fn write_to(path: &Path, source: &str) -> Result<(), Error> {
 struct Outcome {
     /// Dump this is about.
     input: PathBuf,
+    /// How the progress names this dump.
+    ///
+    /// A dump that was written is named by where its source went, below the
+    /// output root, which is the name that tells two dumps apart. One that
+    /// failed has no output path, so it is named by where it was read from,
+    /// below the input root: a dump path is long, and what a reader wants to
+    /// see go by is the part of it the run was pointed at.
+    shown: String,
     /// Where the source went, or why it did not.
     result: Result<Written, String>,
 }
@@ -128,6 +223,16 @@ struct Written {
     target: PathBuf,
     /// Whether the chunk name, rather than the input location, chose it.
     from_module: bool,
+    /// Whether the chunk had to be given up on in part.
+    recovered: bool,
+}
+
+/// A path below `root`, or the path itself when it is not below it.
+fn below(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 /// What a run did.
@@ -137,10 +242,13 @@ pub struct Summary {
     total: usize,
     /// Dumps that were written.
     written: usize,
-    /// Output paths taken from the chunk name.
-    module_paths: usize,
-    /// Output paths that had to fall back to the input location.
-    fallbacks: usize,
+    /// Dumps that were written but had to be given up on in part.
+    ///
+    /// Every one of these is also counted in `written`; what separates them is
+    /// that something inside the chunk was not recovered, so the source is not a
+    /// faithful rendering of the dump. Only `--mark-errors` lets a run finish
+    /// this way: without it a chunk that cannot be recovered fails outright.
+    partial: usize,
     /// Output paths that were written more than once.
     collisions: usize,
     /// Failures, counted by reason.
@@ -183,10 +291,13 @@ impl Summary {
             match &outcome.result {
                 Ok(written) => {
                     summary.written += 1;
-                    if written.from_module {
-                        summary.module_paths += 1;
-                    } else if module_structure {
-                        summary.fallbacks += 1;
+                    if written.recovered {
+                        summary.partial += 1;
+                    }
+                    // A path that did not come from the chunk name is one the
+                    // run had to fall back on, which is only worth mentioning
+                    // when a module path was asked for in the first place.
+                    if !written.from_module && module_structure {
                         summary
                             .fell_back
                             .push((outcome.input.clone(), written.target.clone()));
@@ -222,16 +333,6 @@ impl Summary {
             eprintln!("{}: written more than once", target.display());
         }
 
-        eprintln!("decompiled {} of {} files", self.written, self.total);
-        if self.module_paths > 0 {
-            eprintln!(
-                "{} output paths came from the chunk name",
-                self.module_paths
-            );
-        }
-        if self.fallbacks > 0 {
-            eprintln!("{} fell back to the input location", self.fallbacks);
-        }
         if self.collisions > 0 {
             eprintln!(
                 "{} output paths were written more than once",
@@ -244,6 +345,18 @@ impl Summary {
         for (reason, count) in reasons.iter().take(20) {
             eprintln!("{count:7}  {reason}");
         }
+
+        // The last line accounts for every dump, so that however much detail
+        // the lines above carry, the run is summed up in one place. A dump that
+        // came out in part counts as decompiled, because it was written: what
+        // it does not promise is that the source is a faithful rendering.
+        eprintln!(
+            "{} files: {} decompiled, {} partial, {} failed",
+            self.total,
+            self.written - self.partial,
+            self.partial,
+            self.failed.len(),
+        );
     }
 }
 
@@ -254,10 +367,12 @@ mod tests {
     fn outcome(input: &str, target: Option<&str>) -> Outcome {
         Outcome {
             input: PathBuf::from(input),
+            shown: target.unwrap_or(input).to_owned(),
             result: match target {
                 Some(target) => Ok(Written {
                     target: PathBuf::from(target),
                     from_module: false,
+                    recovered: false,
                 }),
                 None => Err(String::from("boom")),
             },
@@ -285,5 +400,25 @@ mod tests {
         assert!(!summary.ok());
         assert_eq!(summary.written, 0);
         assert_eq!(summary.failures.get("boom"), Some(&1));
+    }
+
+    #[test]
+    fn a_recovered_chunk_is_counted_apart_from_a_whole_one() {
+        let files = [PathBuf::from("whole.ljbc"), PathBuf::from("part.ljbc")];
+        let mut partial = outcome("part.ljbc", Some("part.lua"));
+        if let Ok(written) = &mut partial.result {
+            written.recovered = true;
+        }
+        let outcomes = [outcome("whole.ljbc", Some("whole.lua")), partial];
+
+        let summary = Summary::of(&files, &outcomes, false);
+        // A chunk that came out in part was still written, so it is counted in
+        // both numbers; which of the two it lands in is what the run says about
+        // the source it wrote.
+        assert_eq!(summary.written, 2);
+        assert_eq!(summary.partial, 1);
+        assert_eq!(summary.written - summary.partial, 1);
+        assert_eq!(summary.failed.len(), 0);
+        assert!(summary.ok());
     }
 }

@@ -45,6 +45,14 @@ pub struct Meta {
     /// the code around it is not to be trusted. Only the unwarper's recovery
     /// mode ever sets it; see [`crate::ast::unwarper::Recovery`].
     pub error_here: bool,
+    /// Whether this function could not be decompiled at all.
+    ///
+    /// Unlike [`Meta::error_here`], which says that a region inside a function
+    /// was given up on, this one says that the function itself had to be
+    /// replaced by a call that reports the failure. Nothing is written from it,
+    /// so it marks the function for a caller that wants to tell a chunk that
+    /// came out whole from one that only came out in part.
+    pub failed_here: bool,
 }
 
 impl Meta {
@@ -53,6 +61,7 @@ impl Meta {
             addr,
             line,
             error_here: false,
+            failed_here: false,
         }
     }
 }
@@ -406,6 +415,27 @@ pub fn mark_error<'a>(node: NodeRef<'a>) {
 /// Whether a pass gave up on `node`.
 pub fn has_error<'a>(node: NodeRef<'a>) -> bool {
     node.borrow().meta().is_some_and(|meta| meta.error_here)
+}
+
+/// Records that `node`'s function could not be decompiled.
+pub fn mark_failure<'a>(node: NodeRef<'a>) {
+    if let Some(meta) = node.borrow_mut().meta_mut() {
+        meta.failed_here = true;
+    }
+}
+
+/// Whether `node`'s function could not be decompiled.
+pub fn has_failure<'a>(node: NodeRef<'a>) -> bool {
+    node.borrow().meta().is_some_and(|meta| meta.failed_here)
+}
+
+/// Whether the decompiler had to give up on `node`, wholly or in part.
+///
+/// This is what tells a chunk that came out whole from one that only came out
+/// in part: either a region around the node was recovered, or the function the
+/// node belongs to was replaced by a call that reports the failure.
+pub fn has_recovery<'a>(node: NodeRef<'a>) -> bool {
+    has_error(node) || has_failure(node)
 }
 
 /// `local x = 1` versus `x = 1`.

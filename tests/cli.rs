@@ -290,7 +290,9 @@ fn the_layout_of_the_input_is_mirrored() {
     assert!(temp.join("out/sub/deeper/low.lua").is_file());
     assert!(!temp.join("out/notes.txt").exists());
     assert!(
-        mirror.stderr.contains("decompiled 3 of 3 files"),
+        mirror
+            .stderr
+            .contains("3 files: 3 decompiled, 0 partial, 0 failed"),
         "{}",
         mirror.stderr
     );
@@ -364,7 +366,6 @@ fn a_dump_without_a_name_falls_back_to_its_input_path() {
         "{}",
         run_.stderr
     );
-    assert!(run_.stderr.contains("1 fell back"), "{}", run_.stderr);
 }
 
 #[test]
@@ -449,7 +450,8 @@ fn a_dump_that_cannot_be_read_does_not_stop_the_others() {
     assert!(temp.join("out/good.lua").is_file());
     assert!(!temp.join("out/broken.lua").exists());
     assert!(
-        run_.stderr.contains("decompiled 1 of 2 files"),
+        run_.stderr
+            .contains("2 files: 1 decompiled, 0 partial, 1 failed"),
         "{}",
         run_.stderr
     );
@@ -487,7 +489,8 @@ fn the_number_of_threads_does_not_change_the_output() {
         ]);
         assert!(run_.succeeded(), "{}", run_.stderr);
         assert!(
-            run_.stderr.contains("decompiled 8 of 8 files"),
+            run_.stderr
+                .contains("8 files: 8 decompiled, 0 partial, 0 failed"),
             "{}",
             run_.stderr
         );
@@ -501,6 +504,106 @@ fn the_number_of_threads_does_not_change_the_output() {
         let second = fs::read(eight.join(&relative)).expect("the parallel output");
         assert_eq!(first, second, "{relative} differs between runs");
     }
+}
+
+#[test]
+fn every_dump_is_announced_as_it_comes_out() {
+    let luajit = luajit!();
+    let temp = Temp::new("progress");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(dumps.join("sub")).unwrap();
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("one.ljbc"),
+        true,
+    );
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("two.ljbc"),
+        true,
+    );
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("sub/three.ljbc"),
+        true,
+    );
+
+    let output = temp.text("out");
+    let run_ = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(run_.succeeded(), "{}", run_.stderr);
+
+    // stderr is a pipe here, not a terminal, so the lines are written one after
+    // another instead of taking each other's place; nothing writes escapes a
+    // reader of a log would have to look past.
+    assert!(!run_.stderr.contains('\u{1b}'), "{}", run_.stderr);
+
+    let lines: Vec<&str> = run_.stderr.lines().collect();
+    // The progress comes first, one line per dump, named by the file its source
+    // went to. Which dump is finished first is up to the pool, so the names are
+    // compared as a set; the counter is not, so it is read off in order.
+    let mut announced: Vec<&str> = Vec::new();
+    for (index, line) in lines.iter().take(3).enumerate() {
+        let (count, name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .unwrap_or_else(|| panic!("not a progress line: {line}"));
+        assert_eq!(count, format!("{}/3", index + 1), "{line}");
+        announced.push(name);
+    }
+    announced.sort_unstable();
+    assert_eq!(announced, ["one.lua", "sub/three.lua", "two.lua"]);
+
+    // The account of the run is the last thing said, so that it is what a
+    // reader is left with whatever went by above it.
+    assert_eq!(
+        lines.last(),
+        Some(&"3 files: 3 decompiled, 0 partial, 0 failed")
+    );
+}
+
+#[test]
+fn a_dump_that_fails_is_announced_by_its_input_path() {
+    let luajit = luajit!();
+    let temp = Temp::new("progress-broken");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(dumps.join("sub")).unwrap();
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("good.ljbc"),
+        true,
+    );
+    fs::write(dumps.join("sub/broken.ljbc"), b"this is not a dump").unwrap();
+
+    let output = temp.text("out");
+    let run_ = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(!run_.succeeded());
+
+    // A dump that failed has no output path to be named by, so it is named by
+    // where it was read from.
+    let lines: Vec<&str> = run_.stderr.lines().collect();
+    let mut announced: Vec<&str> = Vec::new();
+    for line in lines.iter().take(2) {
+        let (_, name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .unwrap_or_else(|| panic!("not a progress line: {line}"));
+        announced.push(name);
+    }
+    announced.sort_unstable();
+    assert_eq!(announced, ["good.lua", "sub/broken.ljbc"]);
+
+    assert_eq!(
+        lines.last(),
+        Some(&"2 files: 1 decompiled, 0 partial, 1 failed")
+    );
 }
 
 #[test]
