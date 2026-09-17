@@ -37,3 +37,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.release]
+pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
+tag-message = "chore: release {{crate_name}} version {{version}}"
