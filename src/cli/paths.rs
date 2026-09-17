@@ -248,7 +248,7 @@ impl Tree {
 /// timestamp of the edit, and a dump compiled again carries the timestamp of the
 /// compile, so both are out of date — but so is a source rebuilt an hour later
 /// that happens to be newer. Only the same moment means the source is the one
-/// this dump produced.
+/// this dump produced, which is why [`stamp`] puts that moment there.
 ///
 /// Anything that cannot be looked at, and anything that is not a plain file,
 /// counts as out of date, so that the run does the work and says whatever is
@@ -269,6 +269,31 @@ pub fn unchanged(source: &Path, dump: &Path) -> bool {
         .ok()
         .zip(dump.modified().ok())
         .is_some_and(|(source, dump)| source == dump)
+}
+
+/// Gives a source the modification time of the dump it was written from.
+///
+/// Without this, [`unchanged`] could never be true: a source is written after
+/// the dump it came from is read, so its own timestamp is always later than the
+/// dump's, and an equality test would say "out of date" for a source that the
+/// run has just produced. Copying the time over is what makes the timestamp mean
+/// which dump the source belongs to rather than when it happened to be written,
+/// and so what lets a second run tell a source that is still current from one
+/// whose dump has been compiled again since. A source touched by hand gets a
+/// newer time of its own, so it is out of date as well, which is what makes it
+/// worth writing again.
+pub fn stamp(source: &Path, dump: &Path) -> Result<(), Error> {
+    let time = fs::metadata(dump)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|source| io_error(dump, source))?;
+
+    // The file is opened for writing because not every platform lets the times
+    // of a handle that only reads be changed.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(source)
+        .and_then(|file| file.set_modified(time))
+        .map_err(|error| io_error(source, error))
 }
 
 /// Turns the chunk name of a dump into a path relative to the output root.

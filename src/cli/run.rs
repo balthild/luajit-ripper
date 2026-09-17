@@ -212,6 +212,15 @@ fn work(file: &Path, input: &Path, tree: &Tree, options: &Options) -> Outcome {
         let target = tree.target(input, file, decompiled.name.as_deref());
         tree.prepare(&target.path)?;
         write_to(&target.path, &decompiled.source)?;
+        // The source is written after the dump was read, so on its own it would
+        // say it is newer than the dump it came from and never be left alone
+        // again. Carrying the dump's time over is what lets the next run tell
+        // that the two still belong together; see `paths::stamp`. Only an
+        // incremental run does it, so a plain run leaves the times it always
+        // used to.
+        if tree.incremental {
+            paths::stamp(&target.path, file)?;
+        }
         Ok(Done::Written(Written {
             target: target.path,
             from_module: target.from_module,

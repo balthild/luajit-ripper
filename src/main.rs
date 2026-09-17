@@ -57,11 +57,13 @@ struct Cli {
 
     /// Leave a dump alone when its source is already there and just as old.
     ///
-    /// A dump is skipped when the file it would be written to exists and carries
-    /// the same modification time as the dump itself — the same moment, not one
-    /// at least as new, so a dump compiled again is decompiled again, and so is a
-    /// source that was edited after the fact. A skipped dump is not even read, so
-    /// it also says nothing while the run is under way; the report counts it.
+    /// A dump is skipped when the file it would be written to carries the same
+    /// modification time as the dump itself — the same moment, not a time at
+    /// least as new, so a dump compiled again is decompiled again, and so is a
+    /// source that was edited after the fact. A source this wrote carries the
+    /// time of the dump it came from rather than the time it was written, which
+    /// is what the comparison is about. A skipped dump is not even read, so it
+    /// also says nothing while the run is under way; the report counts it.
     /// Directory input only, since it is a rerun over a directory that it saves.
     #[arg(long)]
     incremental: bool,

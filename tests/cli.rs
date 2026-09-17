@@ -520,6 +520,122 @@ fn an_incremental_run_leaves_a_source_of_the_same_age_alone() {
     assert!(!second.stderr.contains("[1/1]"), "{}", second.stderr);
 }
 
+/// The source a run writes carries the time of the dump it came from.
+///
+/// This is the whole reason a second run has anything to go on: a source is
+/// written after its dump is read, so left to itself it would always look newer
+/// than the dump and never be skipped. The check is checked here on its own,
+/// since a test that only looks at what the second run says would pass even if
+/// the time came from somewhere else.
+#[test]
+fn an_incremental_run_dates_a_source_like_its_dump() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-dates");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    let dump = dumps.join("chunk.ljbc");
+    compile(&luajit, temp.path(), "chunk.lua", &dump, true);
+
+    let output = temp.text("out");
+    let run_ = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--incremental",
+    ]);
+    assert!(run_.succeeded(), "{}", run_.stderr);
+
+    let source = temp.join("out/chunk.lua");
+    assert_eq!(
+        fs::metadata(&source).unwrap().modified().unwrap(),
+        fs::metadata(&dump).unwrap().modified().unwrap(),
+        "the source should carry the time of the dump it was written from"
+    );
+}
+
+/// A second incremental run over its own output has nothing left to do.
+#[test]
+fn an_incremental_rerun_leaves_its_own_output_alone() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-rerun");
+    let work = temp.join("work");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    for (relative, name) in [
+        ("modules/pkg/one.lua", "aaaa.ljbc"),
+        ("modules/pkg/two.lua", "bbbb.ljbc"),
+        ("modules/other/three.lua", "cccc.ljbc"),
+    ] {
+        compile(&luajit, &work, relative, &dumps.join(name), true);
+    }
+
+    let output = temp.text("out");
+    let arguments = [
+        "--input",
+        &*dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--module-structure",
+        "--incremental",
+    ];
+
+    let first = run(&arguments);
+    assert!(first.succeeded(), "{}", first.stderr);
+    assert!(
+        first
+            .stderr
+            .contains("3 files processed: 3 successful, 0 partial, 0 failed"),
+        "{}",
+        first.stderr
+    );
+
+    // Nothing has changed in between, so there is nothing to do: not a dump
+    // rewritten, not a line of progress, only the account of the run.
+    let second = run(&arguments);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert!(
+        second
+            .stderr
+            .contains("3 files processed: 0 successful, 0 partial, 0 failed, 3 skipped"),
+        "{}",
+        second.stderr
+    );
+
+    // A dump compiled again is not the dump the source was written from: its
+    // time moves on and the source stops matching it. The times are set apart by
+    // hand rather than left to the clock, so that the test does not depend on
+    // how fine the filesystem's idea of a moment is.
+    let one = temp.join("out/@modules/pkg/one.lua");
+    let two = temp.join("out/@modules/pkg/two.lua");
+    let redone = dumps.join("aaaa.ljbc");
+    compile(&luajit, &work, "modules/pkg/one.lua", &redone, true);
+    age_apart(&redone, &one, 120);
+
+    // A source someone edited carries the time of the edit, which is not the
+    // dump's either.
+    fs::write(&two, "-- edited\n").unwrap();
+    age_apart(&two, &dumps.join("bbbb.ljbc"), 120);
+
+    let third = run(&arguments);
+    assert!(third.succeeded(), "{}", third.stderr);
+    assert!(
+        third
+            .stderr
+            .contains("3 files processed: 2 successful, 0 partial, 0 failed, 1 skipped"),
+        "{}",
+        third.stderr
+    );
+    assert!(
+        fs::read_to_string(&one).unwrap().contains("return add"),
+        "the source of a dump compiled again should have been written again"
+    );
+    assert!(
+        fs::read_to_string(&two).unwrap().contains("return add"),
+        "the edited source should have been written again"
+    );
+}
+
 #[test]
 fn an_incremental_run_writes_a_source_of_a_different_age() {
     let luajit = luajit!();
