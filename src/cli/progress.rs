@@ -74,6 +74,17 @@ impl<W: Write> Progress<W> {
         self.out.flush()
     }
 
+    /// Counts a dump that was left out, without writing a line for it.
+    ///
+    /// A skipped dump has nothing to say: the source it would have written is
+    /// already there. An incremental rerun over a large tree is mostly skips, and
+    /// a line each would be all that was ever read. The count moves all the same,
+    /// so the lines of the dumps that were done stay where they belong in the run
+    /// and the number in front of a name is still how far the run has come.
+    pub fn skip(&mut self) {
+        self.done += 1;
+    }
+
     /// Ends the progress, clearing the line that is on screen.
     ///
     /// Whatever is written next starts on a clean line, so a report does not
@@ -138,5 +149,32 @@ mod tests {
     #[test]
     fn nothing_is_written_for_an_empty_run() {
         assert_eq!(lines(Vec::new(), true), "");
+    }
+
+    #[test]
+    fn a_skipped_dump_moves_the_count_without_a_line() {
+        let mut progress = Progress::new(Vec::new(), false, 4);
+        progress.step("a.lua").unwrap();
+        progress.skip();
+        progress.skip();
+        progress.step("d.lua").unwrap();
+        progress.finish().unwrap();
+        let written = String::from_utf8(progress.out).unwrap();
+        // The dumps that were done are still numbered by how far the run got —
+        // `2` and `3` went by without a line of their own — and nothing at all
+        // was written for the two that were left out.
+        assert_eq!(written, "[1/4] a.lua\n[4/4] d.lua\n");
+    }
+
+    #[test]
+    fn a_skipped_dump_leaves_a_live_line_alone() {
+        let mut progress = Progress::new(Vec::new(), true, 2);
+        progress.step("a.lua").unwrap();
+        progress.skip();
+        progress.finish().unwrap();
+        let written = String::from_utf8(progress.out).unwrap();
+        // The line that is on screen is the one of the dump that was done: a
+        // skip neither writes over it nor takes it away.
+        assert_eq!(written, format!("[1/2] a.lua\n{REWRITE}"));
     }
 }

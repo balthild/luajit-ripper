@@ -5,11 +5,14 @@
 //! ```text
 //! luajit-ripper --input <dump.ljbc> [--output <file.lua>]
 //! luajit-ripper --input <dir of dumps> --output <dir> [--module-structure]
+//!                                            [--incremental]
 //! ```
 //!
 //! A single dump without an output goes to stdout; a directory of dumps is
 //! decompiled on a thread pool into an output directory, either mirroring the
-//! layout of the input or following the module path recorded in each dump.
+//! layout of the input or following the module path recorded in each dump. With
+//! `--incremental`, a dump whose source is already there and as old as the dump
+//! itself is left alone, so a rerun only does the work that is out of date.
 //!
 //! The tool is only built when the `cli` feature is on, which is what pulls in
 //! clap, rayon and walkdir. It also needs a nightly compiler, because the
@@ -51,6 +54,17 @@ struct Cli {
     /// only, since it is what makes two dumps tell themselves apart.
     #[arg(long)]
     module_structure: bool,
+
+    /// Leave a dump alone when its source is already there and just as old.
+    ///
+    /// A dump is skipped when the file it would be written to exists and carries
+    /// the same modification time as the dump itself — the same moment, not one
+    /// at least as new, so a dump compiled again is decompiled again, and so is a
+    /// source that was edited after the fact. A skipped dump is not even read, so
+    /// it also says nothing while the run is under way; the report counts it.
+    /// Directory input only, since it is a rerun over a directory that it saves.
+    #[arg(long)]
+    incremental: bool,
 
     /// How many dumps to decompile at once. Zero picks a number automatically.
     #[arg(short = 'j', long, value_name = "N", default_value_t = 0)]
@@ -128,7 +142,12 @@ fn main() -> ExitCode {
         Err(message) => return fail(&message),
     };
 
-    let job = match paths::resolve(&cli.input, cli.output.as_deref(), cli.module_structure) {
+    let job = match paths::resolve(
+        &cli.input,
+        cli.output.as_deref(),
+        cli.module_structure,
+        cli.incremental,
+    ) {
         Ok(job) => job,
         Err(error) => return fail(&error.to_string()),
     };

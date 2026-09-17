@@ -95,6 +95,26 @@ fn decompile(file: &Path, options: &Options) -> Result<Decompiled, Failure> {
     .map_err(Failure::Decompile)
 }
 
+/// The name of the chunk in `file`, read from the header alone.
+///
+/// `--module-structure` names the output after the module path in the dump, so
+/// knowing whether a dump is already decompiled means knowing its name first —
+/// and reading the whole dump to find it out would defeat the point of skipping
+/// it. Only the header is parsed here, and only for that question.
+///
+/// A header that cannot be read gives no name: the dump is not skipped, and the
+/// decompile that follows is what fails and says why.
+fn chunk_name(file: &Path) -> Option<String> {
+    let data = fs::read(file).ok()?;
+    with_allocator(|alloc| {
+        let mut reader = bytecode::Reader::new(&data);
+        bytecode::header::read(alloc, &mut reader)
+            .ok()?
+            .name
+            .map(str::to_owned)
+    })
+}
+
 /// Walks the input directory and decompiles everything it holds.
 fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Result<Summary, Error> {
     let files = paths::dumps(input)?;
@@ -140,7 +160,14 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
         // ran the work still does not change what the run says.
         let mut collected: Vec<Option<Outcome>> = (0..files.len()).map(|_| None).collect();
         for (index, outcome) in receiver {
-            progress.step(&outcome.shown).map_err(Error::Progress)?;
+            // A dump that was left out says nothing: the whole point of leaving
+            // it out is that there is nothing to report about it. Its turn is
+            // still taken, so the names that do come by are numbered by how far
+            // the run has got rather than by how many were written.
+            match &outcome.result {
+                Done::Skipped(_) => progress.skip(),
+                _ => progress.step(&outcome.shown).map_err(Error::Progress)?,
+            }
             collected[index] = Some(outcome);
         }
 
@@ -167,29 +194,48 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
 
 /// Decompiles one dump and writes it below the output root.
 fn work(file: &Path, input: &Path, tree: &Tree, options: &Options) -> Outcome {
-    let written = (|| {
+    // A dump whose output is named after its module path cannot be checked
+    // without the name, and the name is in the header, so that one case reads the
+    // header before deciding. A mirrored output is worked out from the input
+    // path, which is already known, and reads nothing.
+    let named = if tree.incremental && tree.module_structure {
+        chunk_name(file)
+    } else {
+        None
+    };
+
+    let done: Result<Done, Failure> = (|| {
+        if let Some(target) = tree.skip(input, file, named.as_deref()) {
+            return Ok(Done::Skipped(target.path));
+        }
         let decompiled = decompile(file, options)?;
         let target = tree.target(input, file, decompiled.name.as_deref());
         tree.prepare(&target.path)?;
         write_to(&target.path, &decompiled.source)?;
-        Ok::<_, Failure>(Written {
+        Ok(Done::Written(Written {
             target: target.path,
             from_module: target.from_module,
             recovered: decompiled.recovered,
-        })
+        }))
     })();
 
     // A dump that was written is named by its output path, one that failed by
-    // its input path: there is no output path to name it by.
-    let shown = match &written {
-        Ok(written) => below(&tree.root, &written.target),
-        Err(_) => below(input, file),
+    // its input path: there is no output path to name it by. A skipped dump is
+    // named like a written one, since its source is where it would have gone.
+    let result = match done {
+        Ok(done) => done,
+        Err(failure) => Done::Failed(failure.to_string()),
+    };
+    let shown = match &result {
+        Done::Written(written) => below(&tree.root, &written.target),
+        Done::Skipped(target) => below(&tree.root, target),
+        Done::Failed(_) => below(input, file),
     };
 
     Outcome {
         input: file.to_path_buf(),
         shown,
-        result: written.map_err(|failure| failure.to_string()),
+        result,
     }
 }
 
@@ -213,8 +259,19 @@ struct Outcome {
     /// below the input root: a dump path is long, and what a reader wants to
     /// see go by is the part of it the run was pointed at.
     shown: String,
-    /// Where the source went, or why it did not.
-    result: Result<Written, String>,
+    /// What became of the dump.
+    result: Done,
+}
+
+/// What became of one dump.
+enum Done {
+    /// It was decompiled and written.
+    Written(Written),
+    /// Its source was already there and as old as the dump, so it was left
+    /// alone: nothing was read from it and nothing was written for it.
+    Skipped(PathBuf),
+    /// It was not written, with the reason why.
+    Failed(String),
 }
 
 /// A dump that was written.
@@ -249,6 +306,11 @@ pub struct Summary {
     /// faithful rendering of the dump. Only `--mark-errors` lets a run finish
     /// this way: without it a chunk that cannot be recovered fails outright.
     partial: usize,
+    /// Dumps that were left alone because their source was already there.
+    ///
+    /// These are counted nowhere else: no work was done for them, so they are
+    /// neither decompiled nor failed, and the two together are not the total.
+    skipped: usize,
     /// Output paths that were written more than once.
     collisions: usize,
     /// Failures, counted by reason.
@@ -289,7 +351,7 @@ impl Summary {
         let mut seen: HashSet<&Path> = HashSet::new();
         for outcome in outcomes {
             match &outcome.result {
-                Ok(written) => {
+                Done::Written(written) => {
                     summary.written += 1;
                     if written.recovered {
                         summary.partial += 1;
@@ -307,7 +369,10 @@ impl Summary {
                         summary.collided.push(written.target.clone());
                     }
                 }
-                Err(reason) => {
+                // Nothing was written, so there is no path to collide on and no
+                // fallback to mention: a skipped dump is only ever counted.
+                Done::Skipped(_) => summary.skipped += 1,
+                Done::Failed(reason) => {
                     *summary.failures.entry(reason.clone()).or_default() += 1;
                     summary.failed.push((outcome.input.clone(), reason.clone()));
                 }
@@ -349,9 +414,17 @@ impl Summary {
         // The last line accounts for every dump, so that however much detail
         // the lines above carry, the run is summed up in one place. A dump that
         // came out in part counts as decompiled, because it was written: what
-        // it does not promise is that the source is a faithful rendering.
+        // it does not promise is that the source is a faithful rendering. The
+        // dumps that were skipped are said only when there are any, since a run
+        // without `--incremental` has none to speak of and its last line is the
+        // one it has always been.
+        let skipped = if self.skipped > 0 {
+            format!(", {} skipped", self.skipped)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{} files: {} decompiled, {} partial, {} failed",
+            "{} files: {} decompiled, {} partial, {} failed{skipped}",
             self.total,
             self.written - self.partial,
             self.partial,
@@ -369,13 +442,21 @@ mod tests {
             input: PathBuf::from(input),
             shown: target.unwrap_or(input).to_owned(),
             result: match target {
-                Some(target) => Ok(Written {
+                Some(target) => Done::Written(Written {
                     target: PathBuf::from(target),
                     from_module: false,
                     recovered: false,
                 }),
-                None => Err(String::from("boom")),
+                None => Done::Failed(String::from("boom")),
             },
+        }
+    }
+
+    fn skipped(input: &str, target: &str) -> Outcome {
+        Outcome {
+            input: PathBuf::from(input),
+            shown: input.to_owned(),
+            result: Done::Skipped(PathBuf::from(target)),
         }
     }
 
@@ -406,7 +487,7 @@ mod tests {
     fn a_recovered_chunk_is_counted_apart_from_a_whole_one() {
         let files = [PathBuf::from("whole.ljbc"), PathBuf::from("part.ljbc")];
         let mut partial = outcome("part.ljbc", Some("part.lua"));
-        if let Ok(written) = &mut partial.result {
+        if let Done::Written(written) = &mut partial.result {
             written.recovered = true;
         }
         let outcomes = [outcome("whole.ljbc", Some("whole.lua")), partial];
@@ -418,6 +499,25 @@ mod tests {
         assert_eq!(summary.written, 2);
         assert_eq!(summary.partial, 1);
         assert_eq!(summary.written - summary.partial, 1);
+        assert_eq!(summary.failed.len(), 0);
+        assert!(summary.ok());
+    }
+
+    #[test]
+    fn a_skipped_dump_is_counted_on_its_own() {
+        let files = [PathBuf::from("done.ljbc"), PathBuf::from("left.ljbc")];
+        let outcomes = [
+            outcome("done.ljbc", Some("done.lua")),
+            // The same output as one that was written, to show a skip cannot
+            // collide with it: nothing was written to collide with.
+            skipped("left.ljbc", "done.lua"),
+        ];
+
+        let summary = Summary::of(&files, &outcomes, false);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.written, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.collisions, 0);
         assert_eq!(summary.failed.len(), 0);
         assert!(summary.ok());
     }

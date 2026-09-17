@@ -124,6 +124,34 @@ macro_rules! luajit {
     };
 }
 
+/// Gives `path` the modification time of `like`.
+///
+/// `--incremental` asks for the same *moment*, not for "newer", so a test that
+/// wants a skip has to put a source and its dump at the very same time rather
+/// than hope they landed close enough together.
+fn age_like(path: &Path, like: &Path) {
+    let time = fs::metadata(like).unwrap().modified().unwrap();
+    set_mtime(path, time);
+}
+
+/// Gives `path` a modification time `seconds` away from that of `like`.
+fn age_apart(path: &Path, like: &Path, seconds: u64) {
+    let time = fs::metadata(like).unwrap().modified().unwrap();
+    set_mtime(path, time + std::time::Duration::from_secs(seconds));
+}
+
+/// Moves the modification time of `path` to `time`.
+fn set_mtime(path: &Path, time: std::time::SystemTime) {
+    // The file is opened for writing: changing the times of a handle that only
+    // reads is not something every platform allows.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("the output file should be there")
+        .set_modified(time)
+        .expect("the modification time should be settable");
+}
+
 #[test]
 fn a_dump_without_an_output_goes_to_stdout() {
     let luajit = luajit!();
@@ -427,6 +455,179 @@ fn module_structure_needs_a_directory_to_work_on() {
         "{}",
         refused.stderr
     );
+}
+
+#[test]
+fn incremental_needs_a_directory_to_be_incremental_about() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-single");
+    let dump = temp.join("chunk.ljbc");
+    compile(&luajit, temp.path(), "chunk.lua", &dump, true);
+
+    let refused = run(&[
+        "--input",
+        &dump.to_string_lossy(),
+        "--output",
+        &temp.text("chunk.out.lua"),
+        "--incremental",
+    ]);
+    assert!(!refused.succeeded());
+    assert!(
+        refused
+            .stderr
+            .contains("--incremental needs a directory as --input"),
+        "{}",
+        refused.stderr
+    );
+}
+
+#[test]
+fn an_incremental_run_leaves_a_source_of_the_same_age_alone() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-same");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    let dump = dumps.join("chunk.ljbc");
+    compile(&luajit, temp.path(), "chunk.lua", &dump, true);
+
+    let output = temp.text("out");
+    let first = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // What the source holds is what says whether it was written again: the
+    // sentinel is not what a decompile would produce.
+    let source = temp.join("out/chunk.lua");
+    fs::write(&source, "-- left alone\n").unwrap();
+    age_like(&source, &dump);
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--incremental",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert_eq!(fs::read_to_string(&source).unwrap(), "-- left alone\n");
+    assert!(
+        second
+            .stderr
+            .contains("1 files: 0 decompiled, 0 partial, 0 failed, 1 skipped"),
+        "{}",
+        second.stderr
+    );
+    // Nothing to say about it while the run is under way, either.
+    assert!(!second.stderr.contains("[1/1]"), "{}", second.stderr);
+}
+
+#[test]
+fn an_incremental_run_writes_a_source_of_a_different_age() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-stale");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    let dump = dumps.join("chunk.ljbc");
+    compile(&luajit, temp.path(), "chunk.lua", &dump, true);
+
+    let output = temp.text("out");
+    let first = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    let source = temp.join("out/chunk.lua");
+    fs::write(&source, "-- stale\n").unwrap();
+    // An output that is not the same moment as its dump is out of date, whether
+    // it is older or newer: a source edited by hand is newer, and it still has
+    // to go.
+    age_apart(&source, &dump, 60);
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--incremental",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert!(
+        fs::read_to_string(&source).unwrap().contains("return add"),
+        "{}",
+        fs::read_to_string(&source).unwrap()
+    );
+    assert!(
+        second
+            .stderr
+            .contains("1 files: 1 decompiled, 0 partial, 0 failed"),
+        "{}",
+        second.stderr
+    );
+    assert!(!second.stderr.contains("skipped"), "{}", second.stderr);
+}
+
+#[test]
+fn an_incremental_run_finds_a_source_named_after_its_module() {
+    let luajit = luajit!();
+    let temp = Temp::new("incremental-modules");
+    let work = temp.join("work");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    let dump = dumps.join("aaaa.ljbc");
+    compile(&luajit, &work, "modules/pkg/one.lua", &dump, true);
+
+    let output = temp.text("out");
+    let first = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--module-structure",
+    ]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // The output is not below a path the input tells the run about, so finding
+    // it means reading the name out of the dump's own header.
+    let source = temp.join("out/@modules/pkg/one.lua");
+    assert!(source.is_file(), "{}", first.stderr);
+    fs::write(&source, "-- left alone\n").unwrap();
+    age_like(&source, &dump);
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--module-structure",
+        "--incremental",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert_eq!(fs::read_to_string(&source).unwrap(), "-- left alone\n");
+    assert!(second.stderr.contains("1 skipped"), "{}", second.stderr);
+}
+
+#[test]
+fn an_incremental_run_still_reports_a_dump_it_cannot_read() {
+    let temp = Temp::new("incremental-broken");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    fs::write(dumps.join("broken.ljbc"), b"this is not a dump").unwrap();
+
+    let output = temp.text("out");
+    let run_ = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--incremental",
+    ]);
+    // A dump with no readable header has no name to look a source up by, so it
+    // is not skipped: it fails, and the run says why.
+    assert!(!run_.succeeded());
+    assert!(
+        run_.stderr
+            .contains("1 files: 0 decompiled, 0 partial, 1 failed"),
+        "{}",
+        run_.stderr
+    );
+    assert!(run_.stderr.contains("bad magic"), "{}", run_.stderr);
 }
 
 #[test]

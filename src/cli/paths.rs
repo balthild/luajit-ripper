@@ -51,6 +51,9 @@ pub struct Tree {
     /// Whether output paths are taken from the module path in the dump header
     /// instead of from the location of the input file.
     pub module_structure: bool,
+    /// Whether a dump whose source is already there and as old as the dump is
+    /// left alone instead of being decompiled again.
+    pub incremental: bool,
 }
 
 /// Where one dump is written.
@@ -66,7 +69,12 @@ pub struct Target {
 ///
 /// This creates the output directory when it needs one, and reports a path that
 /// cannot be used without touching the filesystem.
-pub fn resolve(input: &Path, output: Option<&Path>, module_structure: bool) -> Result<Job, Error> {
+pub fn resolve(
+    input: &Path,
+    output: Option<&Path>,
+    module_structure: bool,
+    incremental: bool,
+) -> Result<Job, Error> {
     let metadata = fs::metadata(input).map_err(|source| io_error(input, source))?;
 
     if metadata.is_dir() {
@@ -82,12 +90,20 @@ pub fn resolve(input: &Path, output: Option<&Path>, module_structure: bool) -> R
             sink: Sink::Tree(Tree {
                 root,
                 module_structure,
+                incremental,
             }),
         })
     } else {
         if module_structure {
             return Err(Error::Layout(String::from(
                 "--module-structure needs a directory as --input",
+            )));
+        }
+        if incremental {
+            // A single input is one output, written whether or not it was there
+            // before: there is no tree to be incremental about.
+            return Err(Error::Layout(String::from(
+                "--incremental needs a directory as --input",
             )));
         }
         let Some(output) = output else {
@@ -209,6 +225,50 @@ impl Tree {
         }
         Ok(())
     }
+
+    /// Where `file` would be written, when that is where it already is.
+    ///
+    /// `None` means there is work to do: either `--incremental` was not asked
+    /// for, or the source is missing, out of date, or cannot be looked at. The
+    /// target is worked out exactly as it is for a write, so the two cannot
+    /// disagree about where the source belongs.
+    pub fn skip(&self, input: &Path, file: &Path, chunk_name: Option<&str>) -> Option<Target> {
+        if !self.incremental {
+            return None;
+        }
+        let target = self.target(input, file, chunk_name);
+        unchanged(&target.path, file).then_some(target)
+    }
+}
+
+/// Whether `source` was written at the very moment `dump` was made.
+///
+/// This is what `--incremental` asks, and it is not the same question as "is the
+/// source at least as new as its dump": a source someone edited carries the
+/// timestamp of the edit, and a dump compiled again carries the timestamp of the
+/// compile, so both are out of date — but so is a source rebuilt an hour later
+/// that happens to be newer. Only the same moment means the source is the one
+/// this dump produced.
+///
+/// Anything that cannot be looked at, and anything that is not a plain file,
+/// counts as out of date, so that the run does the work and says whatever is
+/// wrong with the dump or with where its source was meant to go, rather than
+/// quietly skipping it.
+pub fn unchanged(source: &Path, dump: &Path) -> bool {
+    let Ok(source) = fs::metadata(source) else {
+        return false;
+    };
+    if !source.is_file() {
+        return false;
+    }
+    let Ok(dump) = fs::metadata(dump) else {
+        return false;
+    };
+    source
+        .modified()
+        .ok()
+        .zip(dump.modified().ok())
+        .is_some_and(|(source, dump)| source == dump)
 }
 
 /// Turns the chunk name of a dump into a path relative to the output root.
