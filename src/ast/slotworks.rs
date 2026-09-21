@@ -32,7 +32,7 @@ use oxc_allocator::{Allocator, ArenaHashSet, ArenaVec};
 
 use super::helpers::insert_table_record;
 use super::nodes::*;
-use super::traverse::{self, Visitor};
+use super::traverse::{self, Visitor, node_key};
 use crate::error::{Error, Result};
 
 // MARK: passes
@@ -110,10 +110,6 @@ fn internal(message: &str) -> Error {
 /// something for the run that set it, it is kept here instead of on the nodes.
 #[derive(Clone, Copy)]
 struct Invalidated<'a>(&'a RefCell<ArenaHashSet<'a, usize>>);
-
-fn node_key<'a>(node: NodeRef<'a>) -> usize {
-    traverse::node_key(node)
-}
 
 /// Whether two records describe the same thing.
 ///
@@ -337,27 +333,24 @@ struct SlotInfo<'a> {
     slot_id: u32,
 }
 
+impl<'a> SlotInfo<'a> {
+    /// Allocates a fresh register record in the arena the tree lives in.
+    fn emplace(alloc: &'a Allocator, slot: u32, assignment: NodeRef<'a>, slot_id: u32) -> Info<'a> {
+        alloc.alloc(RefCell::new(SlotInfo {
+            slot,
+            assignment,
+            references: ArenaVec::new_in(&alloc),
+            termination: None,
+            slot_id,
+        }))
+    }
+}
+
 /// A record of one register definition.
 ///
 /// Like a node, a record lives in the arena, so a reference to it is cheap to
 /// copy and its address is its identity.
 type Info<'a> = &'a RefCell<SlotInfo<'a>>;
-
-/// Allocates a fresh register record in the arena the tree lives in.
-fn new_info<'a>(
-    alloc: &'a Allocator,
-    slot: u32,
-    assignment: NodeRef<'a>,
-    slot_id: u32,
-) -> Info<'a> {
-    alloc.alloc(RefCell::new(SlotInfo {
-        slot,
-        assignment,
-        references: ArenaVec::new_in(&alloc),
-        termination: None,
-        slot_id,
-    }))
-}
 
 /// For each register, the live definitions by id. The entry under `-1` is the
 /// most recent one, which is what a plain reference to the register means.
@@ -593,7 +586,7 @@ impl<'a> SlotsCollector<'a> {
             }
         };
 
-        let info = new_info(self.alloc, slot_number, assignment, slot_id);
+        let info = SlotInfo::emplace(self.alloc, slot_number, assignment, slot_id);
         self.set_slot(slot_number, Some(slot_id), info);
     }
 
@@ -1314,7 +1307,7 @@ fn eliminate_iterators<'a>(
             None => vec![*source],
         };
         if let Node::IteratorWarp(inner) = &mut *warp.borrow_mut() {
-            inner.controls = expressions(alloc, replacement);
+            inner.controls = Node::emplace_expressions(alloc, replacement);
         }
 
         processed.push(*warp);

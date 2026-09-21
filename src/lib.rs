@@ -51,7 +51,7 @@ pub mod lua;
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::ast::nodes::{
-    Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node, NodeRef, node,
+    Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node, NodeRef,
 };
 use crate::ast::traverse;
 use crate::ast::unwarper::Recovery;
@@ -193,7 +193,7 @@ fn unwarp_chunk<'a>(alloc: &'a Allocator, root: NodeRef<'a>, options: &Options) 
 
 /// Replaces the body of a function with a call that reports the failure.
 fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
-    let error_name = node(
+    let error_name = Node::emplace(
         alloc,
         Node::Identifier(ArenaBox::new_in(
             Identifier {
@@ -209,7 +209,7 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
         )),
     );
 
-    let message = node(
+    let message = Node::emplace(
         alloc,
         Node::Constant(ArenaBox::new_in(
             Constant {
@@ -220,12 +220,12 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
         )),
     );
 
-    let call = node(
+    let call = Node::emplace(
         alloc,
         Node::FunctionCall(ArenaBox::new_in(
             FunctionCall {
                 function: error_name,
-                arguments: crate::ast::nodes::statements(alloc, [message]),
+                arguments: Node::emplace_statements(alloc, [message]),
                 is_method: false,
                 meta: Meta::default(),
             },

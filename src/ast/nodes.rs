@@ -27,11 +27,6 @@ use crate::bytecode::DebugInfo;
 /// address of the node, and the borrow flag is what keeps the passes honest.
 pub type NodeRef<'a> = &'a RefCell<Node<'a>>;
 
-/// Wraps a node into an arena allocated node.
-pub fn node<'a>(alloc: &'a Allocator, node: Node<'a>) -> NodeRef<'a> {
-    alloc.alloc(RefCell::new(node))
-}
-
 /// Where a node came from in the bytecode.
 ///
 /// `addr` is the instruction address and `line` the source line; both are `0`
@@ -66,66 +61,6 @@ impl Meta {
             failed_here: false,
         }
     }
-}
-
-/// Creates a statement list node.
-pub fn statements<'a>(
-    alloc: &'a Allocator,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) -> NodeRef<'a> {
-    node(
-        alloc,
-        Node::Statements(ArenaVec::from_iter_in(contents, &alloc)),
-    )
-}
-
-/// Creates an expression list node.
-pub fn expressions<'a>(
-    alloc: &'a Allocator,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) -> NodeRef<'a> {
-    node(
-        alloc,
-        Node::Expressions(ArenaVec::from_iter_in(contents, &alloc)),
-    )
-}
-
-/// Creates a variable list node.
-pub fn variables<'a>(
-    alloc: &'a Allocator,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) -> NodeRef<'a> {
-    node(
-        alloc,
-        Node::Variables(ArenaVec::from_iter_in(contents, &alloc)),
-    )
-}
-
-/// Creates an identifier list node.
-pub fn identifiers<'a>(
-    alloc: &'a Allocator,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) -> NodeRef<'a> {
-    node(
-        alloc,
-        Node::Identifiers(ArenaVec::from_iter_in(contents, &alloc)),
-    )
-}
-
-/// Creates a record list node.
-pub fn records<'a>(
-    alloc: &'a Allocator,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) -> NodeRef<'a> {
-    node(
-        alloc,
-        Node::Records(ArenaVec::from_iter_in(contents, &alloc)),
-    )
-}
-
-/// Creates a `nil`, `true` or `false` node.
-pub fn primitive<'a>(alloc: &'a Allocator, kind: PrimitiveKind) -> NodeRef<'a> {
-    node(alloc, Node::Primitive(Primitive { kind }))
 }
 
 /// Every kind of node the decompiler knows about.
@@ -206,6 +141,75 @@ pub enum Node<'a> {
     NumericLoopWarp(ArenaBox<'a, NumericLoopWarp<'a>>),
     /// The end of a function.
     EndWarp(ArenaBox<'a, EndWarp<'a>>),
+}
+
+// MARK: constructors
+
+impl<'a> Node<'a> {
+    /// Wraps a node into an arena allocated node.
+    pub fn emplace(alloc: &'a Allocator, node: Node<'a>) -> NodeRef<'a> {
+        alloc.alloc(RefCell::new(node))
+    }
+
+    /// Creates a statement list node.
+    pub fn emplace_statements(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = NodeRef<'a>>,
+    ) -> NodeRef<'a> {
+        Node::emplace(
+            alloc,
+            Node::Statements(ArenaVec::from_iter_in(contents, &alloc)),
+        )
+    }
+
+    /// Creates an expression list node.
+    pub fn emplace_expressions(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = NodeRef<'a>>,
+    ) -> NodeRef<'a> {
+        Node::emplace(
+            alloc,
+            Node::Expressions(ArenaVec::from_iter_in(contents, &alloc)),
+        )
+    }
+
+    /// Creates a variable list node.
+    pub fn emplace_variables(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = NodeRef<'a>>,
+    ) -> NodeRef<'a> {
+        Node::emplace(
+            alloc,
+            Node::Variables(ArenaVec::from_iter_in(contents, &alloc)),
+        )
+    }
+
+    /// Creates an identifier list node.
+    pub fn emplace_identifiers(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = NodeRef<'a>>,
+    ) -> NodeRef<'a> {
+        Node::emplace(
+            alloc,
+            Node::Identifiers(ArenaVec::from_iter_in(contents, &alloc)),
+        )
+    }
+
+    /// Creates a record list node.
+    pub fn emplace_records(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = NodeRef<'a>>,
+    ) -> NodeRef<'a> {
+        Node::emplace(
+            alloc,
+            Node::Records(ArenaVec::from_iter_in(contents, &alloc)),
+        )
+    }
+
+    /// Creates a `nil`, `true` or `false` node.
+    pub fn emplace_primitive(alloc: &'a Allocator, kind: PrimitiveKind) -> NodeRef<'a> {
+        Node::emplace(alloc, Node::Primitive(Primitive { kind }))
+    }
 }
 
 // MARK: accessors

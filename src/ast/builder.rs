@@ -119,7 +119,7 @@ impl<'a> Builder<'a> {
 
     /// Allocates a node in the arena this builder writes to.
     fn node(&self, value: Node<'a>) -> NodeRef<'a> {
-        node(self.alloc, value)
+        Node::emplace(self.alloc, value)
     }
 
     /// Allocates a payload struct in the arena this builder writes to.
@@ -139,7 +139,7 @@ impl<'a> Builder<'a> {
         }
 
         let statements = self.build_function_blocks()?;
-        let arguments = identifiers(self.alloc, arguments);
+        let arguments = Node::emplace_identifiers(self.alloc, arguments);
         let definition = FunctionDefinition {
             arguments,
             statements,
@@ -196,7 +196,10 @@ impl<'a> Builder<'a> {
             previous = Some(block);
         }
 
-        Ok(statements(self.alloc, self.blocks.iter().copied()))
+        Ok(Node::emplace_statements(
+            self.alloc,
+            self.blocks.iter().copied(),
+        ))
     }
 
     /// Turns the instructions of a block into statements.
@@ -532,7 +535,7 @@ impl<'a> Builder<'a> {
         }
 
         let base = iterator.a;
-        let controls = expressions(
+        let controls = Node::emplace_expressions(
             self.alloc,
             vec![
                 self.build_slot(iterator_addr, base.wrapping_sub(3)),
@@ -554,7 +557,7 @@ impl<'a> Builder<'a> {
 
         self.warp_shift = 2;
         Ok(self.node(Node::IteratorWarp(self.payload(IteratorWarp {
-            variables: variables(self.alloc, loop_variables),
+            variables: Node::emplace_variables(self.alloc, loop_variables),
             controls,
             body: Some(body),
             way_out: Some(way_out),
@@ -565,7 +568,7 @@ impl<'a> Builder<'a> {
     fn build_numeric_loop_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
         let base = instruction.a;
         let index = self.build_slot(addr, base + 3);
-        let controls = expressions(
+        let controls = Node::emplace_expressions(
             self.alloc,
             vec![
                 self.build_slot(addr, base),
@@ -690,8 +693,8 @@ impl<'a> Builder<'a> {
             self.build_child(instruction.cd)?
         } else if op == Opcode::TNEW {
             self.node(Node::TableConstructor(self.payload(TableConstructor {
-                array: records(self.alloc, Vec::new()),
-                records: records(self.alloc, Vec::new()),
+                array: Node::emplace_records(self.alloc, Vec::new()),
+                records: Node::emplace_records(self.alloc, Vec::new()),
                 meta: Meta::default(),
             })))
         } else if op == Opcode::TDUP {
@@ -714,8 +717,8 @@ impl<'a> Builder<'a> {
         };
 
         let assignment = Assignment {
-            expressions: expressions(self.alloc, vec![expression]),
-            destinations: variables(self.alloc, vec![destination]),
+            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
+            destinations: Node::emplace_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -732,8 +735,8 @@ impl<'a> Builder<'a> {
         instruction: Ins,
     ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
         let mut assignment = self.build_range_assignment(addr, instruction.a, instruction.cd);
-        let primitive = primitive(self.alloc, PrimitiveKind::Nil);
-        assignment.expressions = expressions(self.alloc, vec![primitive]);
+        let primitive = Node::emplace_primitive(self.alloc, PrimitiveKind::Nil);
+        assignment.expressions = Node::emplace_expressions(self.alloc, vec![primitive]);
         Ok((
             self.node(Node::Assignment(self.payload(assignment))),
             vec![primitive],
@@ -748,8 +751,8 @@ impl<'a> Builder<'a> {
         let variable = self.build_global_variable(instruction.cd);
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: expressions(self.alloc, vec![expression]),
-            destinations: variables(self.alloc, vec![variable]),
+            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
+            destinations: Node::emplace_variables(self.alloc, vec![variable]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -767,8 +770,8 @@ impl<'a> Builder<'a> {
         let destination = self.build_table_element(addr, &instruction)?;
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: expressions(self.alloc, vec![expression]),
-            destinations: variables(self.alloc, vec![destination]),
+            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
+            destinations: Node::emplace_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -792,8 +795,8 @@ impl<'a> Builder<'a> {
         })));
         let multres = self.node(Node::MulTres);
         let assignment = Assignment {
-            expressions: expressions(self.alloc, vec![multres]),
-            destinations: variables(self.alloc, vec![destination]),
+            expressions: Node::emplace_expressions(self.alloc, vec![multres]),
+            destinations: Node::emplace_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -821,9 +824,10 @@ impl<'a> Builder<'a> {
 
         let statement = if instruction.op <= Opcode::CALL {
             if instruction.b == 0 {
-                let destinations = variables(self.alloc, vec![self.node(Node::MulTres)]);
+                let destinations =
+                    Node::emplace_variables(self.alloc, vec![self.node(Node::MulTres)]);
                 let assignment = Assignment {
-                    expressions: expressions(self.alloc, vec![call]),
+                    expressions: Node::emplace_expressions(self.alloc, vec![call]),
                     destinations,
                     kind: AssignmentKind::Normal,
                     meta: Meta::default(),
@@ -835,11 +839,11 @@ impl<'a> Builder<'a> {
                 let from_slot = instruction.a;
                 let to_slot = instruction.a + instruction.b - 2;
                 let mut assignment = self.build_range_assignment(addr, from_slot, to_slot);
-                assignment.expressions = expressions(self.alloc, vec![call]);
+                assignment.expressions = Node::emplace_expressions(self.alloc, vec![call]);
                 self.node(Node::Assignment(self.payload(assignment)))
             }
         } else {
-            let returns = expressions(self.alloc, vec![call]);
+            let returns = Node::emplace_expressions(self.alloc, vec![call]);
             let return_node = self.node(Node::Return(self.payload(Return {
                 returns,
                 meta: Meta::default(),
@@ -877,7 +881,7 @@ impl<'a> Builder<'a> {
             arguments.push(self.node(Node::MulTres));
         }
 
-        expressions(self.alloc, arguments)
+        Node::emplace_expressions(self.alloc, arguments)
     }
 
     fn build_vararg(
@@ -890,16 +894,16 @@ impl<'a> Builder<'a> {
         let vararg = self.node(Node::Vararg);
 
         let assignment = if last_slot < i64::from(base) {
-            let destinations = variables(self.alloc, vec![self.node(Node::MulTres)]);
+            let destinations = Node::emplace_variables(self.alloc, vec![self.node(Node::MulTres)]);
             Assignment {
-                expressions: expressions(self.alloc, vec![vararg]),
+                expressions: Node::emplace_expressions(self.alloc, vec![vararg]),
                 destinations,
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             }
         } else {
             let mut assignment = self.build_range_assignment(addr, base, last_slot as u32);
-            assignment.expressions = expressions(self.alloc, vec![vararg]);
+            assignment.expressions = Node::emplace_expressions(self.alloc, vec![vararg]);
             assignment
         };
 
@@ -930,7 +934,7 @@ impl<'a> Builder<'a> {
             returns.push(self.node(Node::MulTres));
         }
 
-        let returns_node = expressions(self.alloc, returns.iter().copied());
+        let returns_node = Node::emplace_expressions(self.alloc, returns.iter().copied());
         let return_node = self.node(Node::Return(self.payload(Return {
             returns: returns_node,
             meta: Meta::default(),
@@ -954,8 +958,8 @@ impl<'a> Builder<'a> {
             slot += 1;
         }
         Assignment {
-            expressions: expressions(self.alloc, Vec::new()),
-            destinations: variables(self.alloc, destinations),
+            expressions: Node::emplace_expressions(self.alloc, Vec::new()),
+            destinations: Node::emplace_variables(self.alloc, destinations),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         }
@@ -1163,8 +1167,8 @@ impl<'a> Builder<'a> {
 
         Ok(
             self.node(Node::TableConstructor(self.payload(TableConstructor {
-                array: records(self.alloc, array),
-                records: records(self.alloc, hash),
+                array: Node::emplace_records(self.alloc, array),
+                records: Node::emplace_records(self.alloc, hash),
                 meta: Meta::default(),
             }))),
         )
@@ -1172,9 +1176,11 @@ impl<'a> Builder<'a> {
 
     fn build_table_record_item(&self, value: &ConstKey<'a>) -> NodeRef<'a> {
         match value {
-            ConstKey::Nil | ConstKey::KeyMarker => primitive(self.alloc, PrimitiveKind::Nil),
-            ConstKey::False => primitive(self.alloc, PrimitiveKind::False),
-            ConstKey::True => primitive(self.alloc, PrimitiveKind::True),
+            ConstKey::Nil | ConstKey::KeyMarker => {
+                Node::emplace_primitive(self.alloc, PrimitiveKind::Nil)
+            }
+            ConstKey::False => Node::emplace_primitive(self.alloc, PrimitiveKind::False),
+            ConstKey::True => Node::emplace_primitive(self.alloc, PrimitiveKind::True),
             ConstKey::Int(number) => self.node(Node::Constant(self.payload(Constant {
                 value: ConstantValue::Integer(*number),
                 meta: Meta::default(),
@@ -1277,7 +1283,7 @@ impl<'a> Builder<'a> {
             2 => PrimitiveKind::True,
             _ => PrimitiveKind::Nil,
         };
-        primitive(self.alloc, kind)
+        Node::emplace_primitive(self.alloc, kind)
     }
 
     // MARK: instruction repair passes

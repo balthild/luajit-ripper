@@ -390,8 +390,8 @@ impl<'a> LocalDefinitionsMarker<'a> {
                 return;
             };
             let new_destinations =
-                variables(self.alloc, destinations[slot_index + 1..].iter().copied());
-            node(
+                Node::emplace_variables(self.alloc, destinations[slot_index + 1..].iter().copied());
+            Node::emplace(
                 self.alloc,
                 Node::Assignment(ArenaBox::new_in(
                     Assignment {
@@ -405,7 +405,8 @@ impl<'a> LocalDefinitionsMarker<'a> {
             )
         };
 
-        let old_destinations = variables(self.alloc, destinations[..=slot_index].iter().copied());
+        let old_destinations =
+            Node::emplace_variables(self.alloc, destinations[..=slot_index].iter().copied());
         if let Node::Assignment(inner) = &mut *statement.borrow_mut() {
             inner.destinations = old_destinations;
         }

@@ -371,7 +371,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 if primitive.kind == PrimitiveKind::Nil);
 
             if !is_nil {
-                let key = crate::ast::nodes::node(
+                let key = crate::ast::nodes::Node::emplace(
                     self.alloc,
                     Node::Constant(ArenaBox::new_in(
                         Constant {
@@ -383,7 +383,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 );
                 contents.insert(
                     0,
-                    crate::ast::nodes::node(
+                    crate::ast::nodes::Node::emplace(
                         self.alloc,
                         Node::TableRecord(ArenaBox::new_in(
                             TableRecord {

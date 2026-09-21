@@ -219,7 +219,7 @@ fn is_jump<'a>(warp: &Node<'a>) -> bool {
 
 /// Makes a block flow into `target`.
 fn set_flow_to<'a>(alloc: &'a Allocator, block: NodeRef<'a>, target: NodeRef<'a>) {
-    let warp = node(
+    let warp = Node::emplace(
         alloc,
         Node::UnconditionalWarp(ArenaBox::new_in(
             UnconditionalWarp {
@@ -245,7 +245,7 @@ fn set_end<'a>(alloc: &'a Allocator, block: NodeRef<'a>, force_no_target: bool) 
         traverse::block_warp(block).and_then(|warp| get_target(&warp.borrow(), true))
     };
 
-    let end = node(
+    let end = Node::emplace(
         alloc,
         Node::EndWarp(ArenaBox::new_in(
             EndWarp {
@@ -457,7 +457,7 @@ fn create_next_block<'a>(alloc: &'a Allocator, original: NodeRef<'a>) -> NodeRef
         _ => (0, 0, 0),
     };
 
-    node(
+    Node::emplace(
         alloc,
         Node::Block(ArenaBox::new_in(
             Block {

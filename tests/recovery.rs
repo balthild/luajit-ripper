@@ -16,12 +16,12 @@ use oxc_allocator::{ArenaBox, ArenaVec};
 /// Builds a function definition holding `contents`.
 fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
     let alloc = support::arena();
-    node(
+    Node::emplace(
         alloc,
         Node::FunctionDefinition(ArenaBox::new_in(
             FunctionDefinition {
-                arguments: identifiers(alloc, Vec::new()),
-                statements: statements(alloc, contents),
+                arguments: Node::emplace_identifiers(alloc, Vec::new()),
+                statements: Node::emplace_statements(alloc, contents),
                 upvalues: ArenaVec::new_in(&alloc),
                 debug: alloc.alloc(DebugInfo::new_in(alloc)),
                 instruction_count: 0,
@@ -36,7 +36,7 @@ fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
 fn assignment(name: &str, value: i32) -> NodeRef<'static> {
     let alloc = support::arena();
 
-    let destination = node(
+    let destination = Node::emplace(
         alloc,
         Node::Identifier(ArenaBox::new_in(
             Identifier::new(alloc, IdentifierKind::Local, 0, Meta::default()),
@@ -47,7 +47,7 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
         inner.name = Some(alloc.alloc_str(name));
     }
 
-    let source = node(
+    let source = Node::emplace(
         alloc,
         Node::Constant(ArenaBox::new_in(
             Constant {
@@ -58,12 +58,12 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
         )),
     );
 
-    node(
+    Node::emplace(
         alloc,
         Node::Assignment(ArenaBox::new_in(
             Assignment {
-                expressions: expressions(alloc, vec![source]),
-                destinations: variables(alloc, vec![destination]),
+                expressions: Node::emplace_expressions(alloc, vec![source]),
+                destinations: Node::emplace_variables(alloc, vec![destination]),
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             },
@@ -124,8 +124,8 @@ fn a_marker_survives_a_deep_clone() {
 fn marking_a_list_or_a_primitive_is_harmless() {
     // List nodes and `Primitive` have nowhere to keep a mark; asking for one
     // must not panic.
-    let list = statements(support::arena(), Vec::new());
-    let primitive = primitive(support::arena(), PrimitiveKind::Nil);
+    let list = Node::emplace_statements(support::arena(), Vec::new());
+    let primitive = Node::emplace_primitive(support::arena(), PrimitiveKind::Nil);
 
     assert!(!has_error(list));
     mark_error(list);

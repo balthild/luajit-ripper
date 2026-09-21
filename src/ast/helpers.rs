@@ -144,8 +144,8 @@ pub fn insert_table_record<'a>(
 
         // `t = {nil, x}` uses an explicit nil for the hole at index one.
         if position == 1 && array_contents.is_empty() {
-            let nil = primitive(alloc, PrimitiveKind::Nil);
-            array_contents.push(node(
+            let nil = Node::emplace_primitive(alloc, PrimitiveKind::Nil);
+            array_contents.push(Node::emplace(
                 alloc,
                 Node::ArrayRecord(ArenaBox::new_in(
                     ArrayRecord {
@@ -160,7 +160,7 @@ pub fn insert_table_record<'a>(
         if position > array_contents.len() {
             set_list_contents(alloc, array, array_contents);
         } else {
-            let record = node(
+            let record = Node::emplace(
                 alloc,
                 Node::ArrayRecord(ArenaBox::new_in(
                     ArrayRecord {
@@ -204,7 +204,7 @@ pub fn insert_table_record<'a>(
 
     // Records are not as critical as array entries: whatever the order, both
     // values end up in the table.
-    let record = node(
+    let record = Node::emplace(
         alloc,
         Node::TableRecord(ArenaBox::new_in(
             TableRecord {

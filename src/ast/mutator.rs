@@ -76,7 +76,7 @@ fn merge_elseif<'a>(alloc: &'a Allocator, if_node: NodeRef<'a>) {
         sub.else_block,
     );
 
-    let entry = node(
+    let entry = Node::emplace(
         alloc,
         Node::ElseIf(ArenaBox::new_in(
             ElseIf {
@@ -430,7 +430,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
 
         // The block needs a condition again: the true branch now skips the
         // block that used to hold the `false` constant.
-        let condition = node(
+        let condition = Node::emplace(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(
@@ -442,7 +442,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
                 &self.alloc,
             )),
         );
-        let new_warp = node(
+        let new_warp = Node::emplace(
             self.alloc,
             Node::ConditionalWarp(ArenaBox::new_in(
                 ConditionalWarp {
@@ -478,26 +478,26 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             _ => (0, 0),
         };
 
-        let operand = node(
+        let operand = Node::emplace(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::default()),
                 &self.alloc,
             )),
         );
-        let destination = node(
+        let destination = Node::emplace(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::default()),
                 &self.alloc,
             )),
         );
-        let statement = node(
+        let statement = Node::emplace(
             self.alloc,
             Node::Assignment(ArenaBox::new_in(
                 Assignment {
-                    expressions: expressions(self.alloc, vec![operand]),
-                    destinations: variables(self.alloc, vec![destination]),
+                    expressions: Node::emplace_expressions(self.alloc, vec![operand]),
+                    destinations: Node::emplace_variables(self.alloc, vec![destination]),
                     kind: AssignmentKind::Normal,
                     meta: Meta::default(),
                 },
@@ -509,14 +509,14 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             conditional_targets(warp).and_then(|(_, false_target, _)| false_target)
         });
 
-        let new_block = node(
+        let new_block = Node::emplace(
             self.alloc,
             Node::Block(ArenaBox::new_in(
                 Block::new(self.alloc, index + 1, address, address),
                 &self.alloc,
             )),
         );
-        let flow = node(
+        let flow = Node::emplace(
             self.alloc,
             Node::UnconditionalWarp(ArenaBox::new_in(
                 UnconditionalWarp {
@@ -677,7 +677,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             }
 
             let statement = if use_break {
-                node(self.alloc, Node::Break)
+                Node::emplace(self.alloc, Node::Break)
             } else {
                 let contents = traverse::block_contents(target);
                 if contents.is_empty() {

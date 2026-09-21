@@ -219,14 +219,14 @@ fn unwarp_if_statement<'a>(
 ) -> Result<()> {
     let (expression, body, false_target) =
         extract_if_expression(alloc, start, body, end, topmost_end)?;
-    let if_node = node(
+    let if_node = Node::emplace(
         alloc,
         Node::If(ArenaBox::new_in(
             If {
                 expression,
-                then_block: statements(alloc, []),
+                then_block: Node::emplace_statements(alloc, []),
                 elseifs: ArenaVec::from_iter_in([], &alloc),
-                else_block: statements(alloc, []),
+                else_block: Node::emplace_statements(alloc, []),
                 meta: Meta::default(),
             },
             &alloc,
@@ -304,8 +304,8 @@ fn unwarp_if_statement<'a>(
 
         if let Node::If(inner) = &mut *if_node.borrow_mut() {
             inner.expression = expression;
-            inner.then_block = statements(alloc, then_blocks);
-            inner.else_block = statements(alloc, else_blocks);
+            inner.then_block = Node::emplace_statements(alloc, then_blocks);
+            inner.else_block = Node::emplace_statements(alloc, else_blocks);
         }
     } else {
         let warp_out = body
@@ -331,7 +331,7 @@ fn unwarp_if_statement<'a>(
         )?;
 
         if let Node::If(inner) = &mut *if_node.borrow_mut() {
-            inner.then_block = statements(alloc, then_blocks);
+            inner.then_block = Node::emplace_statements(alloc, then_blocks);
         }
     }
 

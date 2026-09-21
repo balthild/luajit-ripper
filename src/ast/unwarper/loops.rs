@@ -458,7 +458,7 @@ fn loop_build_block<'a>(
     let (first_address, _) = traverse::block_range(first).unwrap_or((0, 0));
     let (_, last_address) = traverse::block_range(last).unwrap_or((0, 0));
 
-    let block = node(
+    let block = Node::emplace(
         alloc,
         Node::Block(ArenaBox::new_in(
             Block {
@@ -552,7 +552,7 @@ fn unwarp_breaks<'a>(
         } else {
             contents
         };
-        contents.push(node(alloc, Node::Break));
+        contents.push(Node::emplace(alloc, Node::Break));
         traverse::set_block_contents(alloc, block, contents);
 
         if i + 1 == length {
@@ -735,13 +735,13 @@ fn unwarp_loop<'a>(
             _ => unreachable!("checked above"),
         };
 
-        let node_loop = node(
+        let node_loop = Node::emplace(
             alloc,
             Node::IteratorFor(ArenaBox::new_in(
                 IteratorFor {
                     identifiers,
                     expressions: controls,
-                    statements: statements(alloc, body.iter().copied()),
+                    statements: Node::emplace_statements(alloc, body.iter().copied()),
                     meta: Meta::new(first_address, 0),
                 },
                 &alloc,
@@ -776,13 +776,13 @@ fn unwarp_loop<'a>(
             _ => unreachable!("checked above"),
         };
 
-        let node_loop = node(
+        let node_loop = Node::emplace(
             alloc,
             Node::NumericFor(ArenaBox::new_in(
                 NumericFor {
                     variable: index,
                     expressions: controls,
-                    statements: statements(alloc, body.iter().copied()),
+                    statements: Node::emplace_statements(alloc, body.iter().copied()),
                     meta: Meta::new(first_address, 0),
                 },
                 &alloc,
@@ -833,9 +833,9 @@ fn unwarp_loop<'a>(
 
             if is_repeat_false {
                 body.pop();
-                let expression = primitive(alloc, PrimitiveKind::False);
-                let inner_statements = statements(alloc, body.iter().copied());
-                node(
+                let expression = Node::emplace_primitive(alloc, PrimitiveKind::False);
+                let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
+                Node::emplace(
                     alloc,
                     Node::RepeatUntil(ArenaBox::new_in(
                         RepeatUntil {
@@ -847,9 +847,9 @@ fn unwarp_loop<'a>(
                     )),
                 )
             } else {
-                let expression = primitive(alloc, PrimitiveKind::True);
-                let inner_statements = statements(alloc, body.iter().copied());
-                node(
+                let expression = Node::emplace_primitive(alloc, PrimitiveKind::True);
+                let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
+                Node::emplace(
                     alloc,
                     Node::While(ArenaBox::new_in(
                         While {
@@ -885,8 +885,8 @@ fn unwarp_loop<'a>(
             let condition =
                 compile_expression(alloc, &expression, None, Some(true_block), Some(end))?;
 
-            let inner_statements = statements(alloc, body.iter().copied());
-            node(
+            let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
+            Node::emplace(
                 alloc,
                 Node::While(ArenaBox::new_in(
                     While {
@@ -969,7 +969,7 @@ fn unwarp_loop<'a>(
                 } else {
                     contents
                 };
-            contents.push(node(alloc, Node::Break));
+            contents.push(Node::emplace(alloc, Node::Break));
             traverse::set_block_contents(alloc, last, contents);
         }
     }
@@ -1003,7 +1003,7 @@ fn unwarp_loop<'a>(
     // its place at the top of the body and the original is emptied.
     let start_range = traverse::block_range(start).unwrap_or((0, 0));
     let copy_contents = traverse::block_contents(start);
-    let copy = node(
+    let copy = Node::emplace(
         alloc,
         Node::Block(ArenaBox::new_in(
             Block {
@@ -1030,9 +1030,9 @@ fn unwarp_loop<'a>(
     set_flow_to(alloc, start, copy);
     body[0] = copy;
 
-    let inner_statements = statements(alloc, body.iter().copied());
+    let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
     Ok(BuiltLoop {
-        node: node(
+        node: Node::emplace(
             alloc,
             Node::RepeatUntil(ArenaBox::new_in(
                 RepeatUntil {

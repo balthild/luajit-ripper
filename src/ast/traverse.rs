@@ -211,7 +211,7 @@ fn deep_clone_into<'a>(
     }
 
     let shallow = clone_shallow(alloc, &source.borrow(), copies);
-    let copy = node(alloc, shallow);
+    let copy = Node::emplace(alloc, shallow);
     copies.insert(node_key(source), copy);
 
     // Rewriting the children of the copy is what makes this a deep copy. Every

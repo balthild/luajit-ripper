@@ -828,7 +828,7 @@ fn unwarp_expressions_pack<'a>(
                 Node::Block(inner) => inner.last_address,
                 _ => 0,
             };
-            let temporary = node(
+            let temporary = Node::emplace(
                 alloc,
                 Node::Block(ArenaBox::new_in(
                     Block {
@@ -988,12 +988,12 @@ fn unwarp_logical_expression<'a>(
         compile_expression(alloc, &parts, Some(end), true_terminator, false_terminator)?;
 
     let destination = traverse::deep_clone(alloc, slot);
-    let assignment = node(
+    let assignment = Node::emplace(
         alloc,
         Node::Assignment(ArenaBox::new_in(
             Assignment {
-                expressions: expressions(alloc, vec![expression]),
-                destinations: variables(alloc, vec![destination]),
+                expressions: Node::emplace_expressions(alloc, vec![expression]),
+                destinations: Node::emplace_variables(alloc, vec![destination]),
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             },
@@ -1093,7 +1093,7 @@ fn optimise_expression_skipping<'a>(
     let mut children = find_binary_operator_children(expression, kind);
     let mut result = children.remove(0);
     for child in children {
-        let next = node(
+        let next = Node::emplace(
             alloc,
             Node::BinaryOperator(ArenaBox::new_in(
                 BinaryOperator {
@@ -1330,7 +1330,7 @@ fn unwarp_expression<'a>(
                         let goes_to_true = warp
                             .and_then(|warp| get_target(&warp.borrow(), false))
                             .is_some_and(|target| same_optional(Some(target), true_end));
-                        primitive(
+                        Node::emplace_primitive(
                             alloc,
                             if goes_to_true {
                                 PrimitiveKind::True
@@ -1479,7 +1479,7 @@ fn simplified_operand<'a>(alloc: &'a Allocator, operand: NodeRef<'a>) -> NodeRef
         } else {
             PrimitiveKind::False
         };
-        return primitive(alloc, kind);
+        return Node::emplace_primitive(alloc, kind);
     }
     operand
 }
@@ -1663,7 +1663,7 @@ pub(super) fn invert<'a>(alloc: &'a Allocator, expression: NodeRef<'a>) -> Resul
             }
             Ok(copy)
         }
-        _ => Ok(node(
+        _ => Ok(Node::emplace(
             alloc,
             Node::UnaryOperator(ArenaBox::new_in(
                 UnaryOperator {
@@ -1686,7 +1686,7 @@ fn assemble_expression<'a>(alloc: &'a Allocator, parts: &[Part<'a>]) -> Result<N
         return Err(internal("a logical expression with a missing operand"));
     }
 
-    let mut result = node(
+    let mut result = Node::emplace(
         alloc,
         Node::BinaryOperator(ArenaBox::new_in(
             BinaryOperator {
@@ -1704,7 +1704,7 @@ fn assemble_expression<'a>(alloc: &'a Allocator, parts: &[Part<'a>]) -> Result<N
         let operator = operator_of(&parts[i as usize])?;
         let component = assemble_part(alloc, parts[i as usize - 1].clone())?;
 
-        result = node(
+        result = Node::emplace(
             alloc,
             Node::BinaryOperator(ArenaBox::new_in(
                 BinaryOperator {
