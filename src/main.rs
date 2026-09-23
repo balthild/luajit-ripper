@@ -3,9 +3,8 @@
 //! The `luajit-ripper` command line tool.
 //!
 //! ```text
-//! luajit-ripper --input <dump.ljbc> [--output <file.lua>]
-//! luajit-ripper --input <dir of dumps> --output <dir> [--module-structure]
-//!                                            [--incremental]
+//! luajit-ripper --input <dump.ljbc> [--output <file.lua>] [...OPTIONS]
+//! luajit-ripper --input <dir of dumps> --output <dir> [...OPTIONS]
 //! ```
 //!
 //! A single dump without an output goes to stdout; a directory of dumps is
@@ -33,50 +32,35 @@ use crate::cli::run;
 #[derive(Debug, Parser)]
 #[command(name = "luajit-ripper", version, about, long_about = None)]
 struct Cli {
-    /// A dump to decompile, or a directory holding dumps.
+    /// The path to the dump or a directory of dumps.
     #[arg(short, long, value_name = "PATH")]
     input: PathBuf,
 
-    /// Where to write the source.
-    ///
-    /// Left out, a single dump is written to stdout. A directory of dumps needs
-    /// an output directory, which is created when its parent already exists.
+    /// The path to the output. If left out, a single dump goes to stdout.
+    /// Required when the input is a directory.
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Name every output after the module path recorded in its dump.
-    ///
-    /// A dump holds the name of the file it was compiled from, such as
-    /// `@modules/logic/rouge/map/Foo.lua`. The name is used as a path below the
-    /// output directory, with the leading `@` kept, which turns a flat
-    /// collection of hashed dumps back into the tree it was built from. A dump
-    /// without a usable name keeps the path of its input file. Directory input
-    /// only, since it is what makes two dumps tell themselves apart.
+    /// For directory input, use the chunk name (such as `@modules/a/b/c.lua`)
+    /// as the path in the output directory. A dump whose chunk name is missing
+    /// or invalid will keep the relative path of the input file.
     #[arg(long)]
     module_structure: bool,
 
-    /// Leave a dump alone when its source is already there and just as old.
-    ///
-    /// A dump is skipped when the file it would be written to carries the same
-    /// modification time as the dump itself — the same moment, not a time at
-    /// least as new, so a dump compiled again is decompiled again, and so is a
-    /// source that was edited after the fact. A source this wrote carries the
-    /// time of the dump it came from rather than the time it was written, which
-    /// is what the comparison is about. A skipped dump is not even read, so it
-    /// also says nothing while the run is under way; the report counts it.
-    /// Directory input only, since it is a rerun over a directory that it saves.
+    /// Decompile only dumps whose source has different modification times.
     #[arg(long)]
     incremental: bool,
 
-    /// How many dumps to decompile at once. Zero picks a number automatically.
+    /// Allow N dumps to be decompiled in parallel; `0` picks a number based on
+    /// CPU cores.
     #[arg(short = 'j', long, value_name = "N", default_value_t = 0)]
     threads: usize,
 
-    /// What to indent the source with.
+    /// Set indentation style for the decompiled source.
     #[arg(long, value_enum, default_value_t = IndentStyle::Tabs)]
     indent: IndentStyle,
 
-    /// How many spaces make a level. Needs --indent spaces.
+    /// If indenting with spaces, sets the number of spaces per level.
     #[arg(long, value_name = "N")]
     indent_width: Option<u8>,
 
@@ -84,7 +68,7 @@ struct Cli {
     #[arg(long)]
     slots: bool,
 
-    /// Write `t.f = function () end` as `function t.f() end`.
+    /// Write `t.f = function() end` as `function t.f() end`.
     #[arg(long)]
     syntactic_sugar: bool,
 
@@ -92,8 +76,8 @@ struct Cli {
     #[arg(long)]
     bit_library: bool,
 
-    /// Write the regions that cannot be structured into code, with a comment
-    /// pointing them out, instead of failing the chunk they are in.
+    /// Write the regions that cannot be structured into code with a comment
+    /// pointing them out, instead of failing the entire chunk.
     #[arg(long)]
     mark_errors: bool,
 }

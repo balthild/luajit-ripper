@@ -6,7 +6,7 @@ The crate is a port of [LJD](https://github.com/Aussiemon/ljd), a LuaJIT bytecod
 
 ## Usage
 
-### As a CLI Tool
+### CLI
 
 ```shell
 # install from prebuilt binary
@@ -17,33 +17,26 @@ cargo install luajit-ripper --features cli
 ```
 
 ```shell
-luajit-ripper --input <dump.ljbc> [--output <file.lua>]
-luajit-ripper --input <dir of dumps> --output <dir> [--module-structure]
+luajit-ripper --input <dump.ljbc> [--output <file.lua>] [...OPTIONS]
+luajit-ripper --input <dir of dumps> --output <dir> [...OPTIONS]
 ```
 
 #### Options
 
 | Option | Effect |
 | --- | --- |
-| `-i`, `--input <PATH>` | Dump, or directory of dumps, to read. |
-| `-o`, `--output <PATH>` | Where to write. Left out, a single dump goes to stdout. |
-| `--module-structure` | Name every output after the chunk name in its dump. |
-| `-j`, `--threads <N>` | How many dumps to decompile at once; `0` picks a number. |
-| `--indent`, `--indent-width` | Tabs, or a chosen number of spaces per level. |
+| `-i`, `--input <PATH>` | The path to the dump or a directory of dumps. |
+| `-o`, `--output <PATH>` | The path to the output. If left out, a single dump goes to stdout. Required when the input is a directory. |
+| `--module-structure` | For directory input, use the chunk name (such as `@modules/a/b/c.lua`) as the path in the output directory. A dump whose chunk name is missing or invalid will keep the relative path of the input file. |
+| `-j`, `--threads <N>` | Allow N dumps to be decompiled in parallel; `0` picks a number based on CPU cores. |
+| `--indent`, `--indent-width` | Set indentation style and width for the decompiled source. |
 | `--slots` | Let unnamed registers carry the ids of the definitions they may refer to. |
 | `--syntactic-sugar` | Write `t.f = function() end` as `function t.f() end`. |
-| `--bit-library` | Write `bit.band(a, b)` instead of `a & b`. |
-| `--mark-errors` | Write the regions that cannot be structured as code instead of failing their chunk. |
+| `--bit-library` | Write bit operations as `bit.band(a, b)` instead of `a & b`. |
+| `--mark-errors` | Write the regions that cannot be structured into code with a comment pointing them out, instead of failing the entire chunk. |
+| `--incremental` | Decompile only dumps whose source has different modification times. |
 
-#### Outputs
-
-A single dump without `--output` is written to stdout. A directory of dumps is decompiled into an output directory with one worker per core (`--threads` changes that), and every worker keeps an allocator of its own, which is reset after each dump instead of unwinding what the passes built.
-
-A dump keeps the name of the file it was compiled from, such as `@modules/logic/rouge/map/Foo.lua`. With `--module-structure` that name becomes the path below the output directory, leading `@` and all, which turns a flat collection of hashed dumps back into the tree it was built from. A dump whose name is missing (a stripped dump) or unusable keeps the path of its input file instead, and the run says so.
-
-Without it, the layout of the input is mirrored: `sub/a.ljbc` becomes `sub/a.lua`.
-
-### As a Library
+### Library
 
 ```shell
 cargo add luajit-ripper

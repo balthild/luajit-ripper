@@ -17,7 +17,7 @@
 //!
 //! The high level entry point is `decompile`, which runs the whole pipeline.
 //!
-//! # Limits
+//! # Limitations
 //!
 //! Rebuilding source from bytecode is not always possible, because a jump
 //! target does not record which construct produced it. Two shapes of input are
