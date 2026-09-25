@@ -11,9 +11,11 @@
 //!   invents a chain of folders. Everything below the output directory is fair
 //!   game and is created as needed.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::{fs, io};
 
+use luajit_ripper::path::PathExt;
 use walkdir::WalkDir;
 
 use crate::cli::Error;
@@ -24,6 +26,24 @@ use crate::cli::Error;
 pub const DUMP_EXTENSION: &str = "ljbc";
 /// Extension given to the decompiled output.
 pub const SOURCE_EXTENSION: &str = "lua";
+
+/// What the command line asks of a run.
+///
+/// These are the options that decide where a run reads from and writes to, and
+/// what it does to what it finds there. They are kept together so that
+/// [`resolve`] takes one argument rather than a row of booleans that grows
+/// every time one is added.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Layout {
+    /// Whether output paths are taken from the module path in the dump header
+    /// instead of from the location of the input file.
+    pub module_structure: bool,
+    /// Whether a dump whose source is already there and as old as the dump is
+    /// left alone instead of being decompiled again.
+    pub incremental: bool,
+    /// Whether outputs below the root that this run did not produce are removed.
+    pub delete: bool,
+}
 
 /// A resolved command line: one input and where its output goes.
 #[derive(Debug)]
@@ -50,12 +70,8 @@ pub enum Sink {
 pub struct Tree {
     /// Directory the output is written below.
     pub root: PathBuf,
-    /// Whether output paths are taken from the module path in the dump header
-    /// instead of from the location of the input file.
-    pub module_structure: bool,
-    /// Whether a dump whose source is already there and as old as the dump is
-    /// left alone instead of being decompiled again.
-    pub incremental: bool,
+    /// What the run was asked for.
+    pub layout: Layout,
 }
 
 /// Where one dump is written.
@@ -73,12 +89,7 @@ pub struct Target {
 ///
 /// This creates the output directory when it needs one, and reports a path that
 /// cannot be used without touching the filesystem.
-pub fn resolve(
-    input: &Path,
-    output: Option<&Path>,
-    module_structure: bool,
-    incremental: bool,
-) -> Result<Job, Error> {
+pub fn resolve(input: &Path, output: Option<&Path>, layout: &Layout) -> Result<Job, Error> {
     let metadata = fs::metadata(input).map_err(|source| io_error(input, source))?;
 
     if metadata.is_dir() {
@@ -88,34 +99,53 @@ pub fn resolve(
                 input.display()
             )));
         };
+
         let root = prepare_root(output)?;
+
+        // The output root is compared with the input before anything is read:
+        // a run that would delete from where it reads is one to refuse, not one
+        // to start and find out about halfway.
+        if layout.delete {
+            refuse_deleting_input(input, &root)?;
+        }
+
         Ok(Job {
             input: input.to_path_buf(),
             sink: Sink::Tree(Tree {
                 root,
-                module_structure,
-                incremental,
+                layout: *layout,
             }),
         })
     } else {
-        if module_structure {
+        if layout.module_structure {
             return Err(Error::Layout(String::from(
                 "--module-structure needs a directory as --input",
             )));
         }
-        if incremental {
+
+        if layout.incremental {
             // A single input is one output, written whether or not it was there
             // before: there is no tree to be incremental about.
             return Err(Error::Layout(String::from(
                 "--incremental needs a directory as --input",
             )));
         }
+
+        if layout.delete {
+            // A single input is one output, and it was just named: there is no
+            // tree to walk for outputs that no longer belong.
+            return Err(Error::Layout(String::from(
+                "--delete needs a directory as --input",
+            )));
+        }
+
         let Some(output) = output else {
             return Ok(Job {
                 input: input.to_path_buf(),
                 sink: Sink::Stdout,
             });
         };
+
         // A single input is one output. Accepting a directory here would mean
         // deciding a file name for it, and there is no name to decide on.
         if output.is_dir() {
@@ -126,6 +156,7 @@ pub fn resolve(
                 output.display()
             )));
         }
+
         // The parent has to be there already: a file output is not a reason to
         // start making directories.
         let parent = parent_of(output);
@@ -136,6 +167,7 @@ pub fn resolve(
                 output.display()
             )));
         }
+
         Ok(Job {
             input: input.to_path_buf(),
             sink: Sink::File(output.to_path_buf()),
@@ -171,6 +203,34 @@ fn prepare_root(output: &Path) -> Result<PathBuf, Error> {
     }
 }
 
+/// Refuses a run that would delete from the directory it reads from.
+///
+/// `--delete` removes what the output root holds and the run did not produce,
+/// so an output root that is the input directory, or that holds it, is one where
+/// the walk could reach a dump the run has not read yet or a source it did not
+/// write. A directory of dumps usually has no `.lua` files to lose, but that is
+/// a fact about one tree rather than a rule, so the shape is refused rather than
+/// trusted.
+///
+/// Both paths are resolved to their real form before being compared, so a link
+/// that points one at the other is seen for what it is. Both are known to exist
+/// by the time this runs: the input was just read, and the output root was
+/// created if it was missing.
+fn refuse_deleting_input(input: &Path, root: &Path) -> Result<(), Error> {
+    let real_input = fs::canonicalize(input).map_err(|source| io_error(input, source))?;
+    let real_root = fs::canonicalize(root).map_err(|source| io_error(root, source))?;
+
+    if real_input == real_root || real_input.starts_with(&real_root) {
+        return Err(Error::Layout(format!(
+            "--output {} is --input {} or holds it, so --delete would delete from \
+             where the run reads",
+            root.display(),
+            input.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Every dump below `input`, in path order.
 ///
 /// Subdirectories are searched; symbolic links are not followed, so a link
@@ -185,16 +245,68 @@ pub fn dumps(input: &Path) -> Result<Vec<PathBuf>, Error> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == DUMP_EXTENSION)
-        {
+        if entry.path().has_extension(DUMP_EXTENSION) {
             files.push(entry.into_path());
         }
     }
     files.sort();
     Ok(files)
+}
+
+/// Removes the `.lua` outputs below `root` that are not in `keep`.
+///
+/// This is what `--delete` asks for: the output tree is meant to hold what the
+/// run produced and nothing else, so a source no dump produced is a leftover of
+/// an earlier run, or of a dump that is gone. Only files are candidates, and
+/// only ones named [`SOURCE_EXTENSION`]: anything else below the root was not
+/// written by this tool and is left where it is. Symbolic links are neither
+/// followed nor removed, as when the input is walked.
+///
+/// Directories left empty are removed as well, everything below the root but not
+/// the root itself: a stale source is often the last thing in its directory, and
+/// taking the directory with it is what keeps the tree from filling up with
+/// empty folders. That is not counted or reported — the answer is the number of
+/// files removed.
+///
+/// `keep` holds the paths of this run, both the ones it wrote and the ones it
+/// left alone, spelled exactly as the run resolved them. The walk spells the
+/// same files the same way, since both join the same root.
+pub fn prune(root: &Path, keep: &HashSet<PathBuf>) -> Result<usize, Error> {
+    let mut deleted = 0;
+
+    // Contents first, so that a directory is visited after whatever was below
+    // it: a directory that is empty by the time it is reached is one whose
+    // contents were all removed, which is the only kind worth removing.
+    for entry in WalkDir::new(root).contents_first(true).follow_links(false) {
+        let entry = entry.map_err(|source| Error::Walk {
+            path: root.to_path_buf(),
+            source,
+        })?;
+
+        // The root itself is what `--output` named, and it stays: it is a
+        // directory the run was asked to fill in, not one it may take away.
+        if entry.path() == root {
+            continue;
+        }
+
+        if entry.file_type().is_dir() {
+            // A directory that still holds something is one to keep, and
+            // `remove_dir` refuses it; that refusal is the answer, not a
+            // failure to report.
+            let _ = fs::remove_dir(entry.path());
+            continue;
+        }
+
+        if entry.file_type().is_file()
+            && entry.path().has_extension(SOURCE_EXTENSION)
+            && !keep.contains(entry.path())
+        {
+            fs::remove_file(entry.path()).map_err(|source| io_error(entry.path(), source))?;
+            deleted += 1;
+        }
+    }
+
+    Ok(deleted)
 }
 
 // MARK: targets
@@ -205,7 +317,7 @@ impl Tree {
     /// `input` is the directory the walk started from, which is what the
     /// fallback mirrors.
     pub fn target(&self, input: &Path, file: &Path, chunk_name: Option<&str>) -> Target {
-        if self.module_structure
+        if self.layout.module_structure
             && let Some(relative) = chunk_name.and_then(module_relative_path)
         {
             return Target {
@@ -239,7 +351,7 @@ impl Tree {
     /// target is worked out exactly as it is for a write, so the two cannot
     /// disagree about where the source belongs.
     pub fn skip(&self, input: &Path, file: &Path, chunk_name: Option<&str>) -> Option<Target> {
-        if !self.incremental {
+        if !self.layout.incremental {
             return None;
         }
         let target = self.target(input, file, chunk_name);

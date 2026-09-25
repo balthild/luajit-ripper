@@ -14,9 +14,8 @@
 //!   order, so both are skipped where they sit in the tree.
 //! * The trailing `return` of a function is left out, because Lua does not need
 //!   it.
-//! * `t.f = function() end` is written as `function t.f() end` when the
-//!   destination is simple enough for that, which is what makes methods come
-//!   out as `function Mod:name()`.
+//! * `t.f = function(self) end` is written as `function t:f() end` when the
+//!   destination is simple enough for that.
 
 use std::collections::HashSet;
 
@@ -77,7 +76,7 @@ pub struct Options {
     /// Whether registers that were never named carry the ids of the
     /// definitions they might refer to.
     pub show_slot_ids: bool,
-    /// Whether `t.f = function() end` becomes `function t.f() end`.
+    /// Whether `t.f = function(self) end` is written as `function t:f() end`.
     pub function_definition_sugar: bool,
     /// Whether the `self` argument of a method is written out.
     pub write_function_definition_self_arg: bool,

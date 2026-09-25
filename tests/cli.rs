@@ -747,6 +747,266 @@ fn an_incremental_run_still_reports_a_dump_it_cannot_read() {
 }
 
 #[test]
+fn delete_needs_a_directory_to_delete_from() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-single");
+    let dump = temp.join("chunk.ljbc");
+    compile(&luajit, temp.path(), "chunk.lua", &dump, true);
+
+    let refused = run(&[
+        "--input",
+        &dump.to_string_lossy(),
+        "--output",
+        &temp.text("chunk.out.lua"),
+        "--delete",
+    ]);
+    assert!(!refused.succeeded());
+    assert!(
+        refused
+            .stderr
+            .contains("--delete needs a directory as --input"),
+        "{}",
+        refused.stderr
+    );
+}
+
+#[test]
+fn delete_refuses_an_output_that_holds_the_input() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-overlap");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("chunk.ljbc"),
+        true,
+    );
+
+    // The output is the input's parent, so walking it would reach the dump the
+    // run is reading from.
+    let above = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &temp.path().to_string_lossy(),
+        "--delete",
+    ]);
+    assert!(!above.succeeded());
+    assert!(
+        above.stderr.contains("--delete would delete"),
+        "{}",
+        above.stderr
+    );
+
+    // And the output being the input itself is the same case, seen from closer.
+    let same = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &dumps.to_string_lossy(),
+        "--delete",
+    ]);
+    assert!(!same.succeeded());
+    assert!(
+        same.stderr.contains("--delete would delete"),
+        "{}",
+        same.stderr
+    );
+}
+
+#[test]
+fn delete_removes_an_output_no_dump_produced() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-stale");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("chunk.ljbc"),
+        true,
+    );
+
+    let output = temp.text("out");
+    let first = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // Two leftovers of an earlier run: a source in a directory of its own, and
+    // one next to the output, plus a file this tool would never have written.
+    fs::create_dir_all(temp.join("out/gone")).unwrap();
+    fs::write(temp.join("out/gone/stale.lua"), "-- stale\n").unwrap();
+    fs::write(temp.join("out/deeper.lua"), "-- stale\n").unwrap();
+    fs::write(temp.join("out/notes.txt"), "keep me\n").unwrap();
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--delete",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+
+    assert!(temp.join("out/chunk.lua").is_file());
+    assert!(!temp.join("out/gone/stale.lua").exists());
+    assert!(!temp.join("out/deeper.lua").exists());
+    // The directory the stale source was the last thing in goes with it, and
+    // the file this tool did not write is left where it is.
+    assert!(!temp.join("out/gone").exists());
+    assert_eq!(
+        fs::read_to_string(temp.join("out/notes.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert!(second.stderr.contains("2 deleted"), "{}", second.stderr);
+}
+
+#[test]
+fn delete_keeps_what_the_run_wrote_and_what_it_skipped() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-keeps");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    for name in ["one", "two"] {
+        compile(
+            &luajit,
+            temp.path(),
+            &format!("{name}.lua"),
+            &dumps.join(format!("{name}.ljbc")),
+            true,
+        );
+    }
+
+    let output = temp.text("out");
+    let first = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // One dump is compiled again and the other is not, so the run writes one
+    // source and leaves the other alone; both are this run's output, and
+    // deleting either would throw away work that is current.
+    compile(
+        &luajit,
+        temp.path(),
+        "one.lua",
+        &dumps.join("one.ljbc"),
+        true,
+    );
+    let one = temp.join("out/one.lua");
+    let two = temp.join("out/two.lua");
+    age_like(&two, &dumps.join("two.ljbc"));
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--incremental",
+        "--delete",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert_eq!(
+        fs::metadata(&two).unwrap().modified().unwrap(),
+        fs::metadata(dumps.join("two.ljbc"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    );
+    assert!(one.is_file());
+    assert!(two.is_file());
+    assert!(second.stderr.contains("1 skipped"), "{}", second.stderr);
+    assert!(!second.stderr.contains("deleted"), "{}", second.stderr);
+}
+
+#[test]
+fn delete_is_held_back_when_a_dump_fails() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-failed");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    compile(
+        &luajit,
+        temp.path(),
+        "chunk.lua",
+        &dumps.join("good.ljbc"),
+        true,
+    );
+
+    let output = temp.text("out");
+    let first = run(&["--input", &dumps.to_string_lossy(), "--output", &output]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // A dump that cannot be read makes the run one that does not know what it
+    // produced, so the leftover is left alone rather than taken on a guess.
+    fs::write(temp.join("out/stale.lua"), "-- stale\n").unwrap();
+    fs::write(dumps.join("broken.ljbc"), b"this is not a dump").unwrap();
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--delete",
+    ]);
+    assert!(!second.succeeded());
+    assert!(temp.join("out/stale.lua").is_file(), "{}", second.stderr);
+    assert!(
+        second.stderr.contains("nothing deleted"),
+        "{}",
+        second.stderr
+    );
+}
+
+#[test]
+fn delete_finds_a_stale_output_named_after_its_module() {
+    let luajit = luajit!();
+    let temp = Temp::new("delete-modules");
+    let work = temp.join("work");
+    let dumps = temp.join("dumps");
+    fs::create_dir_all(&dumps).unwrap();
+    compile(
+        &luajit,
+        &work,
+        "modules/pkg/one.lua",
+        &dumps.join("aaaa.ljbc"),
+        true,
+    );
+
+    let output = temp.text("out");
+    let first = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--module-structure",
+    ]);
+    assert!(first.succeeded(), "{}", first.stderr);
+
+    // The output of this run is not below a path the input tells the run about,
+    // so what belongs there is only known by reading the dump's header; the
+    // leftovers are named after modules that no dump mentions.
+    let kept = temp.join("out/@modules/pkg/one.lua");
+    assert!(kept.is_file(), "{}", first.stderr);
+    fs::create_dir_all(temp.join("out/@modules/other")).unwrap();
+    fs::write(temp.join("out/@modules/other/gone.lua"), "-- stale\n").unwrap();
+
+    let second = run(&[
+        "--input",
+        &dumps.to_string_lossy(),
+        "--output",
+        &output,
+        "--module-structure",
+        "--delete",
+    ]);
+    assert!(second.succeeded(), "{}", second.stderr);
+    assert!(kept.is_file());
+    assert!(!temp.join("out/@modules/other/gone.lua").exists());
+    assert!(!temp.join("out/@modules/other").exists());
+    assert!(second.stderr.contains("1 deleted"), "{}", second.stderr);
+}
+
+#[test]
 fn a_dump_that_cannot_be_read_does_not_stop_the_others() {
     let luajit = luajit!();
     let temp = Temp::new("broken");

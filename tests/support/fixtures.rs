@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use luajit_ripper::path::PathExt;
+
 /// The directory the fixture sources live in.
 pub fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -18,7 +20,7 @@ pub fn fixture_names() -> Vec<String> {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
-            (path.extension().is_some_and(|ext| ext == "lua"))
+            path.has_extension("lua")
                 .then(|| path.file_stem().unwrap().to_string_lossy().into_owned())
         })
         .collect();

@@ -190,7 +190,49 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
     // A worker sends exactly one outcome per dump, so every slot is filled.
     let outcomes: Vec<Outcome> = outcomes.into_iter().flatten().collect();
 
-    Ok(Summary::of(&files, &outcomes, tree.module_structure))
+    let mut summary = Summary::of(&files, &outcomes, tree.layout.module_structure);
+    // Deleting is the last thing a run does, and it is done once the run is
+    // over: with `--module-structure` the path an output went to comes from the
+    // dump's own header, so what the run produced is not known until every dump
+    // has been read and answered for.
+    if tree.layout.delete {
+        delete_stale(tree, &outcomes, &mut summary)?;
+    }
+    Ok(summary)
+}
+
+/// Removes the outputs below the root that this run did not produce.
+///
+/// The paths the run keeps are the ones it wrote and the ones `--incremental`
+/// left alone, worked out exactly as the run resolved them, so the tree that is
+/// walked and the paths that are kept cannot disagree about where an output
+/// belongs.
+///
+/// A run that failed a dump is not one that knows what it produced: that dump
+/// may have an output from an earlier run, which may be perfectly good, while
+/// the run has just said it could not read the dump. Nothing is deleted and the
+/// report says why, which is what keeps `--delete` safe on a tree that is not
+/// always decompilable.
+fn delete_stale(tree: &Tree, outcomes: &[Outcome], summary: &mut Summary) -> Result<(), Error> {
+    if outcomes
+        .iter()
+        .any(|outcome| matches!(outcome.result, Done::Failed(_)))
+    {
+        summary.delete_skipped = true;
+        return Ok(());
+    }
+
+    let keep: HashSet<PathBuf> = outcomes
+        .iter()
+        .filter_map(|outcome| match &outcome.result {
+            Done::Written(written) => Some(written.target.clone()),
+            Done::Skipped(target) => Some(target.clone()),
+            Done::Failed(_) => None,
+        })
+        .collect();
+
+    summary.deleted = paths::prune(&tree.root, &keep)?;
+    Ok(())
 }
 
 /// Decompiles one dump and writes it below the output root.
@@ -199,7 +241,7 @@ fn work(file: &Path, input: &Path, tree: &Tree, options: &Options) -> Outcome {
     // without the name, and the name is in the header, so that one case reads the
     // header before deciding. A mirrored output is worked out from the input
     // path, which is already known, and reads nothing.
-    let named = if tree.incremental && tree.module_structure {
+    let named = if tree.layout.incremental && tree.layout.module_structure {
         chunk_name(file)
     } else {
         None
@@ -219,7 +261,7 @@ fn work(file: &Path, input: &Path, tree: &Tree, options: &Options) -> Outcome {
         // that the two still belong together; see `paths::stamp`. Only an
         // incremental run does it, so a plain run leaves the times it always
         // used to.
-        if tree.incremental {
+        if tree.layout.incremental {
             paths::stamp(&target.path, file)?;
         }
         Ok(Done::Written(Written {
@@ -328,6 +370,18 @@ pub struct Summary {
     /// These are counted nowhere else: no work was done for them, so they are
     /// neither successful nor failed, and the two together are not the total.
     skipped: usize,
+    /// Outputs that were removed because this run did not produce them.
+    ///
+    /// These are counted nowhere else: they are what an earlier run left that
+    /// the output tree is no longer meant to hold. Only `--delete` asks for
+    /// them, and a run that was asked for them but held them back leaves this
+    /// at zero.
+    deleted: usize,
+    /// Whether `--delete` was asked for but left undone.
+    ///
+    /// A run with a failure does not know the whole set of outputs it produced,
+    /// so it deletes nothing and says so rather than guessing.
+    delete_skipped: bool,
     /// Output paths that were written more than once.
     collisions: usize,
     /// Failures, counted by reason.
@@ -426,6 +480,17 @@ impl Summary {
         reasons.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
         for (reason, count) in reasons.iter().take(20) {
             eprintln!("{count:7}  {reason}");
+        }
+
+        // What `--delete` did is said in one line, and only when there is
+        // something to say: a run without it has nothing to report, and neither
+        // has one whose output tree already held nothing but its own output.
+        // Empty directories are taken with the stale sources they held, and are
+        // not counted or mentioned.
+        if self.delete_skipped {
+            eprintln!("nothing deleted: a dump failed, so this run's outputs are not known");
+        } else if self.deleted > 0 {
+            eprintln!("{} deleted", self.deleted);
         }
 
         // The last line accounts for every dump, so that however much detail

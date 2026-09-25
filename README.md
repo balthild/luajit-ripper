@@ -31,10 +31,11 @@ luajit-ripper --input <dir of dumps> --output <dir> [...OPTIONS]
 | `-j`, `--threads <N>` | Allow N dumps to be decompiled in parallel; `0` picks a number based on CPU cores. |
 | `--indent`, `--indent-width` | Set indentation style and width for the decompiled source. |
 | `--slots` | Let unnamed registers carry the ids of the definitions they may refer to. |
-| `--syntactic-sugar` | Write `t.f = function() end` as `function t.f() end`. |
+| `--syntactic-sugar` | Write `t.f = function(self) end` as `function t:f() end`. |
 | `--bit-library` | Write bit operations as `bit.band(a, b)` instead of `a & b`. |
 | `--mark-errors` | Write the regions that cannot be structured into code with a comment pointing them out, instead of failing the entire chunk. |
-| `--incremental` | Decompile only dumps whose source has different modification times. |
+| `--incremental` | Decompile only dumps whose outputs have different modification times. |
+| `--delete` | For directory input, remove the lua files inside the output directory that this run did not produce. |
 
 ### Library
 
@@ -80,7 +81,7 @@ print!("{}", listing::dump(&chunk));
 | `bitop_style` | `BitOpStyle::Operator` | `a & b`, or `bit.band(a, b)`. |
 | `on_function_error` | `OnFunctionError::Fail` | Stop at the first region that cannot be structured, or recover it. |
 | `show_slot_ids` | `false` | Let unnamed registers carry the ids of the definitions they may refer to. |
-| `function_definition_sugar` | `false` | Write `t.f = function() end` as `function t.f() end`. |
+| `function_definition_sugar` | `false` | Write `t.f = function(self) end` as `function t:f() end`. |
 
 ## Testing
 

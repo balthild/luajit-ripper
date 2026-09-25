@@ -1,22 +1,5 @@
 #![feature(thread_local)]
 
-//! The `luajit-ripper` command line tool.
-//!
-//! ```text
-//! luajit-ripper --input <dump.ljbc> [--output <file.lua>] [...OPTIONS]
-//! luajit-ripper --input <dir of dumps> --output <dir> [...OPTIONS]
-//! ```
-//!
-//! A single dump without an output goes to stdout; a directory of dumps is
-//! decompiled on a thread pool into an output directory, either mirroring the
-//! layout of the input or following the module path recorded in each dump. With
-//! `--incremental`, a dump whose source is already there and as old as the dump
-//! itself is left alone, so a rerun only does the work that is out of date.
-//!
-//! The tool is only built when the `cli` feature is on, which is what pulls in
-//! clap, rayon and walkdir. It also needs a nightly compiler, because the
-//! allocator each worker keeps is a `#[thread_local]` static.
-
 mod cli;
 
 use std::path::PathBuf;
@@ -47,9 +30,14 @@ struct Cli {
     #[arg(long)]
     module_structure: bool,
 
-    /// Decompile only dumps whose source has different modification times.
+    /// Decompile only dumps whose outputs have different modification times.
     #[arg(long)]
     incremental: bool,
+
+    /// For directory input, remove the lua files inside the output directory
+    /// that this run did not produce.
+    #[arg(long)]
+    delete: bool,
 
     /// Allow N dumps to be decompiled in parallel; `0` picks a number based on
     /// CPU cores.
@@ -68,7 +56,7 @@ struct Cli {
     #[arg(long)]
     slots: bool,
 
-    /// Write `t.f = function() end` as `function t.f() end`.
+    /// Write `t.f = function(self) end` as `function t:f() end`.
     #[arg(long)]
     syntactic_sugar: bool,
 
@@ -85,9 +73,7 @@ struct Cli {
 /// What the source is indented with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum IndentStyle {
-    /// One tab per level, which is what the original compiler is fed.
     Tabs,
-    /// A chosen number of spaces.
     Spaces,
 }
 
@@ -128,12 +114,13 @@ fn main() -> ExitCode {
         Err(message) => return fail(&message),
     };
 
-    let job = match paths::resolve(
-        &cli.input,
-        cli.output.as_deref(),
-        cli.module_structure,
-        cli.incremental,
-    ) {
+    let layout = paths::Layout {
+        module_structure: cli.module_structure,
+        incremental: cli.incremental,
+        delete: cli.delete,
+    };
+
+    let job = match paths::resolve(&cli.input, cli.output.as_deref(), &layout) {
         Ok(job) => job,
         Err(error) => return fail(&error.to_string()),
     };

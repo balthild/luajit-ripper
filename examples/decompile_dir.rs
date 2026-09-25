@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use luajit_ripper::path::PathExt;
 use luajit_ripper::{OnFunctionError, Options, decompile};
 
 fn main() -> ExitCode {
@@ -50,7 +51,7 @@ fn main() -> ExitCode {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "ljbc"))
+            .filter(|path| path.has_extension("ljbc"))
             .collect(),
         Err(error) => {
             eprintln!("cannot read {}: {error}", input.display());

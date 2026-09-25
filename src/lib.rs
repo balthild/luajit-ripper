@@ -41,6 +41,7 @@
 pub mod bytecode;
 mod error;
 pub mod listing;
+pub mod path;
 
 #[doc(hidden)]
 pub mod ast;
@@ -86,7 +87,7 @@ pub struct Options {
     /// Whether registers that could not be named carry the ids of the
     /// definitions they may refer to.
     pub show_slot_ids: bool,
-    /// Whether `t.f = function() end` is written as `function t.f() end`.
+    /// Whether to write `t.f = function(self) end` as `function t:f() end`.
     pub function_definition_sugar: bool,
 }
 

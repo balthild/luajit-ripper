@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use luajit_ripper::path::PathExt;
+
 use super::rng::Rng;
 
 /// How many dumps a run over the corpus looks at by default.
@@ -85,7 +87,7 @@ fn dumps_in(dir: &Path) -> Vec<PathBuf> {
         .expect("the corpus directory should be readable")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "ljbc"))
+        .filter(|path| path.has_extension("ljbc"))
         .collect();
     files.sort();
     files
