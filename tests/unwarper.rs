@@ -7,15 +7,15 @@
 
 mod support;
 
+use luajit_ripper::ast::ext::*;
 use luajit_ripper::ast::nodes::Node;
-use luajit_ripper::ast::traverse;
 use luajit_ripper::bytecode::Chunk;
-use support::NodeRef;
+use support::ArenaNode;
 
 /// Builds the AST of a chunk and unwraps every function in it.
 fn build_and_unwarp(
     chunk: &'static Chunk<'static>,
-) -> Result<NodeRef<'static>, luajit_ripper::Error> {
+) -> Result<ArenaNode<'static>, luajit_ripper::Error> {
     let root = support::prepare(chunk)?;
     luajit_ripper::ast::unwarper::unwarp_chunk(
         support::arena(),
@@ -26,21 +26,14 @@ fn build_and_unwarp(
 }
 
 /// The kinds of all nodes in the tree.
-fn kinds(root: NodeRef<'_>) -> Vec<&'static str> {
-    traverse::walk(root)
-        .iter()
-        .map(|node| node.borrow().kind())
-        .collect()
+fn kinds(root: ArenaNode<'_>) -> Vec<&'static str> {
+    root.iter_nodes().map(|node| node.borrow().kind()).collect()
 }
 
 /// How many `return` statements without values the tree contains.
-fn empty_returns(root: NodeRef<'_>) -> usize {
-    traverse::walk(root)
-        .iter()
-        .filter(|node| {
-            matches!(&*node.borrow(), Node::Return(inner)
-                if traverse::list_contents(inner.returns).is_empty())
-        })
+fn empty_returns(root: ArenaNode<'_>) -> usize {
+    root.iter_nodes()
+        .filter(|node| node.is_return_and(|inner| inner.returns.list_contents().is_empty()))
         .count()
 }
 
@@ -307,12 +300,11 @@ fn iterator_for_loop_is_rebuilt() {
     // statement before it.
     let mut loops = 0;
     let mut controls_are_a_call = false;
-    for node in traverse::walk(root) {
+    for node in root.iter_nodes() {
         if let Node::IteratorFor(inner) = &*node.borrow() {
             loops += 1;
-            let expressions = traverse::list_contents(inner.expressions);
-            controls_are_a_call = expressions.len() == 1
-                && matches!(&*expressions[0].borrow(), Node::FunctionCall(_));
+            let expressions = inner.expressions.list_contents();
+            controls_are_a_call = expressions.len() == 1 && expressions[0].is_function_call();
         }
     }
     assert_eq!(loops, 1, "{dumped}");

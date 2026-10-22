@@ -15,8 +15,8 @@ use std::collections::HashSet;
 
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
+use super::super::ext::*;
 use super::super::nodes::*;
-use super::super::traverse;
 use super::expressions::{compile_expression, invert};
 use super::*;
 use crate::error::{Error, Result};
@@ -26,9 +26,9 @@ use crate::error::{Error, Result};
 /// Rebuilds the `if` statements of one block list.
 pub fn unwarp_ifs<'a>(
     alloc: &'a Allocator,
-    blocks: Vec<NodeRef<'a>>,
+    blocks: Vec<ArenaNode<'a>>,
     recovery: Recovery,
-) -> Result<Vec<NodeRef<'a>>> {
+) -> Result<Vec<ArenaNode<'a>>> {
     unwarp_if_region(alloc, blocks, None, None, recovery)
 }
 
@@ -39,11 +39,11 @@ pub fn unwarp_ifs<'a>(
 /// that leave through either are what tells an `if` from a body.
 fn unwarp_if_region<'a>(
     alloc: &'a Allocator,
-    blocks: Vec<NodeRef<'a>>,
-    _top_end: Option<NodeRef<'a>>,
-    topmost_end: Option<NodeRef<'a>>,
+    blocks: Vec<ArenaNode<'a>>,
+    _top_end: Option<ArenaNode<'a>>,
+    topmost_end: Option<ArenaNode<'a>>,
     recovery: Recovery,
-) -> Result<Vec<NodeRef<'a>>> {
+) -> Result<Vec<ArenaNode<'a>>> {
     let mut boundaries: Vec<(usize, usize)> = Vec::new();
 
     let mut start_index = 0usize;
@@ -51,14 +51,14 @@ fn unwarp_if_region<'a>(
         let start = blocks[start_index];
         let mut abort_loop = false;
 
-        if let Some(warp) = traverse::block_warp(start) {
+        if let Some(warp) = start.block_warp() {
             let borrowed = warp.borrow();
-            if is_flow(&borrowed) {
+            if borrowed.is_flow() {
                 start_index += 1;
                 continue;
             }
 
-            if is_jump(&borrowed) {
+            if borrowed.is_jump() {
                 // A jump opening with `slot = false` followed by a block that
                 // only assigns `true` is a leftover from an expression in an
                 // assignment, not a real branch.
@@ -75,17 +75,17 @@ fn unwarp_if_region<'a>(
 
         let is_end = body
             .last()
-            .and_then(|block| traverse::block_warp(block))
-            .is_some_and(|warp| matches!(&*warp.borrow(), Node::EndWarp(_)));
+            .and_then(|block| block.block_warp())
+            .is_end_warp();
 
         // An empty `else` branch is not written.
         if is_end
             && body.len() == 1
-            && traverse::block_contents(body[0]).is_empty()
-            && same_optional(
-                traverse::block_warp(start).and_then(|warp| get_target(&warp.borrow(), true)),
-                traverse::block_warp(body[0]).and_then(|warp| get_target(&warp.borrow(), true)),
-            )
+            && body[0].block_contents().is_empty()
+            && start
+                .block_warp()
+                .target(true)
+                .same_optional_as(body[0].block_warp().target(true))
         {
             abort_loop = true;
         }
@@ -96,15 +96,15 @@ fn unwarp_if_region<'a>(
             if std::env::var("LJR_DEBUG_IF").is_ok() {
                 eprintln!(
                     "--- if start {} end {}",
-                    block_index(start),
-                    block_index(end)
+                    start.block_index(),
+                    end.block_index()
                 );
                 for block in &blocks {
-                    eprintln!("{}", debug_block(block));
+                    eprintln!("{}", block.debug_trace_line());
                 }
                 let mut out = String::new();
                 for block in &blocks {
-                    out.push_str(&super::super::dump::dump(block));
+                    out.push_str(&super::super::dump::dump(*block));
                 }
                 eprintln!("{out}");
             }
@@ -116,13 +116,13 @@ fn unwarp_if_region<'a>(
             if recovery == Recovery::Off {
                 return Err(error);
             }
-            mark_error(start);
+            start.mark_error();
         }
 
         if is_end {
-            set_end(alloc, start, false);
+            start.borrow_mut().block_set_end(alloc, false);
         } else {
-            set_flow_to(alloc, start, end);
+            start.borrow_mut().block_set_flow_to(alloc, end);
         }
 
         boundaries.push((start_index, end_index.saturating_sub(1)));
@@ -134,28 +134,32 @@ fn unwarp_if_region<'a>(
 
 // MARK: debug trace
 
-/// One line describing a block, its warp and where the warp goes, for the
-/// `LJR_DEBUG_IF` trace.
-fn debug_block<'a>(block: NodeRef<'a>) -> String {
-    let index = block_index(block);
-    let range = traverse::block_range(block).unwrap_or((0, 0));
-    let contents = traverse::block_contents(block).len();
-    let detail = traverse::block_warp(block)
-        .map(|warp| {
-            let borrowed = warp.borrow();
-            let targets = traverse::block_targets(&borrowed)
-                .iter()
-                .map(|target| block_index(target).to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{} -> {targets}", borrowed.kind())
-        })
-        .unwrap_or_else(|| "none".to_string());
+impl<'a> ArenaNode<'a> {
+    /// One line describing this block, its warp and where the warp goes, for
+    /// the `LJR_DEBUG_IF` trace.
+    fn debug_trace_line(self) -> String {
+        let index = self.block_index();
+        let range = self.block_range().unwrap_or((0, 0));
+        let contents = self.block_contents().len();
+        let detail = self
+            .block_warp()
+            .map(|warp| {
+                let borrowed = warp.borrow();
+                let targets = borrowed
+                    .block_targets()
+                    .iter()
+                    .map(|target| (*target).block_index().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{} -> {targets}", borrowed.kind())
+            })
+            .unwrap_or_else(|| "none".to_string());
 
-    format!(
-        "  block {index} [{}..{}] {contents} stmt {detail}",
-        range.0, range.1
-    )
+        format!(
+            "  block {index} [{}..{}] {contents} stmt {detail}",
+            range.0, range.1
+        )
+    }
 }
 
 // MARK: unreachable branches
@@ -163,79 +167,72 @@ fn debug_block<'a>(block: NodeRef<'a>) -> String {
 /// Whether the block assigns `false` and is followed by a block that assigns
 /// `true` and is reached from nowhere else.
 fn unreachable_true_assignment<'a>(
-    start: NodeRef<'a>,
-    blocks: &[NodeRef<'a>],
+    start: ArenaNode<'a>,
+    blocks: &[ArenaNode<'a>],
     start_index: usize,
 ) -> bool {
-    let contents = traverse::block_contents(start);
+    let contents = start.block_contents();
     if contents.len() != 1 {
         return false;
     }
     let Node::Assignment(assignment) = &*contents[0].borrow() else {
         return false;
     };
-    let destinations = traverse::list_contents(assignment.destinations);
-    let expressions = traverse::list_contents(assignment.expressions);
+    let destinations = assignment.destinations.list_contents();
+    let expressions = assignment.expressions.list_contents();
     if destinations.len() != 1 {
         return false;
     }
     if start_index + 1 >= blocks.len() {
         return false;
     }
-    let is_false = expressions.first().is_some_and(|expression| {
-        matches!(&*expression.borrow(), Node::Primitive(primitive)
-            if primitive.kind == PrimitiveKind::False)
-    });
-    if !is_false {
+    if !expressions.first().is_primitive_false() {
         return false;
     }
 
     let next_block = blocks[start_index + 1];
-    if warpins(next_block) != 0 {
+    if next_block.block_warpins() != 0 {
         return false;
     }
-    let contents = traverse::block_contents(next_block);
+    let contents = next_block.block_contents();
     if contents.len() != 1 {
         return false;
     }
 
-    contents[0].borrow().kind().eq("assignment")
-        && matches!(&*contents[0].borrow(), Node::Assignment(inner)
-            if traverse::list_contents(inner.expressions)
-                .first()
-                .is_some_and(|expression| matches!(&*expression.borrow(), Node::Primitive(primitive)
-                    if primitive.kind == PrimitiveKind::True)))
+    contents[0].is_assignment_and(|inner| inner.expressions.list_first().is_primitive_true())
 }
 
 // MARK: statement construction
 
 fn unwarp_if_statement<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    body: &[NodeRef<'a>],
-    end: NodeRef<'a>,
-    topmost_end: NodeRef<'a>,
+    start: ArenaNode<'a>,
+    body: &[ArenaNode<'a>],
+    end: ArenaNode<'a>,
+    topmost_end: ArenaNode<'a>,
     recovery: Recovery,
 ) -> Result<()> {
     let (expression, body, false_target) =
         extract_if_expression(alloc, start, body, end, topmost_end)?;
-    let if_node = Node::emplace(
+    let if_node = ArenaNode::new(
         alloc,
         Node::If(ArenaBox::new_in(
             If {
                 expression,
-                then_block: Node::emplace_statements(alloc, []),
+                then_block: ArenaNode::new_statements(alloc, []),
                 elseifs: ArenaVec::from_iter_in([], &alloc),
-                else_block: Node::emplace_statements(alloc, []),
+                else_block: ArenaNode::new_statements(alloc, []),
                 meta: Meta::default(),
             },
             &alloc,
         )),
     );
 
-    if !traverse::same_node(false_target, end) && !traverse::same_node(false_target, topmost_end) {
+    if !false_target.same_as(end) && !false_target.same_as(topmost_end) {
         // There is an `else` branch.
-        let else_start_index = traverse::position(&body, false_target)
+        let else_start_index = body
+            .iter()
+            .position(|item| *item == false_target)
             .ok_or_else(|| internal("an else branch is not in the body"))?;
 
         let then_body = body[..else_start_index].to_vec();
@@ -243,18 +240,20 @@ fn unwarp_if_statement<'a>(
 
         let then_warp_out = then_body
             .last()
-            .and_then(|block| traverse::block_warp(block))
+            .and_then(|block| block.block_warp())
             .ok_or_else(|| internal("an if body without a warp"))?;
-        if !is_jump(&then_warp_out.borrow()) {
+        if !then_warp_out.is_jump() {
             return Err(internal("the then branch does not leave the if"));
         }
 
         let else_warp_out = else_body
             .last()
-            .and_then(|block| traverse::block_warp(block))
+            .and_then(|block| block.block_warp())
             .ok_or_else(|| internal("an if body without a warp"))?;
 
-        set_end(alloc, then_body.last().expect("checked above"), false);
+        (*then_body.last().expect("checked above"))
+            .borrow_mut()
+            .block_set_end(alloc, false);
         let then_blocks = unwarp_if_region(
             alloc,
             then_body.clone(),
@@ -263,7 +262,9 @@ fn unwarp_if_statement<'a>(
             recovery,
         )?;
 
-        set_end(alloc, else_body.last().expect("checked above"), false);
+        (*else_body.last().expect("checked above"))
+            .borrow_mut()
+            .block_set_end(alloc, false);
         let else_blocks = unwarp_if_region(
             alloc,
             else_body.clone(),
@@ -275,22 +276,15 @@ fn unwarp_if_statement<'a>(
         // An empty `then` with a full `else` is written with the condition
         // inverted, unless the `else` is itself an `elseif` chain.
         let then_is_empty = then_blocks.len() == 1
-            && traverse::block_contents(then_blocks[0]).len() == 1
-            && matches!(
-                &*traverse::block_contents(then_blocks[0])[0].borrow(),
-                Node::NoOp(_)
-            );
-        let targets_match = same_optional(
-            get_target(&then_warp_out.borrow(), true),
-            get_target(&else_warp_out.borrow(), true),
-        );
+            && then_blocks[0].block_contents().len() == 1
+            && then_blocks[0].block_contents()[0].is_no_op();
+        let targets_match = then_warp_out
+            .target(true)
+            .same_optional_as(else_warp_out.target(true));
 
         let invert_branches = targets_match
             && then_is_empty
-            && (else_blocks.len() != 1
-                || !traverse::block_contents(else_blocks[0])
-                    .last()
-                    .is_some_and(|last| matches!(&*last.borrow(), Node::If(_))));
+            && (else_blocks.len() != 1 || !else_blocks[0].block_last().is_if());
 
         let expression = match &*if_node.borrow() {
             Node::If(inner) => inner.expression,
@@ -304,24 +298,23 @@ fn unwarp_if_statement<'a>(
 
         if let Node::If(inner) = &mut *if_node.borrow_mut() {
             inner.expression = expression;
-            inner.then_block = Node::emplace_statements(alloc, then_blocks);
-            inner.else_block = Node::emplace_statements(alloc, else_blocks);
+            inner.then_block = ArenaNode::new_statements(alloc, then_blocks);
+            inner.else_block = ArenaNode::new_statements(alloc, else_blocks);
         }
     } else {
         let warp_out = body
             .last()
-            .and_then(|block| traverse::block_warp(block))
+            .and_then(|block| block.block_warp())
             .ok_or_else(|| internal("an if body without a warp"))?;
         // The body leaves the branch one way or another; an unconditional
         // warp that jumps somewhere else was checked when the region was cut.
-        if !matches!(
-            &*warp_out.borrow(),
-            Node::EndWarp(_) | Node::UnconditionalWarp(_)
-        ) {
+        if !warp_out.is_end_warp() && !warp_out.is_unconditional_warp() {
             return Err(internal("the if body does not leave the branch"));
         }
 
-        set_end(alloc, body.last().expect("checked above"), false);
+        (*body.last().expect("checked above"))
+            .borrow_mut()
+            .block_set_end(alloc, false);
         let then_blocks = unwarp_if_region(
             alloc,
             body.to_vec(),
@@ -331,13 +324,13 @@ fn unwarp_if_statement<'a>(
         )?;
 
         if let Node::If(inner) = &mut *if_node.borrow_mut() {
-            inner.then_block = Node::emplace_statements(alloc, then_blocks);
+            inner.then_block = ArenaNode::new_statements(alloc, then_blocks);
         }
     }
 
-    let mut contents = traverse::block_contents(start);
+    let mut contents = start.block_contents();
     contents.push(if_node);
-    traverse::set_block_contents(alloc, start, contents);
+    start.borrow_mut().block_set_contents(alloc, contents);
     Ok(())
 }
 
@@ -346,17 +339,17 @@ fn unwarp_if_statement<'a>(
 /// Splits the region into the part that holds the condition and the body.
 fn extract_if_expression<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    body: &[NodeRef<'a>],
-    end: NodeRef<'a>,
-    topmost_end: NodeRef<'a>,
-) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>, NodeRef<'a>)> {
+    start: ArenaNode<'a>,
+    body: &[ArenaNode<'a>],
+    end: ArenaNode<'a>,
+    topmost_end: ArenaNode<'a>,
+) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>, ArenaNode<'a>)> {
     // Everything before the first block with contents belongs to the
     // condition. A body with no contents at all leaves the last block to be
     // the body, which is what ljd does.
     let mut split = body.len().saturating_sub(1);
     for (index, block) in body.iter().enumerate() {
-        if !traverse::block_contents(block).is_empty() {
+        if !block.block_contents().is_empty() {
             split = index;
             break;
         }
@@ -375,23 +368,23 @@ fn extract_if_expression<'a>(
     let mut falses: HashSet<usize> = HashSet::new();
     for index in 0..body.len().saturating_sub(1) {
         let block = body[index];
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
         let borrowed = warp.borrow();
-        if !is_jump(&borrowed) {
+        if !borrowed.is_jump() {
             continue;
         }
-        let Some(target) = get_target(&borrowed, false) else {
+        let Some(target) = borrowed.target(false) else {
             continue;
         };
-        if !traverse::same_node(target, end) && !traverse::same_node(target, topmost_end) {
+        if !target.same_as(end) && !target.same_as(topmost_end) {
             continue;
         }
-        falses.insert(node_key(body[index + 1]));
+        falses.insert(body[index + 1].key());
     }
-    falses.insert(node_key(end));
-    falses.insert(node_key(topmost_end));
+    falses.insert(end.key());
+    falses.insert(topmost_end.key());
 
     let (false_target, expression_end) = search_expression_end(&expression, &falses)?;
 
@@ -418,20 +411,20 @@ fn extract_if_expression<'a>(
 /// Finds where the condition ends: the first block that leaves through a way
 /// out of the region.
 fn search_expression_end<'a>(
-    expression: &[NodeRef<'a>],
+    expression: &[ArenaNode<'a>],
     falses: &HashSet<usize>,
-) -> Result<(NodeRef<'a>, usize)> {
+) -> Result<(ArenaNode<'a>, usize)> {
     let mut expression_end = None;
-    let mut false_target: Option<NodeRef<'a>> = None;
+    let mut false_target: Option<ArenaNode<'a>> = None;
 
     for (index, block) in expression.iter().enumerate() {
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
-        let Some(target) = get_target(&warp.borrow(), true) else {
+        let Some(target) = warp.target(true) else {
             continue;
         };
-        if !falses.contains(&node_key(target)) {
+        if !falses.contains(&target.key()) {
             continue;
         }
 
@@ -440,7 +433,7 @@ fn search_expression_end<'a>(
                 false_target = Some(target);
                 expression_end = Some(index + 1);
             }
-            Some(current) if traverse::same_node(current, target) => {
+            Some(current) if current.same_as(target) => {
                 expression_end = Some(index + 1);
             }
             Some(_) => break,
@@ -455,10 +448,10 @@ fn search_expression_end<'a>(
 
 /// Drops the blocks that became part of an `if`.
 fn remove_processed_blocks<'a>(
-    blocks: &[NodeRef<'a>],
+    blocks: &[ArenaNode<'a>],
     boundaries: &[(usize, usize)],
-) -> Vec<NodeRef<'a>> {
-    let mut remains: Vec<NodeRef<'a>> = Vec::new();
+) -> Vec<ArenaNode<'a>> {
+    let mut remains: Vec<ArenaNode<'a>> = Vec::new();
     let mut last_end_index: i64 = -1;
 
     for (start, end) in boundaries {

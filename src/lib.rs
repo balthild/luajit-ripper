@@ -38,10 +38,11 @@
 //! Both are inherited from the original decompiler; they are not specific to
 //! one version of the bytecode.
 
-pub mod bytecode;
 mod error;
-pub mod listing;
 pub mod path;
+
+pub mod bytecode;
+pub mod listing;
 
 #[doc(hidden)]
 pub mod ast;
@@ -52,9 +53,8 @@ pub mod lua;
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::ast::nodes::{
-    Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node, NodeRef,
+    ArenaNode, Constant, ConstantValue, FunctionCall, Identifier, IdentifierKind, Meta, Node,
 };
-use crate::ast::traverse;
 use crate::ast::unwarper::Recovery;
 pub use crate::error::{Error, Result};
 pub use crate::lua::writer::{BitOpStyle, Indent};
@@ -123,7 +123,7 @@ pub fn decompile(data: &[u8], options: &Options) -> Result<String> {
 /// The AST has to live in `alloc`, because the passes allocate new nodes in it.
 pub fn decompile_ast<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     options: &Options,
 ) -> Result<String> {
     ast::mutator::pre_pass(alloc, root);
@@ -163,10 +163,10 @@ pub fn decompile_ast<'a>(
 ///
 /// Each function is done on its own, so that a function that cannot be
 /// decompiled does not take the rest of the chunk down with it.
-fn unwarp_chunk<'a>(alloc: &'a Allocator, root: NodeRef<'a>, options: &Options) -> Result<()> {
+fn unwarp_chunk<'a>(alloc: &'a Allocator, root: ArenaNode<'a>, options: &Options) -> Result<()> {
     // The nested functions come first, so that a function is finished before
     // the one that contains it is looked at.
-    let mut functions = traverse::functions(root);
+    let mut functions = root.functions();
     functions.reverse();
 
     // Recovering is asked for when the caller wants the chunk to come out
@@ -193,8 +193,8 @@ fn unwarp_chunk<'a>(alloc: &'a Allocator, root: NodeRef<'a>, options: &Options) 
 }
 
 /// Replaces the body of a function with a call that reports the failure.
-fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
-    let error_name = Node::emplace(
+fn mark_function_failed<'a>(alloc: &'a Allocator, function: ArenaNode<'a>) {
+    let error_name = ArenaNode::new(
         alloc,
         Node::Identifier(ArenaBox::new_in(
             Identifier {
@@ -210,7 +210,7 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
         )),
     );
 
-    let message = Node::emplace(
+    let message = ArenaNode::new(
         alloc,
         Node::Constant(ArenaBox::new_in(
             Constant {
@@ -221,12 +221,12 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
         )),
     );
 
-    let call = Node::emplace(
+    let call = ArenaNode::new(
         alloc,
         Node::FunctionCall(ArenaBox::new_in(
             FunctionCall {
                 function: error_name,
-                arguments: Node::emplace_statements(alloc, [message]),
+                arguments: ArenaNode::new_statements(alloc, [message]),
                 is_method: false,
                 meta: Meta::default(),
             },
@@ -238,9 +238,12 @@ fn mark_function_failed<'a>(alloc: &'a Allocator, function: NodeRef<'a>) {
     // so nothing that reads the source can tell it apart from a function that
     // was decompiled. `has_recovery` is what tells a caller the chunk it just
     // got back is only partly decompiled.
-    crate::ast::nodes::mark_failure(function);
+    function.mark_failure();
 
     if let Node::FunctionDefinition(inner) = &mut *function.borrow_mut() {
-        crate::ast::nodes::set_list_contents(alloc, inner.statements, [call]);
+        inner
+            .statements
+            .borrow_mut()
+            .list_set_contents(alloc, [call]);
     }
 }

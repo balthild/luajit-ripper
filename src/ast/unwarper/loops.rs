@@ -11,8 +11,8 @@ use std::collections::HashSet;
 
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
+use super::super::ext::*;
 use super::super::nodes::*;
-use super::super::traverse;
 use super::expressions::compile_expression;
 use super::*;
 use crate::error::{Error, Result};
@@ -27,9 +27,9 @@ const BREAK_ONE_USE: u8 = 1;
 /// Ends the loops of one block list.
 pub fn fix_loops<'a>(
     alloc: &'a Allocator,
-    blocks: Vec<NodeRef<'a>>,
+    blocks: Vec<ArenaNode<'a>>,
     repeat_until: bool,
-) -> Result<Vec<NodeRef<'a>>> {
+) -> Result<Vec<ArenaNode<'a>>> {
     let mut blocks = blocks;
     let loops = find_all_loops(&blocks, repeat_until)?;
     if loops.is_empty() {
@@ -37,15 +37,16 @@ pub fn fix_loops<'a>(
     }
 
     let fixed = cleanup_breaks_and_if_ends(alloc, &loops, &mut blocks)?;
-    let mut replacements: Vec<(NodeRef<'a>, NodeRef<'a>)> = Vec::new();
-    let lookup = |replacements: &[(NodeRef<'a>, NodeRef<'a>)], node: NodeRef<'a>| -> NodeRef<'a> {
-        for (from, to) in replacements {
-            if traverse::same_node(from, node) {
-                return *to;
+    let mut replacements: Vec<(ArenaNode<'a>, ArenaNode<'a>)> = Vec::new();
+    let lookup =
+        |replacements: &[(ArenaNode<'a>, ArenaNode<'a>)], node: ArenaNode<'a>| -> ArenaNode<'a> {
+            for (from, to) in replacements {
+                if (*from).same_as(node) {
+                    return *to;
+                }
             }
-        }
-        node
-    };
+            node
+        };
 
     for (start, end) in fixed {
         let end = lookup(&replacements, end);
@@ -54,7 +55,7 @@ pub fn fix_loops<'a>(
         // The outermost block that marks the start of the body.
         let mut loop_block = None;
         for block in &blocks[start_index..end_index] {
-            if block_is_loop(block) {
+            if (*block).block_is_loop() {
                 loop_block = Some(*block);
                 break;
             }
@@ -62,9 +63,7 @@ pub fn fix_loops<'a>(
 
         // A `for ... in` loop has no marker of its own, and using the one the
         // iterator warp sits on would hide the call that produces the values.
-        if matches!(&*start.borrow(), Node::Block(inner)
-            if inner.warp.is_some_and(|warp| matches!(&*warp.borrow(), Node::IteratorWarp(_))))
-        {
+        if start.is_block_and(|inner| inner.warp.is_iterator_warp()) {
             loop_block = None;
         }
 
@@ -101,13 +100,12 @@ pub fn fix_loops<'a>(
             new_blocks.extend_from_slice(&blocks[end_index..]);
             blocks = new_blocks;
         } else {
-            let is_while = matches!(&*built.node.borrow(), Node::While(_));
-            let before = if is_while && start_index < body_start_index - 1 {
+            let before = if built.node.is_while() && start_index < body_start_index - 1 {
                 // A condition that holds statements of its own has to be
                 // unpacked before the loop can be built.
                 if blocks[start_index..body_start_index]
                     .iter()
-                    .any(|node| !traverse::block_contents(node).is_empty())
+                    .any(|node| !node.block_contents().is_empty())
                 {
                     start_index = body_start_index;
                 }
@@ -144,9 +142,9 @@ pub fn fix_loops<'a>(
 /// [`fix_loops`], and anything left here means the graph was not understood.
 pub fn unwarp_loops<'a>(
     alloc: &'a Allocator,
-    blocks: Vec<NodeRef<'a>>,
+    blocks: Vec<ArenaNode<'a>>,
     repeat_until: bool,
-) -> Result<Vec<NodeRef<'a>>> {
+) -> Result<Vec<ArenaNode<'a>>> {
     let _ = alloc;
     let loops = find_all_loops(&blocks, repeat_until)?;
     if !loops.is_empty() {
@@ -160,20 +158,20 @@ pub fn unwarp_loops<'a>(
 /// The result is a list of the block a loop jumps back to and the block the
 /// flow leaves the loop through.
 fn find_all_loops<'a>(
-    blocks: &[NodeRef<'a>],
+    blocks: &[ArenaNode<'a>],
     repeat_until: bool,
-) -> Result<Vec<(NodeRef<'a>, NodeRef<'a>)>> {
-    let mut loops: Vec<(NodeRef<'a>, NodeRef<'a>)> = Vec::new();
+) -> Result<Vec<(ArenaNode<'a>, ArenaNode<'a>)>> {
+    let mut loops: Vec<(ArenaNode<'a>, ArenaNode<'a>)> = Vec::new();
 
     // Two jumps back to the same block are the same loop: all but the last one
     // are `continue` statements the compiler put in, so the loop they describe
     // is dropped again.
-    let mut starts: Vec<(usize, (NodeRef<'a>, NodeRef<'a>))> = Vec::new();
+    let mut starts: Vec<(usize, (ArenaNode<'a>, ArenaNode<'a>))> = Vec::new();
 
     let mut i = 0usize;
     while i < blocks.len() {
         let block = blocks[i];
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             i += 1;
             continue;
         };
@@ -196,11 +194,11 @@ fn find_all_loops<'a>(
                 continue;
             }
 
-            let Some(start) = get_target(&warp.borrow(), false) else {
+            let Some(start) = warp.target(false) else {
                 return Err(internal("a jump without a target"));
             };
 
-            if block_index(start) <= block_index(block) {
+            if start.block_index() <= block.block_index() {
                 if repeat_until {
                     return Err(internal("a back edge in a repeat pass"));
                 }
@@ -211,31 +209,29 @@ fn find_all_loops<'a>(
                 let entry = (start, blocks[i + 1]);
                 let previous = starts
                     .iter()
-                    .find(|(key, _)| *key == node_key(start))
+                    .find(|(key, _)| *key == start.key())
                     .map(|(_, entry)| *entry);
                 if let Some(previous) = previous
-                    && let Some(index) = loops.iter().position(|(s, e)| {
-                        traverse::same_node(s, previous.0) && traverse::same_node(e, previous.1)
-                    })
+                    && let Some(index) = loops
+                        .iter()
+                        .position(|(s, e)| (*s).same_as(previous.0) && (*e).same_as(previous.1))
                 {
                     loops.remove(index);
                 }
 
                 loops.push(entry);
-                starts.retain(|(key, _)| *key != node_key(start));
-                starts.push((node_key(start), entry));
+                starts.retain(|(key, _)| *key != start.key());
+                starts.push((start.key(), entry));
             }
         } else if repeat_until {
-            let false_target = match &*warp.borrow() {
-                Node::ConditionalWarp(inner) => inner.false_target,
-                _ => None,
-            };
-            let Some(false_target) = false_target else {
+            // The warp is a branch here, and a branch is described by where its
+            // false side goes.
+            let Some(false_target) = warp.target(false) else {
                 i += 1;
                 continue;
             };
 
-            if block_index(false_target) > block_index(block) {
+            if false_target.block_index() > block.block_index() {
                 i += 1;
                 continue;
             }
@@ -248,24 +244,22 @@ fn find_all_loops<'a>(
             // The end of the expression is the last jump back to the loop.
             while i < blocks.len() {
                 let block = blocks[i];
-                let Some(warp) = traverse::block_warp(block) else {
+                let Some(warp) = block.block_warp() else {
                     break;
                 };
-                let borrowed = warp.borrow();
 
-                if !traverse::same_node(block, first) && !traverse::block_contents(block).is_empty()
-                {
+                if !block.same_as(first) && !block.block_contents().is_empty() {
                     break;
                 }
-                if matches!(&*borrowed, Node::EndWarp(_)) {
+                if warp.is_end_warp() {
                     break;
                 }
 
-                let Some(target) = get_target(&borrowed, false) else {
+                let Some(target) = warp.target(false) else {
                     break;
                 };
-                if block_index(target) < block_index(block) {
-                    if traverse::same_node(target, start) {
+                if target.block_index() < block.block_index() {
+                    if target.same_as(start) {
                         start = target;
                         end = block;
                         last_i = i;
@@ -291,7 +285,7 @@ fn find_all_loops<'a>(
     }
 
     // Inner loops come first, so they are built before the ones around them.
-    loops.sort_by_key(|(start, _)| block_index(start));
+    loops.sort_by_key(|(start, _)| (*start).block_index());
     loops.reverse();
     Ok(loops)
 }
@@ -302,32 +296,33 @@ fn find_all_loops<'a>(
 /// at the block that follows its body.
 fn cleanup_breaks_and_if_ends<'a>(
     alloc: &'a Allocator,
-    loops: &[(NodeRef<'a>, NodeRef<'a>)],
-    blocks: &mut Vec<NodeRef<'a>>,
-) -> Result<Vec<(NodeRef<'a>, NodeRef<'a>)>> {
+    loops: &[(ArenaNode<'a>, ArenaNode<'a>)],
+    blocks: &mut Vec<ArenaNode<'a>>,
+) -> Result<Vec<(ArenaNode<'a>, ArenaNode<'a>)>> {
     let mut outer_start_index: Option<u32> = None;
-    let mut outer_end: Option<NodeRef<'a>> = None;
+    let mut outer_end: Option<ArenaNode<'a>> = None;
     let mut current_start_index: Option<u32> = None;
-    let mut current_end: Option<NodeRef<'a>> = None;
+    let mut current_end: Option<ArenaNode<'a>> = None;
 
-    let mut fixed: Vec<(NodeRef<'a>, NodeRef<'a>)> = Vec::new();
+    let mut fixed: Vec<(ArenaNode<'a>, ArenaNode<'a>)> = Vec::new();
 
     for (start, end) in loops {
-        let start_index = block_index(start);
+        let start_index = (*start).block_index();
         let is_nested =
             Some(start_index) == outer_start_index || Some(start_index) == current_start_index;
 
         if is_nested {
-            let end_index = position(blocks, end)?;
+            let end_index = position(blocks, *end)?;
             let last_in_body = *blocks
                 .get(end_index.wrapping_sub(1))
                 .ok_or_else(|| internal("a loop body that is empty"))?;
-            let warp = traverse::block_warp(last_in_body)
+            let warp = last_in_body
+                .block_warp()
                 .ok_or_else(|| internal("a loop body without a warp"))?;
-            if !matches!(&*warp.borrow(), Node::UnconditionalWarp(_)) {
+            if !warp.is_unconditional_warp() {
                 return Err(internal("a loop does not end with a jump"));
             }
-            if !same_optional(get_target(&warp.borrow(), false), Some(*start)) {
+            if !warp.target(false).same_optional_as(Some(*start)) {
                 return Err(internal("a loop back edge does not reach its start"));
             }
 
@@ -338,7 +333,7 @@ fn cleanup_breaks_and_if_ends<'a>(
                 let replacement = *blocks
                     .get(outer_end_index.wrapping_sub(1))
                     .ok_or_else(|| internal("an outer loop without a body"))?;
-                set_target(warp, Some(replacement));
+                warp.borrow_mut().set_target(Some(replacement));
             } else {
                 let current_end =
                     current_end.ok_or_else(|| internal("a nested loop without an end"))?;
@@ -348,31 +343,33 @@ fn cleanup_breaks_and_if_ends<'a>(
                     .get(current_end_index.wrapping_sub(1))
                     .ok_or_else(|| internal("a loop without a body"))?;
 
-                if traverse::same_node(last, end) {
+                if last.same_as(*end) {
                     // The end of the loop is also the last block of the body,
                     // so a block has to be made for the jump to land on.
                     let new_block = create_next_block(alloc, last);
-                    let last_warp = traverse::block_warp(last)
+                    let last_warp = last
+                        .block_warp()
                         .ok_or_else(|| internal("a loop end without a warp"))?;
-                    traverse::set_block_warp(new_block, last_warp);
-                    set_flow_to(alloc, last, new_block);
+                    new_block.borrow_mut().block_set_warp(last_warp);
+                    last.borrow_mut().block_set_flow_to(alloc, new_block);
                     blocks.insert(current_end_index, new_block);
                     last = new_block;
                 }
 
-                if !traverse::block_contents(last).is_empty() {
+                if !last.block_contents().is_empty() {
                     return Err(internal("a loop end holds statements"));
                 }
-                let last_warp = traverse::block_warp(last)
+                let last_warp = last
+                    .block_warp()
                     .ok_or_else(|| internal("a loop end without a warp"))?;
-                if !matches!(&*last_warp.borrow(), Node::UnconditionalWarp(_)) {
+                if !last_warp.is_unconditional_warp() {
                     return Err(internal("a loop end without a jump"));
                 }
-                if !same_optional(get_target(&last_warp.borrow(), false), Some(*start)) {
+                if !last_warp.target(false).same_optional_as(Some(*start)) {
                     return Err(internal("a loop end does not jump back"));
                 }
 
-                set_target(warp, Some(last));
+                warp.borrow_mut().set_target(Some(last));
             }
         } else {
             fixed.push((*start, *end));
@@ -380,7 +377,7 @@ fn cleanup_breaks_and_if_ends<'a>(
             let nested = match (current_end, current_start_index) {
                 (Some(current_end), Some(current_start_index)) => {
                     current_start_index < start_index
-                        && block_index(current_end) >= block_index(end)
+                        && current_end.block_index() >= (*end).block_index()
                 }
                 _ => false,
             };
@@ -404,11 +401,11 @@ fn cleanup_breaks_and_if_ends<'a>(
 /// Builds the loop of a region that has no marker block of its own.
 fn handle_single_loop<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    end: NodeRef<'a>,
-    blocks: Vec<NodeRef<'a>>,
+    start: ArenaNode<'a>,
+    end: ArenaNode<'a>,
+    blocks: Vec<ArenaNode<'a>>,
     repeat_until: bool,
-) -> Result<Vec<NodeRef<'a>>> {
+) -> Result<Vec<ArenaNode<'a>>> {
     let start_index = position(&blocks, start)?;
     let end_index = position(&blocks, end)?;
 
@@ -426,7 +423,7 @@ fn handle_single_loop<'a>(
         end,
         &blocks,
         built.node,
-        block_index(start) + 1,
+        start.block_index() + 1,
     )?;
     set_statements(alloc, built.node, &built.body);
 
@@ -442,23 +439,23 @@ fn handle_single_loop<'a>(
 /// `break`s.
 fn loop_build_block<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    body: &mut Vec<NodeRef<'a>>,
-    end: NodeRef<'a>,
-    blocks: &[NodeRef<'a>],
-    loop_node: NodeRef<'a>,
+    start: ArenaNode<'a>,
+    body: &mut Vec<ArenaNode<'a>>,
+    end: ArenaNode<'a>,
+    blocks: &[ArenaNode<'a>],
+    loop_node: ArenaNode<'a>,
     index: u32,
-) -> Result<NodeRef<'a>> {
+) -> Result<ArenaNode<'a>> {
     let first = *body
         .first()
         .ok_or_else(|| internal("a loop without a body"))?;
     let last = *body
         .last()
         .ok_or_else(|| internal("a loop without a body"))?;
-    let (first_address, _) = traverse::block_range(first).unwrap_or((0, 0));
-    let (_, last_address) = traverse::block_range(last).unwrap_or((0, 0));
+    let (first_address, _) = first.block_range().unwrap_or((0, 0));
+    let (_, last_address) = last.block_range().unwrap_or((0, 0));
 
-    let block = Node::emplace(
+    let block = ArenaNode::new(
         alloc,
         Node::Block(ArenaBox::new_in(
             Block {
@@ -474,13 +471,13 @@ fn loop_build_block<'a>(
             &alloc,
         )),
     );
-    set_flow_to(alloc, block, end);
+    block.borrow_mut().block_set_flow_to(alloc, end);
 
     replace_targets(alloc, blocks, first, block, false);
 
     // The end block is left without a target: it may point outside the loop,
     // which would confuse the checks that follow.
-    set_end(alloc, last, true);
+    last.borrow_mut().block_set_end(alloc, true);
 
     unwarp_breaks(alloc, start, body, end)?;
     Ok(block)
@@ -489,54 +486,54 @@ fn loop_build_block<'a>(
 /// Rewrites the jumps that leave a loop into `break` statements.
 fn unwarp_breaks<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    blocks: &mut Vec<NodeRef<'a>>,
-    next_block: NodeRef<'a>,
+    start: ArenaNode<'a>,
+    blocks: &mut Vec<ArenaNode<'a>>,
+    next_block: ArenaNode<'a>,
 ) -> Result<()> {
     let mut blocks_set: HashSet<usize> = HashSet::new();
-    blocks_set.insert(node_key(start));
+    blocks_set.insert(start.key());
     for block in blocks.iter() {
-        blocks_set.insert(node_key(block));
+        blocks_set.insert(block.key());
     }
 
-    let ends = gather_possible_ends(next_block)?;
+    let ends = next_block.possible_ends()?;
 
     let mut breaks: HashSet<usize> = HashSet::new();
-    let mut patched: Vec<NodeRef<'a>> = Vec::new();
+    let mut patched: Vec<ArenaNode<'a>> = Vec::new();
     let length = blocks.len();
 
     for (i, block) in blocks.iter().enumerate() {
         let block = *block;
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             patched.push(block);
             continue;
         };
-        if !matches!(&*warp.borrow(), Node::UnconditionalWarp(_)) {
+        if !warp.is_unconditional_warp() {
             patched.push(block);
             continue;
         }
 
-        let Some(target) = get_target(&warp.borrow(), false) else {
+        let Some(target) = warp.target(false) else {
             return Err(internal("a jump without a target"));
         };
-        if blocks_set.contains(&node_key(target)) {
+        if blocks_set.contains(&target.key()) {
             patched.push(block);
             continue;
         }
-        if !ends.contains(&node_key(target)) {
+        if !ends.contains(&target.key()) {
             return Err(Error::Unsupported(
                 "goto statements are not supported".to_string(),
             ));
         }
 
-        let contents = traverse::block_contents(block);
-        let is_placeholder = contents.len() == 1 && matches!(&*contents[0].borrow(), Node::NoOp(_));
+        let contents = block.block_contents();
+        let is_placeholder = contents.len() == 1 && contents[0].is_no_op();
 
-        let block = if warpins(block) != 0 && !is_placeholder {
+        let block = if block.block_warpins() != 0 && !is_placeholder {
             // The block is jumped to as well, so the `break` gets a block of
             // its own and the original keeps flowing into it.
             let new_block = create_next_block(alloc, block);
-            set_flow_to(alloc, block, new_block);
+            block.borrow_mut().block_set_flow_to(alloc, new_block);
             patched.push(block);
             patched.push(new_block);
             new_block
@@ -545,24 +542,23 @@ fn unwarp_breaks<'a>(
             block
         };
 
-        let contents = traverse::block_contents(block);
-        let mut contents = if contents.len() == 1 && matches!(&*contents[0].borrow(), Node::NoOp(_))
-        {
+        let contents = block.block_contents();
+        let mut contents = if contents.len() == 1 && contents[0].is_no_op() {
             Vec::new()
         } else {
             contents
         };
-        contents.push(Node::emplace(alloc, Node::Break));
-        traverse::set_block_contents(alloc, block, contents);
+        contents.push(ArenaNode::new(alloc, Node::Break));
+        block.borrow_mut().block_set_contents(alloc, contents);
 
         if i + 1 == length {
-            set_end(alloc, block, false);
+            block.borrow_mut().block_set_end(alloc, false);
         } else {
             let next = blocks[i + 1];
-            set_flow_to(alloc, block, next);
+            block.borrow_mut().block_set_flow_to(alloc, next);
         }
 
-        breaks.insert(node_key(block));
+        breaks.insert(block.key());
     }
 
     *blocks = patched;
@@ -571,16 +567,16 @@ fn unwarp_breaks<'a>(
         return Ok(());
     }
 
-    let mut breaks_stack: Vec<(u8, NodeRef<'a>)> = Vec::new();
-    let mut warps_out: Vec<NodeRef<'a>> = Vec::new();
-    let mut pending_break: Option<NodeRef<'a>> = None;
+    let mut breaks_stack: Vec<(u8, ArenaNode<'a>)> = Vec::new();
+    let mut warps_out: Vec<ArenaNode<'a>> = Vec::new();
+    let mut pending_break: Option<ArenaNode<'a>> = None;
 
     for block in blocks.iter().rev() {
         let block = *block;
 
-        if breaks.contains(&node_key(block)) {
+        if breaks.contains(&block.key()) {
             pending_break = None;
-            let kind = if warpins(block) == 0 {
+            let kind = if block.block_warpins() == 0 {
                 BREAK_ONE_USE
             } else {
                 BREAK_INFINITE
@@ -589,29 +585,28 @@ fn unwarp_breaks<'a>(
             continue;
         }
 
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
 
         let target = {
-            let borrowed = warp.borrow();
-            if !matches!(&*borrowed, Node::ConditionalWarp(_)) {
-                if is_flow(&borrowed) {
+            if !warp.is_conditional_warp() {
+                if warp.is_flow() {
                     pending_break = None;
                 }
                 continue;
             }
 
-            let Some(target) = get_target(&borrowed, false) else {
+            let Some(target) = warp.target(false) else {
                 return Err(internal("a branch without a target"));
             };
             target
         };
 
-        if blocks_set.contains(&node_key(target)) {
+        if blocks_set.contains(&target.key()) {
             continue;
         }
-        if !ends.contains(&node_key(target)) {
+        if !ends.contains(&target.key()) {
             return Err(Error::Unsupported(
                 "goto statements are not supported".to_string(),
             ));
@@ -623,7 +618,7 @@ fn unwarp_breaks<'a>(
                 .copied()
                 .ok_or_else(|| internal("a break without a block to leave to"))?;
 
-            set_target(warp, Some(top.1));
+            warp.borrow_mut().set_target(Some(top.1));
 
             if top.0 == BREAK_ONE_USE {
                 pending_break = breaks_stack.pop().map(|entry| entry.1);
@@ -632,11 +627,11 @@ fn unwarp_breaks<'a>(
                 warps_out.push(block);
             }
         } else {
-            set_target(warp, pending_break);
+            warp.borrow_mut().set_target(pending_break);
             warps_out.push(block);
         }
 
-        if !traverse::block_contents(block).is_empty() {
+        if !block.block_contents().is_empty() {
             pending_break = None;
         }
     }
@@ -651,8 +646,8 @@ fn unwarp_breaks<'a>(
     while !warps_out.is_empty() && !breaks_stack.is_empty() {
         let block = warps_out.pop().expect("checked above");
         let (_, target) = breaks_stack.pop().expect("checked above");
-        if let Some(warp) = traverse::block_warp(block) {
-            set_target(warp, Some(target));
+        if let Some(warp) = block.block_warp() {
+            warp.borrow_mut().set_target(Some(target));
         }
     }
 
@@ -661,38 +656,40 @@ fn unwarp_breaks<'a>(
 
 // MARK: jump ends
 
-/// The blocks a jump chain can end at, starting at `block`.
-fn gather_possible_ends<'a>(block: NodeRef<'a>) -> Result<HashSet<usize>> {
-    let mut ends: HashSet<usize> = HashSet::new();
-    ends.insert(node_key(block));
+impl<'a> ArenaNode<'a> {
+    /// The blocks a jump chain can end at, starting at this block.
+    fn possible_ends(self) -> Result<HashSet<usize>> {
+        let mut ends: HashSet<usize> = HashSet::new();
+        ends.insert(self.key());
 
-    let mut block = block;
-    while let Some(warp) = traverse::block_warp(block) {
-        let target = {
-            let borrowed = warp.borrow();
-            if !is_jump(&borrowed) {
+        let mut cursor = self;
+        while let Some(warp) = cursor.block_warp() {
+            let target = {
+                let borrowed = warp.borrow();
+                if !borrowed.is_jump() {
+                    break;
+                }
+                borrowed.target(false)
+            };
+            let Some(target) = target else {
+                break;
+            };
+
+            // A cycle of jumps would never end; the set turns it into a stop.
+            if !ends.insert(target.key()) {
                 break;
             }
-            get_target(&borrowed, false)
-        };
-        let Some(target) = target else {
-            break;
-        };
-
-        // A cycle of jumps would never end; the set turns it into a stop.
-        if !ends.insert(node_key(target)) {
-            break;
+            cursor = target;
         }
-        block = target;
-    }
 
-    Ok(ends)
+        Ok(ends)
+    }
 }
 
 /// A loop that has been built, together with the body it ended up with.
 struct BuiltLoop<'a> {
-    node: NodeRef<'a>,
-    body: Vec<NodeRef<'a>>,
+    node: ArenaNode<'a>,
+    body: Vec<ArenaNode<'a>>,
 }
 
 // MARK: loop node construction
@@ -700,34 +697,31 @@ struct BuiltLoop<'a> {
 /// Builds the loop node of a region.
 fn unwarp_loop<'a>(
     alloc: &'a Allocator,
-    start: NodeRef<'a>,
-    end: NodeRef<'a>,
-    body: Vec<NodeRef<'a>>,
-    expr_body: Option<Vec<NodeRef<'a>>>,
+    start: ArenaNode<'a>,
+    end: ArenaNode<'a>,
+    body: Vec<ArenaNode<'a>>,
+    expr_body: Option<Vec<ArenaNode<'a>>>,
 ) -> Result<BuiltLoop<'a>> {
     let last = body.last().copied().unwrap_or(start);
     let expr_body = expr_body.unwrap_or_default();
 
-    let warp = traverse::block_warp(start).ok_or_else(|| internal("a loop head without a warp"))?;
-    let (is_iterator, is_numeric) = match &*warp.borrow() {
-        Node::IteratorWarp(_) => (true, false),
-        Node::NumericLoopWarp(_) => (false, true),
-        _ => (false, false),
-    };
+    let warp = start
+        .block_warp()
+        .ok_or_else(|| internal("a loop head without a warp"))?;
+    let is_iterator = warp.is_iterator_warp();
+    let is_numeric = warp.is_numeric_loop_warp();
 
-    let last_warp = traverse::block_warp(last).unwrap_or(warp);
-    let last_is_unconditional = matches!(&*last_warp.borrow(), Node::UnconditionalWarp(_));
+    let last_warp = last.block_warp().unwrap_or(warp);
+    let last_is_unconditional = last_warp.is_unconditional_warp();
 
     if is_iterator {
-        if !last_is_unconditional
-            || !same_optional(get_target(&last_warp.borrow(), false), Some(start))
-        {
+        if !last_is_unconditional || !last_warp.target(false).same_optional_as(Some(start)) {
             return Err(internal("an iterator loop does not jump back to its start"));
         }
 
         let (first_address, _) = body
             .first()
-            .and_then(|block| traverse::block_range(block))
+            .and_then(|block| block.block_range())
             .ok_or_else(|| internal("an iterator loop without a body"))?;
 
         let (identifiers, controls) = match &*warp.borrow() {
@@ -735,13 +729,13 @@ fn unwarp_loop<'a>(
             _ => unreachable!("checked above"),
         };
 
-        let node_loop = Node::emplace(
+        let node_loop = ArenaNode::new(
             alloc,
             Node::IteratorFor(ArenaBox::new_in(
                 IteratorFor {
                     identifiers,
                     expressions: controls,
-                    statements: Node::emplace_statements(alloc, body.iter().copied()),
+                    statements: ArenaNode::new_statements(alloc, body.iter().copied()),
                     meta: Meta::new(first_address, 0),
                 },
                 &alloc,
@@ -751,7 +745,7 @@ fn unwarp_loop<'a>(
         let first = *body
             .first()
             .ok_or_else(|| internal("an iterator loop without a body"))?;
-        set_flow_to(alloc, start, first);
+        start.borrow_mut().block_set_flow_to(alloc, first);
 
         return Ok(BuiltLoop {
             node: node_loop,
@@ -760,15 +754,13 @@ fn unwarp_loop<'a>(
     }
 
     if is_numeric {
-        if !last_is_unconditional
-            || !same_optional(get_target(&last_warp.borrow(), false), Some(start))
-        {
+        if !last_is_unconditional || !last_warp.target(false).same_optional_as(Some(start)) {
             return Err(internal("a numeric loop does not jump back to its start"));
         }
 
         let (first_address, _) = body
             .first()
-            .and_then(|block| traverse::block_range(block))
+            .and_then(|block| block.block_range())
             .ok_or_else(|| internal("a numeric loop without a body"))?;
 
         let (index, controls) = match &*warp.borrow() {
@@ -776,13 +768,13 @@ fn unwarp_loop<'a>(
             _ => unreachable!("checked above"),
         };
 
-        let node_loop = Node::emplace(
+        let node_loop = ArenaNode::new(
             alloc,
             Node::NumericFor(ArenaBox::new_in(
                 NumericFor {
                     variable: index,
                     expressions: controls,
-                    statements: Node::emplace_statements(alloc, body.iter().copied()),
+                    statements: ArenaNode::new_statements(alloc, body.iter().copied()),
                     meta: Meta::new(first_address, 0),
                 },
                 &alloc,
@@ -792,7 +784,7 @@ fn unwarp_loop<'a>(
         let first = *body
             .first()
             .ok_or_else(|| internal("a numeric loop without a body"))?;
-        set_flow_to(alloc, start, first);
+        start.borrow_mut().block_set_flow_to(alloc, first);
 
         return Ok(BuiltLoop {
             node: node_loop,
@@ -801,14 +793,13 @@ fn unwarp_loop<'a>(
     }
 
     if last_is_unconditional {
-        if !same_optional(get_target(&last_warp.borrow(), false), Some(start)) {
+        if !last_warp.target(false).same_optional_as(Some(start)) {
             return Err(internal("a loop does not jump back to its start"));
         }
 
         let mut body = body;
-        let is_flow_start = is_flow(&warp.borrow());
 
-        let node_loop = if is_flow_start {
+        let node_loop = if warp.is_flow() {
             // `while true` and `repeat ... until false`: the condition is
             // constant, and the `repeat` form has a block of its own to drop.
             let previous = if body.len() > 1 {
@@ -817,25 +808,23 @@ fn unwarp_loop<'a>(
                 None
             };
             let is_repeat_false = previous.is_some_and(|previous| {
-                let Some(warp) = traverse::block_warp(previous) else {
+                let Some(warp) = previous.block_warp() else {
                     return false;
                 };
-                let borrowed = warp.borrow();
-                is_jump(&borrowed)
-                    && get_target(&borrowed, false)
-                        .is_some_and(|target| traverse::same_node(target, last))
+                warp.is_jump()
+                    && warp.target(false).same_as(last)
                     && (body.len() <= 2
                         || body
                             .get(body.len() - 3)
-                            .and_then(|block| traverse::block_warp(block))
-                            .is_some_and(|warp| is_flow(&warp.borrow())))
+                            .and_then(|block| block.block_warp())
+                            .is_flow())
             });
 
             if is_repeat_false {
                 body.pop();
-                let expression = Node::emplace_primitive(alloc, PrimitiveKind::False);
-                let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
-                Node::emplace(
+                let expression = ArenaNode::new_primitive(alloc, PrimitiveKind::False);
+                let inner_statements = ArenaNode::new_statements(alloc, body.iter().copied());
+                ArenaNode::new(
                     alloc,
                     Node::RepeatUntil(ArenaBox::new_in(
                         RepeatUntil {
@@ -847,9 +836,9 @@ fn unwarp_loop<'a>(
                     )),
                 )
             } else {
-                let expression = Node::emplace_primitive(alloc, PrimitiveKind::True);
-                let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
-                Node::emplace(
+                let expression = ArenaNode::new_primitive(alloc, PrimitiveKind::True);
+                let inner_statements = ArenaNode::new_statements(alloc, body.iter().copied());
+                ArenaNode::new(
                     alloc,
                     Node::While(ArenaBox::new_in(
                         While {
@@ -866,7 +855,7 @@ fn unwarp_loop<'a>(
             // into the next one.
             let mut i = body.len().saturating_sub(1);
             for (index, block) in body.iter().enumerate() {
-                if traverse::block_warp(block).is_some_and(|warp| is_flow(&warp.borrow())) {
+                if block.block_warp().is_flow() {
                     i = index;
                     break;
                 }
@@ -885,8 +874,8 @@ fn unwarp_loop<'a>(
             let condition =
                 compile_expression(alloc, &expression, None, Some(true_block), Some(end))?;
 
-            let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
-            Node::emplace(
+            let inner_statements = ArenaNode::new_statements(alloc, body.iter().copied());
+            ArenaNode::new(
                 alloc,
                 Node::While(ArenaBox::new_in(
                     While {
@@ -905,7 +894,7 @@ fn unwarp_loop<'a>(
         let first = *body
             .first()
             .ok_or_else(|| internal("a loop without a body"))?;
-        set_flow_to(alloc, condition_end, first);
+        condition_end.borrow_mut().block_set_flow_to(alloc, first);
 
         return Ok(BuiltLoop {
             node: node_loop,
@@ -915,23 +904,22 @@ fn unwarp_loop<'a>(
 
     // `repeat ... until <condition>`: the condition ends with a branch back to
     // the start of the loop.
-    if !matches!(&*last_warp.borrow(), Node::ConditionalWarp(_)) {
+    if !last_warp.is_conditional_warp() {
         return Err(internal("a loop does not end with a jump or a branch"));
     }
-    if !same_optional(get_target(&last_warp.borrow(), false), Some(start)) {
+    if !last_warp.target(false).same_optional_as(Some(start)) {
         return Err(internal("a repeat loop does not branch back to its start"));
     }
 
     let mut i = body.len() as isize - 1;
     while i >= 0 {
         let block = body[i as usize];
-        let warp = traverse::block_warp(block).ok_or_else(|| internal("a block without a warp"))?;
+        let warp = block
+            .block_warp()
+            .ok_or_else(|| internal("a block without a warp"))?;
         let (flow, empty) = {
             let borrowed = warp.borrow();
-            (
-                is_flow(&borrowed),
-                traverse::block_contents(block).is_empty(),
-            )
+            (borrowed.is_flow(), block.block_contents().is_empty())
         };
 
         if flow {
@@ -956,21 +944,19 @@ fn unwarp_loop<'a>(
     }
 
     let first = expression[0];
-    let first_is_jump = traverse::block_warp(first).is_some_and(|warp| is_jump(&warp.borrow()));
-    if first_is_jump {
+    if first.block_warp().is_jump() {
         // The condition starts with the `break` the region was cut from.
         expression.remove(0);
 
         if let Some(last) = body.last().copied() {
-            let contents = traverse::block_contents(last);
-            let mut contents =
-                if contents.len() == 1 && matches!(&*contents[0].borrow(), Node::NoOp(_)) {
-                    Vec::new()
-                } else {
-                    contents
-                };
-            contents.push(Node::emplace(alloc, Node::Break));
-            traverse::set_block_contents(alloc, last, contents);
+            let contents = last.block_contents();
+            let mut contents = if contents.len() == 1 && contents[0].is_no_op() {
+                Vec::new()
+            } else {
+                contents
+            };
+            contents.push(ArenaNode::new(alloc, Node::Break));
+            last.borrow_mut().block_set_contents(alloc, contents);
         }
     }
 
@@ -981,14 +967,10 @@ fn unwarp_loop<'a>(
     let expression_last = *expression
         .last()
         .ok_or_else(|| internal("a repeat loop without a condition"))?;
-    let true_block = traverse::block_warp(expression_last)
-        .and_then(|warp| {
-            let borrowed = warp.borrow();
-            match &*borrowed {
-                Node::ConditionalWarp(inner) => inner.true_target,
-                _ => None,
-            }
-        })
+    let true_block = expression_last
+        .block_warp()
+        .and_then(|warp| warp.conditional_targets())
+        .and_then(|(true_target, _, _)| true_target)
         .ok_or_else(|| internal("a repeat loop condition without a true branch"))?;
 
     let condition = compile_expression(
@@ -1001,17 +983,17 @@ fn unwarp_loop<'a>(
 
     // The first block of the body is the condition of the loop, so a copy takes
     // its place at the top of the body and the original is emptied.
-    let start_range = traverse::block_range(start).unwrap_or((0, 0));
-    let copy_contents = traverse::block_contents(start);
-    let copy = Node::emplace(
+    let start_range = start.block_range().unwrap_or((0, 0));
+    let copy_contents = start.block_contents();
+    let copy = ArenaNode::new(
         alloc,
         Node::Block(ArenaBox::new_in(
             Block {
-                index: block_index(start),
+                index: start.block_index(),
                 first_address: start_range.0,
                 last_address: start_range.1,
                 last_body_address: 0,
-                warpins_count: warpins(start),
+                warpins_count: start.block_warpins(),
                 is_loop: false,
                 contents: ArenaVec::from_iter_in(copy_contents, &alloc),
                 warp: None,
@@ -1019,20 +1001,20 @@ fn unwarp_loop<'a>(
             &alloc,
         )),
     );
-    traverse::set_block_contents(alloc, start, Vec::new());
+    start.borrow_mut().block_set_contents(alloc, Vec::new());
 
     if body.len() > 1 {
         let second = body[1];
-        set_flow_to(alloc, copy, second);
+        copy.borrow_mut().block_set_flow_to(alloc, second);
     } else {
-        set_end(alloc, copy, false);
+        copy.borrow_mut().block_set_end(alloc, false);
     }
-    set_flow_to(alloc, start, copy);
+    start.borrow_mut().block_set_flow_to(alloc, copy);
     body[0] = copy;
 
-    let inner_statements = Node::emplace_statements(alloc, body.iter().copied());
+    let inner_statements = ArenaNode::new_statements(alloc, body.iter().copied());
     Ok(BuiltLoop {
-        node: Node::emplace(
+        node: ArenaNode::new(
             alloc,
             Node::RepeatUntil(ArenaBox::new_in(
                 RepeatUntil {
@@ -1055,36 +1037,34 @@ fn unwarp_loop<'a>(
 /// for anything that jumps to the start of the loop instead of its end.
 fn fix_nested_ifs<'a>(
     alloc: &'a Allocator,
-    blocks: &mut Vec<NodeRef<'a>>,
-    start: NodeRef<'a>,
+    blocks: &mut Vec<ArenaNode<'a>>,
+    start: ArenaNode<'a>,
 ) -> Result<()> {
     let last_existing = *blocks
         .last()
         .ok_or_else(|| internal("a loop without a body"))?;
     let last = create_next_block(alloc, last_existing);
 
-    let warp = traverse::block_warp(last_existing)
+    let warp = last_existing
+        .block_warp()
         .ok_or_else(|| internal("a loop body without a warp"))?;
-    if matches!(&*warp.borrow(), Node::ConditionalWarp(_)) {
-        if let Node::ConditionalWarp(inner) = &mut *warp.borrow_mut() {
-            inner.false_target = Some(last);
-        }
+    if warp.is_conditional_warp() {
+        // A branch is stored by its false target, which is the one to move.
+        warp.borrow_mut().set_target(Some(last));
     } else {
-        set_flow_to(alloc, last_existing, last);
+        last_existing.borrow_mut().block_set_flow_to(alloc, last);
     }
 
     blocks.push(last);
-    set_end(alloc, last, false);
+    last.borrow_mut().block_set_end(alloc, false);
 
     let existing = blocks[..blocks.len() - 1].to_vec();
     for block in existing {
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
-        if get_target(&warp.borrow(), false)
-            .is_some_and(|target| traverse::same_node(target, start))
-        {
-            set_target(warp, Some(last));
+        if warp.target(false).same_as(start) {
+            warp.borrow_mut().set_target(Some(last));
         }
     }
 
@@ -1092,18 +1072,18 @@ fn fix_nested_ifs<'a>(
 }
 
 /// Points the blocks that jump out of a loop condition at the end of the loop.
-fn fix_expression<'a>(blocks: &[NodeRef<'a>], start: NodeRef<'a>, end: NodeRef<'a>) {
+fn fix_expression<'a>(blocks: &[ArenaNode<'a>], start: ArenaNode<'a>, end: ArenaNode<'a>) {
     for block in blocks {
-        if !traverse::block_contents(block).is_empty() {
+        if !block.block_contents().is_empty() {
             break;
         }
 
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
-        let target = get_target(&warp.borrow(), false);
-        if target.is_some_and(|target| block_index(target) < block_index(start)) {
-            set_target(warp, Some(end));
+        let target = warp.target(false);
+        if target.is_some_and(|target| target.block_index() < start.block_index()) {
+            warp.borrow_mut().set_target(Some(end));
         }
     }
 }
@@ -1111,17 +1091,18 @@ fn fix_expression<'a>(blocks: &[NodeRef<'a>], start: NodeRef<'a>, end: NodeRef<'
 // MARK: validation
 
 /// Checks that everything a loop body branches to is inside it.
-fn validate_loop_body<'a>(body: &[NodeRef<'a>]) -> Result<()> {
+fn validate_loop_body<'a>(body: &[ArenaNode<'a>]) -> Result<()> {
     for (index, block) in body.iter().enumerate() {
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
         let borrowed = warp.borrow();
 
-        if is_flow(&borrowed) {
-            let target =
-                get_target(&borrowed, false).ok_or_else(|| internal("a flow without a target"))?;
-            if !same_optional(Some(target), body.get(index + 1).copied()) {
+        if borrowed.is_flow() {
+            let target = borrowed
+                .target(false)
+                .ok_or_else(|| internal("a flow without a target"))?;
+            if !Some(target).same_optional_as(body.get(index + 1).copied()) {
                 return Err(internal("a loop body does not flow on to the next block"));
             }
         }
@@ -1132,14 +1113,14 @@ fn validate_loop_body<'a>(body: &[NodeRef<'a>]) -> Result<()> {
                     .into_iter()
                     .flatten()
                 {
-                    if !traverse::contains(body, target) {
+                    if !body.contains(&target) {
                         return Err(internal("a branch leaves the loop body"));
                     }
                 }
             }
             Node::UnconditionalWarp(inner) => {
                 if let Some(target) = inner.target
-                    && !traverse::contains(body, target)
+                    && !body.contains(&target)
                 {
                     return Err(internal("a jump leaves the loop body"));
                 }
@@ -1152,17 +1133,18 @@ fn validate_loop_body<'a>(body: &[NodeRef<'a>]) -> Result<()> {
 }
 
 /// Checks that every warp of a finished list points inside it.
-fn validate_block_list<'a>(blocks: &[NodeRef<'a>]) -> Result<()> {
+fn validate_block_list<'a>(blocks: &[ArenaNode<'a>]) -> Result<()> {
     for (index, block) in blocks.iter().enumerate() {
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             continue;
         };
         let borrowed = warp.borrow();
 
-        if is_flow(&borrowed) {
-            let target =
-                get_target(&borrowed, false).ok_or_else(|| internal("a flow without a target"))?;
-            if !same_optional(Some(target), blocks.get(index + 1).copied()) {
+        if borrowed.is_flow() {
+            let target = borrowed
+                .target(false)
+                .ok_or_else(|| internal("a flow without a target"))?;
+            if !Some(target).same_optional_as(blocks.get(index + 1).copied()) {
                 return Err(internal("a block does not flow on to the next block"));
             }
         }
@@ -1173,14 +1155,14 @@ fn validate_block_list<'a>(blocks: &[NodeRef<'a>]) -> Result<()> {
                     .into_iter()
                     .flatten()
                 {
-                    if !traverse::contains(blocks, target) {
+                    if !blocks.contains(&target) {
                         return Err(internal("a branch leaves the statement list"));
                     }
                 }
             }
             _ => {
-                if let Some(target) = get_target(&borrowed, true)
-                    && !traverse::contains(blocks, target)
+                if let Some(target) = borrowed.target(true)
+                    && !blocks.contains(&target)
                 {
                     return Err(internal("a warp leaves the statement list"));
                 }
@@ -1194,7 +1176,7 @@ fn validate_block_list<'a>(blocks: &[NodeRef<'a>]) -> Result<()> {
 // MARK: block list helpers
 
 /// The block list of a loop node.
-fn set_statements<'a>(alloc: &'a Allocator, loop_node: NodeRef<'a>, body: &[NodeRef<'a>]) {
+fn set_statements<'a>(alloc: &'a Allocator, loop_node: ArenaNode<'a>, body: &[ArenaNode<'a>]) {
     let statements = match &*loop_node.borrow() {
         Node::While(inner) => Some(inner.statements),
         Node::RepeatUntil(inner) => Some(inner.statements),
@@ -1204,16 +1186,16 @@ fn set_statements<'a>(alloc: &'a Allocator, loop_node: NodeRef<'a>, body: &[Node
     };
 
     if let Some(statements) = statements {
-        set_list_contents(alloc, statements, body.iter().copied());
+        statements
+            .borrow_mut()
+            .list_set_contents(alloc, body.iter().copied());
     }
 }
 
-/// Whether a block is the marker the compiler left for a loop body.
-fn block_is_loop<'a>(block: NodeRef<'a>) -> bool {
-    matches!(&*block.borrow(), Node::Block(inner) if inner.is_loop)
-}
-
 /// The position of a block in a list.
-fn position<'a>(blocks: &[NodeRef<'a>], block: NodeRef<'a>) -> Result<usize> {
-    traverse::position(blocks, block).ok_or_else(|| internal("a block is not in the list"))
+fn position<'a>(blocks: &[ArenaNode<'a>], block: ArenaNode<'a>) -> Result<usize> {
+    blocks
+        .iter()
+        .position(|item| *item == block)
+        .ok_or_else(|| internal("a block is not in the list"))
 }

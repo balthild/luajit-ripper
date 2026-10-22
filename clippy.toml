@@ -1,0 +1,15 @@
+# Clippy configuration.
+
+# `ArenaNode` is the handle a pass holds to a node, and the passes key their
+# sets and maps on it. It wraps a `RefCell`, which `mutable_key_type` reads as a
+# key whose hash can change while it sits in the collection: a node's payload is
+# rewritten all the time, so the lint would fire on every set of nodes.
+#
+# Here the lint does not apply. Both `Hash` and `Eq` are the address of the node
+# in the arena, which the arena never moves and no pass can write, and the
+# payload behind the cell is never read to find the key. Treating the type as if
+# it held no interior mutability is what says exactly that, and it keeps the
+# exemption in one place instead of an `allow` that a new file could miss.
+#
+# `..` keeps clippy's own default (`bytes::Bytes`) alongside this entry.
+ignore-interior-mutability = ["..", "luajit_ripper::ast::nodes::ArenaNode"]

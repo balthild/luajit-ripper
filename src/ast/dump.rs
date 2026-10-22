@@ -5,18 +5,18 @@
 
 use std::fmt::Write;
 
+use super::ext::*;
 use super::nodes::*;
-use super::traverse;
 
 /// Renders the AST rooted at `root`.
-pub fn dump(root: NodeRef<'_>) -> String {
+pub fn dump(root: ArenaNode<'_>) -> String {
     let mut out = String::new();
     write_node(&mut out, root, 0);
     out
 }
 
 /// Renders one node, recursively, one node per line.
-pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
+pub fn write_node(out: &mut String, node: ArenaNode<'_>, depth: usize) {
     let indent = "  ".repeat(depth);
     let borrowed = node.borrow();
 
@@ -28,7 +28,7 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
         | Node::Records(items) => {
             let _ = writeln!(out, "{indent}{} [{}]", borrowed.kind(), items.len());
             for item in items {
-                write_node(out, item, depth + 1);
+                write_node(out, *item, depth + 1);
             }
         }
         Node::Identifier(inner) => {
@@ -74,10 +74,12 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
             write_node(out, inner.expression, depth + 1);
             write_node(out, inner.then_block, depth + 1);
             for branch in &inner.elseifs {
-                write_node(out, branch, depth + 1);
+                write_node(out, *branch, depth + 1);
             }
-            if !traverse::block_contents(inner.else_block).is_empty()
-                || matches!(&*inner.else_block.borrow(), Node::Statements(items) if !items.is_empty())
+            if !inner.else_block.block_contents().is_empty()
+                || inner
+                    .else_block
+                    .is_statements_and(|items| !items.is_empty())
             {
                 let _ = writeln!(out, "{indent}else");
                 write_node(out, inner.else_block, depth + 1);
@@ -156,10 +158,10 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
                 inner.is_loop
             );
             for statement in &inner.contents {
-                write_node(out, statement, depth + 1);
+                write_node(out, *statement, depth + 1);
             }
             if let Some(warp) = &inner.warp {
-                write_node(out, warp, depth + 1);
+                write_node(out, *warp, depth + 1);
             }
         }
         Node::UnconditionalWarp(inner) => {
@@ -173,7 +175,7 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
                 inner
                     .target
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner.is_uclo
             );
@@ -189,16 +191,16 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
                 inner
                     .true_target
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .false_target
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string())
             );
             if let Some(condition) = &inner.condition {
-                write_node(out, condition, depth + 1);
+                write_node(out, *condition, depth + 1);
             }
         }
         Node::IteratorWarp(inner) => {
@@ -208,12 +210,12 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
                 inner
                     .body
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .way_out
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string())
             );
             write_node(out, inner.variables, depth + 1);
@@ -226,12 +228,12 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
                 inner
                     .body
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string()),
                 inner
                     .way_out
                     .as_ref()
-                    .map(|block| describe_block(block))
+                    .map(|block| describe_block(*block))
                     .unwrap_or_else(|| "?".to_string())
             );
             write_node(out, inner.index, depth + 1);
@@ -240,7 +242,7 @@ pub fn write_node(out: &mut String, node: NodeRef<'_>, depth: usize) {
     }
 }
 
-fn describe_block(block: NodeRef<'_>) -> String {
+fn describe_block(block: ArenaNode<'_>) -> String {
     match &*block.borrow() {
         Node::Block(inner) => format!("block#{}", inner.index),
         other => other.kind().to_string(),

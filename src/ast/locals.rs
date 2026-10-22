@@ -16,66 +16,28 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxc_allocator::{Allocator, ArenaBox};
 
+use super::ext::*;
 use super::nodes::*;
-use super::traverse::{self, Visitor};
+use super::traverse::Visitor;
 use crate::bytecode::{DebugInfo, VarKind};
 
 // MARK: entry points
 
 /// Gives every register reference its source level name, where one is known.
-pub fn mark_locals<'a>(root: NodeRef<'a>, alt_mode: bool) {
-    traverse::traverse(&mut LocalsMarker::new(alt_mode), root);
+pub fn mark_locals<'a>(root: ArenaNode<'a>, alt_mode: bool) {
+    root.traverse(&mut LocalsMarker::new(alt_mode));
 }
 
 /// Turns the assignments that introduce a variable into `local` definitions.
-pub fn mark_local_definitions<'a>(alloc: &'a Allocator, root: NodeRef<'a>) {
-    traverse::traverse(&mut LocalDefinitionsMarker::new(alloc), root);
-}
-
-/// The address of `node`, falling back to the parts of it that carry one.
-///
-/// Statements know their own address, but an expression only knows the address
-/// of the statement it belongs to. ljd looks through a few node kinds to find
-/// it; the same cases are handled here.
-fn get_addr<'a>(node: NodeRef<'a>) -> Option<u32> {
-    let (addr, first, second) = {
-        let borrowed = node.borrow();
-        let (first, second) = match &*borrowed {
-            Node::Assignment(inner) => (
-                traverse::list_contents(inner.destinations).first().copied(),
-                None,
-            ),
-            Node::If(inner) => (Some(inner.expression), None),
-            Node::UnaryOperator(inner) => (Some(inner.operand), None),
-            Node::BinaryOperator(inner) => (Some(inner.left), Some(inner.right)),
-            _ => (None, None),
-        };
-        (borrowed.addr(), first, second)
-    };
-
-    if let Some(addr) = addr {
-        return Some(addr);
-    }
-
-    match first {
-        Some(first) => get_addr(first).or_else(|| second.and_then(get_addr)),
-        None => None,
-    }
-}
-
-/// The kind and slot of an identifier node.
-fn identifier_slot<'a>(node: NodeRef<'a>) -> Option<(IdentifierKind, u32)> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => Some((identifier.kind, identifier.slot)),
-        _ => None,
-    }
+pub fn mark_local_definitions<'a>(alloc: &'a Allocator, root: ArenaNode<'a>) {
+    root.traverse(&mut LocalDefinitionsMarker::new(alloc));
 }
 
 // MARK: naming registers
 
 struct LocalsState<'a> {
     /// Register references that have not been resolved to a variable yet.
-    pending_slots: BTreeMap<u32, Vec<NodeRef<'a>>>,
+    pending_slots: BTreeMap<u32, Vec<ArenaNode<'a>>>,
     debug: Option<&'a DebugInfo<'a>>,
     /// Address of the node that is currently being visited, `-1` while unknown.
     addr: i64,
@@ -154,10 +116,10 @@ impl<'a> LocalsMarker<'a> {
         self.state().pending_slots.remove(&slot);
     }
 
-    fn reset_slots(&mut self, slots: &[NodeRef<'a>]) {
+    fn reset_slots(&mut self, slots: &[ArenaNode<'a>]) {
         let slots: Vec<u32> = slots
             .iter()
-            .filter_map(|node| identifier_slot(node))
+            .filter_map(|node| node.identifier_kind_and_slot())
             .map(|(_, slot)| slot)
             .collect();
         for slot in slots {
@@ -170,16 +132,11 @@ impl<'a> LocalsMarker<'a> {
     ///
     /// Statements are visited on entry and on exit, so that both the address
     /// before and the one after it are taken into account.
-    fn process_worthy_node(&mut self, node: NodeRef<'a>) {
-        let borrowed = node.borrow();
-        let is_identifier = matches!(&*borrowed, Node::Identifier(_));
-        let addr = borrowed.addr();
-        drop(borrowed);
-
-        let Some(addr) = addr else {
+    fn process_worthy_node(&mut self, node: ArenaNode<'a>) {
+        let Some(addr) = node.borrow().addr() else {
             return;
         };
-        if is_identifier {
+        if node.is_identifier() {
             return;
         }
 
@@ -194,13 +151,13 @@ impl<'a> LocalsMarker<'a> {
 }
 
 impl<'a> Visitor<'a> for LocalsMarker<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         self.process_worthy_node(node);
 
         enum Action<'b> {
             None,
             Enter(&'b DebugInfo<'b>),
-            Leave(Vec<NodeRef<'b>>),
+            Leave(Vec<ArenaNode<'b>>),
             ResetSlot(u32),
             Queue { slot: u32 },
         }
@@ -209,12 +166,10 @@ impl<'a> Visitor<'a> for LocalsMarker<'a> {
             let borrowed = node.borrow();
             match &*borrowed {
                 Node::FunctionDefinition(inner) => Action::Enter(inner.debug),
-                Node::Variables(_) | Node::Identifiers(_) => {
-                    Action::Leave(traverse::list_contents(node))
-                }
+                Node::Variables(_) | Node::Identifiers(_) => Action::Leave(node.list_contents()),
                 Node::NumericLoopWarp(inner) => {
                     let index = inner.index;
-                    match identifier_slot(index) {
+                    match index.identifier_kind_and_slot() {
                         Some((_, slot)) => Action::ResetSlot(slot),
                         None => Action::None,
                     }
@@ -257,7 +212,7 @@ impl<'a> Visitor<'a> for LocalsMarker<'a> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         enum Action {
             None,
             Exit(i64),
@@ -277,7 +232,7 @@ impl<'a> Visitor<'a> for LocalsMarker<'a> {
                 }
                 Node::NumericFor(_) | Node::IteratorFor(_) => {
                     if self.alt_mode {
-                        match get_addr(node) {
+                        match node.find_addr() {
                             Some(addr) => Action::Process(i64::from(addr)),
                             None => Action::None,
                         }
@@ -287,7 +242,7 @@ impl<'a> Visitor<'a> for LocalsMarker<'a> {
                 }
                 Node::Assignment(inner) => {
                     if self.alt_mode {
-                        let count = traverse::list_contents(inner.destinations).len();
+                        let count = inner.destinations.list_contents().len();
                         Action::Assignment(count)
                     } else {
                         Action::None
@@ -337,7 +292,7 @@ impl DefinitionsState {
 struct LocalDefinitionsMarker<'a> {
     alloc: &'a Allocator,
     states: Vec<DefinitionsState>,
-    path: Vec<NodeRef<'a>>,
+    path: Vec<ArenaNode<'a>>,
 }
 
 impl<'a> LocalDefinitionsMarker<'a> {
@@ -359,7 +314,7 @@ impl<'a> LocalDefinitionsMarker<'a> {
     ///
     /// Returns whether the same variable was already living there, which means
     /// the assignment writes to a local instead of declaring one.
-    fn update_known_locals(&mut self, local: NodeRef<'a>, addr: u32) -> bool {
+    fn update_known_locals(&mut self, local: ArenaNode<'a>, addr: u32) -> bool {
         let (slot, end_addr) = {
             let borrowed = local.borrow();
             let Node::Identifier(identifier) = &*borrowed else {
@@ -380,8 +335,8 @@ impl<'a> LocalDefinitionsMarker<'a> {
     /// at the same time, which Lua cannot express in a single statement.
     fn split_assignment(
         &mut self,
-        statement: NodeRef<'a>,
-        destinations: &[NodeRef<'a>],
+        statement: ArenaNode<'a>,
+        destinations: &[ArenaNode<'a>],
         slot_index: usize,
     ) {
         let new_statement = {
@@ -389,9 +344,11 @@ impl<'a> LocalDefinitionsMarker<'a> {
             let Node::Assignment(inner) = &*borrowed else {
                 return;
             };
-            let new_destinations =
-                Node::emplace_variables(self.alloc, destinations[slot_index + 1..].iter().copied());
-            Node::emplace(
+            let new_destinations = ArenaNode::new_variables(
+                self.alloc,
+                destinations[slot_index + 1..].iter().copied(),
+            );
+            ArenaNode::new(
                 self.alloc,
                 Node::Assignment(ArenaBox::new_in(
                     Assignment {
@@ -406,7 +363,7 @@ impl<'a> LocalDefinitionsMarker<'a> {
         };
 
         let old_destinations =
-            Node::emplace_variables(self.alloc, destinations[..=slot_index].iter().copied());
+            ArenaNode::new_variables(self.alloc, destinations[..=slot_index].iter().copied());
         if let Node::Assignment(inner) = &mut *statement.borrow_mut() {
             inner.destinations = old_destinations;
         }
@@ -415,11 +372,11 @@ impl<'a> LocalDefinitionsMarker<'a> {
         // path points at.
         for index in (1..self.path.len()).rev() {
             let holder = self.path[index];
-            let contents = traverse::list_contents(holder);
-            if let Some(position) = traverse::position(&contents, statement) {
+            let contents = holder.list_contents();
+            if let Some(position) = contents.iter().position(|item| *item == statement) {
                 let mut contents = contents;
                 contents.insert(position + 1, new_statement);
-                set_list_contents(self.alloc, holder, contents);
+                holder.borrow_mut().list_set_contents(self.alloc, contents);
                 return;
             }
         }
@@ -429,8 +386,8 @@ impl<'a> LocalDefinitionsMarker<'a> {
     /// splits it when it mixes both cases.
     fn visit_assignment(
         &mut self,
-        node: NodeRef<'a>,
-        destinations: Vec<NodeRef<'a>>,
+        node: ArenaNode<'a>,
+        destinations: Vec<ArenaNode<'a>>,
         addr: Option<u32>,
     ) {
         let Some(first) = destinations.first().copied() else {
@@ -446,16 +403,15 @@ impl<'a> LocalDefinitionsMarker<'a> {
         }
         let addr = addr.unwrap_or(self.state().addr);
 
-        if identifier_slot(first).map(|(kind, _)| kind) != Some(IdentifierKind::Local) {
+        if first.identifier_kind() != Some(IdentifierKind::Local) {
             return;
         }
 
         let mut known_slot = self.update_known_locals(first, addr);
         let mut split_at = None;
         for (slot_index, slot) in destinations[1..].iter().enumerate() {
-            let slot_is_local =
-                identifier_slot(slot).map(|(kind, _)| kind) == Some(IdentifierKind::Local);
-            let also_known = slot_is_local && self.update_known_locals(slot, addr);
+            let slot_is_local = slot.identifier_kind() == Some(IdentifierKind::Local);
+            let also_known = slot_is_local && self.update_known_locals(*slot, addr);
 
             if !known_slot && (!slot_is_local || also_known) {
                 // The variable is unknown, so it cannot be declared together
@@ -481,12 +437,12 @@ impl<'a> LocalDefinitionsMarker<'a> {
     }
 
     /// Registers the variables a loop introduces.
-    fn register_loop_variables(&mut self, variables: Vec<NodeRef<'a>>, addr: Option<u32>) {
+    fn register_loop_variables(&mut self, variables: Vec<ArenaNode<'a>>, addr: Option<u32>) {
         let Some(addr) = addr else {
             return;
         };
         for variable in variables {
-            if identifier_slot(variable).map(|(kind, _)| kind) == Some(IdentifierKind::Local) {
+            if variable.identifier_kind() == Some(IdentifierKind::Local) {
                 self.update_known_locals(variable, addr);
             }
         }
@@ -494,12 +450,12 @@ impl<'a> LocalDefinitionsMarker<'a> {
 }
 
 impl<'a> Visitor<'a> for LocalDefinitionsMarker<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         enum Action<'b> {
             None,
-            Enter(Vec<NodeRef<'b>>),
-            Assignment(Vec<NodeRef<'b>>, Option<u32>),
-            Loop(Vec<NodeRef<'b>>, Option<u32>),
+            Enter(Vec<ArenaNode<'b>>),
+            Assignment(Vec<ArenaNode<'b>>, Option<u32>),
+            Loop(Vec<ArenaNode<'b>>, Option<u32>),
         }
 
         if let Some(addr) = node.borrow().addr() {
@@ -510,15 +466,13 @@ impl<'a> Visitor<'a> for LocalDefinitionsMarker<'a> {
         let action = {
             let borrowed = node.borrow();
             match &*borrowed {
-                Node::FunctionDefinition(inner) => {
-                    Action::Enter(traverse::list_contents(inner.arguments))
-                }
+                Node::FunctionDefinition(inner) => Action::Enter(inner.arguments.list_contents()),
                 Node::IteratorFor(inner) => {
-                    Action::Loop(traverse::list_contents(inner.identifiers), borrowed.addr())
+                    Action::Loop(inner.identifiers.list_contents(), borrowed.addr())
                 }
                 Node::NumericFor(inner) => Action::Loop(vec![inner.variable], borrowed.addr()),
                 Node::Assignment(inner) => {
-                    Action::Assignment(traverse::list_contents(inner.destinations), borrowed.addr())
+                    Action::Assignment(inner.destinations.list_contents(), borrowed.addr())
                 }
                 _ => Action::None,
             }
@@ -530,7 +484,7 @@ impl<'a> Visitor<'a> for LocalDefinitionsMarker<'a> {
                 self.states.push(DefinitionsState::new());
                 for argument in arguments {
                     // Arguments are live from the first instruction on.
-                    if identifier_slot(argument).is_some() {
+                    if argument.is_identifier() {
                         self.update_known_locals(argument, 1);
                     }
                 }
@@ -544,10 +498,10 @@ impl<'a> Visitor<'a> for LocalDefinitionsMarker<'a> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         self.path.pop();
 
-        if matches!(&*node.borrow(), Node::FunctionDefinition(_)) {
+        if node.is_function_definition() {
             self.states.pop();
         }
     }

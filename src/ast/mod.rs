@@ -10,8 +10,10 @@
 
 #![allow(dead_code)] // Parts of the node model are only used by later passes.
 
+pub mod accessors;
 pub mod builder;
 pub mod dump;
+pub mod ext;
 pub mod helpers;
 pub mod locals;
 pub mod mutator;

@@ -3,113 +3,114 @@
 //! The control flow graph is stored alongside the statements: a warp may point
 //! at a block that is *not* one of its children. Traversal therefore
 //! deliberately does not follow warp targets, exactly like ljd does; passes
-//! that need the graph use [`block_targets`] instead.
+//! that need the graph use [`block_targets`](NodeBlockExt::block_targets)
+//! instead.
+//!
+//! What reads and replaces the contents of a list or block node lives here too:
+//! the five list nodes hold their contents directly rather than in a child, and
+//! a block node does the same.
 
 use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
+use super::accessors::NodeAccessorExt;
 use super::nodes::*;
-pub use super::nodes::{list_contents, set_list_contents};
 
 // MARK: children
 
-/// The direct children of a node, in the order ljd visits them.
-///
-/// Warp targets are not included: they are part of the graph, not of the tree.
-///
-/// The result is a plain vector: it is the list of children to walk, not part
-/// of the tree, and every entry is a cheap copy of a [`NodeRef`].
-pub fn children<'a>(node: &Node<'a>) -> Vec<NodeRef<'a>> {
-    match node {
-        Node::Statements(items)
-        | Node::Expressions(items)
-        | Node::Variables(items)
-        | Node::Identifiers(items)
-        | Node::Records(items) => items.iter().copied().collect(),
-        Node::Assignment(inner) => vec![inner.expressions, inner.destinations],
-        Node::FunctionCall(inner) => vec![inner.arguments, inner.function],
-        Node::Return(inner) => vec![inner.returns],
-        Node::If(inner) => {
-            let mut out = vec![inner.expression, inner.then_block];
-            out.extend(inner.elseifs.iter().copied());
-            out.push(inner.else_block);
-            out
-        }
-        Node::ElseIf(inner) => vec![inner.expression, inner.then_block],
-        Node::While(inner) => vec![inner.expression, inner.statements],
-        Node::RepeatUntil(inner) => vec![inner.statements, inner.expression],
-        Node::NumericFor(inner) => vec![inner.variable, inner.expressions, inner.statements],
-        Node::IteratorFor(inner) => vec![inner.expressions, inner.identifiers, inner.statements],
-        Node::FunctionDefinition(inner) => vec![inner.arguments, inner.statements],
-        Node::TableElement(inner) => vec![inner.key, inner.table],
-        Node::TableConstructor(inner) => vec![inner.array, inner.records],
-        Node::BinaryOperator(inner) => vec![inner.left, inner.right],
-        Node::UnaryOperator(inner) => vec![inner.operand],
-        Node::ArrayRecord(inner) => vec![inner.value],
-        Node::TableRecord(inner) => vec![inner.key, inner.value],
-        Node::Block(inner) => {
-            let mut out: Vec<NodeRef<'a>> = inner.contents.iter().copied().collect();
-            if let Some(warp) = inner.warp {
-                out.push(warp);
+impl<'a> Node<'a> {
+    /// The direct children of a node, in the order ljd visits them.
+    ///
+    /// Warp targets are not included: they are part of the graph, not of the
+    /// tree.
+    ///
+    /// The result is a plain vector: it is the list of children to walk, not
+    /// part of the tree, and every entry is a cheap copy of an [`ArenaNode`].
+    pub fn children(&self) -> Vec<ArenaNode<'a>> {
+        match self {
+            Node::Statements(items)
+            | Node::Expressions(items)
+            | Node::Variables(items)
+            | Node::Identifiers(items)
+            | Node::Records(items) => items.iter().copied().collect(),
+            Node::Assignment(inner) => vec![inner.expressions, inner.destinations],
+            Node::FunctionCall(inner) => vec![inner.arguments, inner.function],
+            Node::Return(inner) => vec![inner.returns],
+            Node::If(inner) => {
+                let mut out = vec![inner.expression, inner.then_block];
+                out.extend(inner.elseifs.iter().copied());
+                out.push(inner.else_block);
+                out
             }
-            out
+            Node::ElseIf(inner) => vec![inner.expression, inner.then_block],
+            Node::While(inner) => vec![inner.expression, inner.statements],
+            Node::RepeatUntil(inner) => vec![inner.statements, inner.expression],
+            Node::NumericFor(inner) => vec![inner.variable, inner.expressions, inner.statements],
+            Node::IteratorFor(inner) => {
+                vec![inner.expressions, inner.identifiers, inner.statements]
+            }
+            Node::FunctionDefinition(inner) => vec![inner.arguments, inner.statements],
+            Node::TableElement(inner) => vec![inner.key, inner.table],
+            Node::TableConstructor(inner) => vec![inner.array, inner.records],
+            Node::BinaryOperator(inner) => vec![inner.left, inner.right],
+            Node::UnaryOperator(inner) => vec![inner.operand],
+            Node::ArrayRecord(inner) => vec![inner.value],
+            Node::TableRecord(inner) => vec![inner.key, inner.value],
+            Node::Block(inner) => {
+                let mut out: Vec<ArenaNode<'a>> = inner.contents.iter().copied().collect();
+                if let Some(warp) = inner.warp {
+                    out.push(warp);
+                }
+                out
+            }
+            Node::ConditionalWarp(inner) => inner.condition.iter().copied().collect(),
+            Node::IteratorWarp(inner) => vec![inner.variables, inner.controls],
+            Node::NumericLoopWarp(inner) => vec![inner.index, inner.controls],
+            Node::EndWarp(_)
+            | Node::UnconditionalWarp(_)
+            | Node::Break
+            | Node::NoOp(_)
+            | Node::Identifier(_)
+            | Node::Constant(_)
+            | Node::Primitive(_)
+            | Node::Vararg
+            | Node::MulTres => Vec::new(),
         }
-        Node::ConditionalWarp(inner) => inner.condition.iter().copied().collect(),
-        Node::IteratorWarp(inner) => vec![inner.variables, inner.controls],
-        Node::NumericLoopWarp(inner) => vec![inner.index, inner.controls],
-        Node::EndWarp(_)
-        | Node::UnconditionalWarp(_)
-        | Node::Break
-        | Node::NoOp(_)
-        | Node::Identifier(_)
-        | Node::Constant(_)
-        | Node::Primitive(_)
-        | Node::Vararg
-        | Node::MulTres => Vec::new(),
     }
 }
 
-// MARK: identity
+// MARK: iterating
 
-/// The address of a node, which is what identity means in this tree.
-///
-/// The arena never moves what it has handed out, so the address of a node is a
-/// stable name for it, just like the pointer `Rc` used to expose.
-pub fn node_key(node: NodeRef<'_>) -> usize {
-    std::ptr::from_ref(node).cast::<()>() as usize
-}
+impl<'a> ArenaNode<'a> {
+    /// Every node in this subtree, this one included, in depth first order.
+    ///
+    /// Nodes that are reachable through more than one path are reported once.
+    ///
+    /// This is lazy: nothing past the entry the caller stops at is visited, so a
+    /// question answered by the first few entries costs only those. Because the
+    /// tree is read as the iterator advances, it must not be rewritten while the
+    /// iterator is alive; a pass that rewrites during its walk uses
+    /// [`traverse`] instead.
+    pub fn iter_nodes(self) -> impl Iterator<Item = ArenaNode<'a>> {
+        let mut stack = vec![self];
+        let mut seen = HashSet::new();
 
-/// Whether two node references point at the same node.
-pub fn same_node(a: NodeRef<'_>, b: NodeRef<'_>) -> bool {
-    node_key(a) == node_key(b)
-}
-
-// MARK: walking with visitors
-
-/// Every node reachable from `root`, in depth first order.
-///
-/// Nodes that are reachable through more than one path are reported once.
-pub fn walk<'a>(root: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    walk_from(root, &mut HashSet::new())
-}
-
-/// [`walk`] with a set of nodes that are already known to have been visited.
-pub fn walk_from<'a>(root: NodeRef<'a>, seen: &mut HashSet<usize>) -> Vec<NodeRef<'a>> {
-    let mut result = Vec::new();
-    let mut stack = vec![root];
-
-    while let Some(current) = stack.pop() {
-        if !seen.insert(node_key(current)) {
-            continue;
-        }
-        result.push(current);
-        let kids = children(&current.borrow());
-        stack.extend(kids.into_iter().rev());
+        std::iter::from_fn(move || {
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current) {
+                    continue;
+                }
+                let kids = current.borrow().children();
+                stack.extend(kids.into_iter().rev());
+                return Some(current);
+            }
+            None
+        })
     }
-
-    result
 }
+
+// MARK: visiting
 
 /// A hook based tree walk, mirroring ljd's visitor protocol.
 ///
@@ -119,82 +120,83 @@ pub fn walk_from<'a>(root: NodeRef<'a>, seen: &mut HashSet<usize>) -> Vec<NodeRe
 ///
 /// The trait carries the arena lifetime, so a visitor can store the nodes it is
 /// handed instead of copying them out. The hooks take the node by value: a
-/// [`NodeRef`] is a copyable reference, so a pass that wants to keep it just
+/// [`ArenaNode`] is a copyable reference, so a pass that wants to keep it just
 /// stores it.
 pub trait Visitor<'a> {
     /// Called when `node` is entered.
     ///
     /// Returning `false` skips the node entirely: its children are not visited
     /// and [`leave`](Visitor::leave) is not called for it.
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         let _ = node;
         true
     }
 
     /// Called after all children of `node` have been visited.
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         let _ = node;
     }
 }
 
-/// Walks `root` depth first, notifying `visitor` on entry and exit.
-///
-/// A node that is reachable twice is only visited once, which mirrors the loop
-/// protection ljd puts into table constructors; the rest of the tree is a tree
-/// in practice.
-pub fn traverse<'a>(visitor: &mut impl Visitor<'a>, root: NodeRef<'a>) {
-    let mut seen = HashSet::new();
-    walk_into(visitor, root, &mut seen);
-}
-
-/// Walks a subtree of a traversal that is already running.
-///
-/// Passes that need to reorder the walk — the slot collector visits the
-/// expressions of an assignment before registering its destinations — use this
-/// to run a nested walk with the same visitor state.
-pub fn visit_subtree<'a>(visitor: &mut impl Visitor<'a>, node: NodeRef<'a>) {
-    let mut seen = HashSet::new();
-    walk_into(visitor, node, &mut seen);
-}
-
-fn walk_into<'a>(visitor: &mut impl Visitor<'a>, node: NodeRef<'a>, seen: &mut HashSet<usize>) {
-    if !seen.insert(node_key(node)) {
-        return;
-    }
-    if !visitor.visit(node) {
-        return;
+impl<'a> ArenaNode<'a> {
+    /// Walks this node depth first, notifying `visitor` on entry and exit.
+    ///
+    /// A node that is reachable twice is only visited once, which mirrors the
+    /// loop protection ljd puts into table constructors; the rest of the tree is
+    /// a tree in practice.
+    ///
+    /// This is the rewriting counterpart of
+    /// [`iter_nodes`](ArenaNode::iter_nodes): the visitor may change the tree as
+    /// it goes, which the lazy iterator cannot offer. It is named `traverse`
+    /// rather than `visit` so that it does not read like the opposite of
+    /// [`Visitor::visit`], which takes the two arguments the other way round.
+    pub fn traverse(self, visitor: &mut impl Visitor<'a>) {
+        let mut seen = HashSet::new();
+        self.traverse_into(visitor, &mut seen);
     }
 
-    // The borrow has to end before the children are walked: a visitor is
-    // allowed to change the list of the node it is looking at.
-    let children = children(&node.borrow());
-    for child in children {
-        walk_into(visitor, child, seen);
+    fn traverse_into(self, visitor: &mut impl Visitor<'a>, seen: &mut HashSet<ArenaNode<'a>>) {
+        if !seen.insert(self) {
+            return;
+        }
+        if !visitor.visit(self) {
+            return;
+        }
+
+        // The borrow has to end before the children are walked: a visitor is
+        // allowed to change the list of the node it is looking at.
+        let children = self.borrow().children();
+        for child in children {
+            child.traverse_into(visitor, seen);
+        }
+
+        visitor.leave(self);
     }
-    visitor.leave(node);
 }
 
 // MARK: copying
 
-/// Copies a node and everything below it into `alloc`.
-///
-/// ljd uses `copy.deepcopy` when it has to move a subtree into a second place;
-/// sharing the node between the two places instead would make later changes
-/// visible in both.
-pub fn deep_clone<'a>(alloc: &'a Allocator, root: NodeRef<'a>) -> NodeRef<'a> {
-    let mut copies = HashMap::new();
-    deep_clone_into(alloc, root, &mut copies)
+impl<'a> ArenaNode<'a> {
+    /// Copies this node and everything below it into `alloc`.
+    ///
+    /// ljd uses `copy.deepcopy` when it has to move a subtree into a second
+    /// place; sharing the node between the two places instead would make later
+    /// changes visible in both.
+    pub fn deep_clone(self, alloc: &'a Allocator) -> ArenaNode<'a> {
+        let mut copies = HashMap::new();
+        deep_clone_into(alloc, self, &mut copies)
+    }
 }
 
 /// Copies a list of nodes, giving two occurrences of the same node one copy.
 ///
 /// This is what keeps a copy of a graph with shared children a graph with
 /// shared children.
-pub fn deep_clone_list<'a>(
+fn deep_clone_list<'a>(
     alloc: &'a Allocator,
-    nodes: impl IntoIterator<Item = NodeRef<'a>>,
-    copies: &mut HashMap<usize, NodeRef<'a>>,
-) -> Vec<NodeRef<'a>> {
+    nodes: impl IntoIterator<Item = ArenaNode<'a>>,
+    copies: &mut HashMap<ArenaNode<'a>, ArenaNode<'a>>,
+) -> Vec<ArenaNode<'a>> {
     nodes
         .into_iter()
         .map(|node| deep_clone_into(alloc, node, copies))
@@ -203,30 +205,27 @@ pub fn deep_clone_list<'a>(
 
 fn deep_clone_into<'a>(
     alloc: &'a Allocator,
-    source: NodeRef<'a>,
-    copies: &mut HashMap<usize, NodeRef<'a>>,
-) -> NodeRef<'a> {
-    if let Some(copy) = copies.get(&node_key(source)) {
-        return copy;
+    source: ArenaNode<'a>,
+    copies: &mut HashMap<ArenaNode<'a>, ArenaNode<'a>>,
+) -> ArenaNode<'a> {
+    if let Some(copy) = copies.get(&source) {
+        return *copy;
     }
 
     let shallow = clone_shallow(alloc, &source.borrow(), copies);
-    let copy = Node::emplace(alloc, shallow);
-    copies.insert(node_key(source), copy);
+    let copy = ArenaNode::new(alloc, shallow);
+    copies.insert(source, copy);
 
     // Rewriting the children of the copy is what makes this a deep copy. Every
     // occurrence is replaced, so that a child used twice stays shared instead
     // of half of it pointing into the original graph.
-    let kids = {
-        let borrowed = copy.borrow();
-        children(&borrowed)
-    };
+    let kids = copy.borrow().children();
     for child in kids {
         let cloned = deep_clone_into(alloc, child, copies);
-        if same_node(cloned, child) {
+        if cloned.same_as(child) {
             continue;
         }
-        while replace_child(copy, child, cloned) {}
+        while copy.borrow_mut().replace_child(child, cloned) {}
     }
 
     copy
@@ -237,9 +236,9 @@ fn deep_clone_into<'a>(
 fn clone_shallow<'a>(
     alloc: &'a Allocator,
     source: &Node<'a>,
-    copies: &mut HashMap<usize, NodeRef<'a>>,
+    copies: &mut HashMap<ArenaNode<'a>, ArenaNode<'a>>,
 ) -> Node<'a> {
-    let mut list = |nodes: &ArenaVec<'a, NodeRef<'a>>| -> Vec<NodeRef<'a>> {
+    let mut list = |nodes: &ArenaVec<'a, ArenaNode<'a>>| -> Vec<ArenaNode<'a>> {
         deep_clone_list(alloc, nodes.iter().copied(), copies)
     };
 
@@ -475,162 +474,154 @@ fn clone_shallow<'a>(
 
 // MARK: lookups
 
-/// Every function definition in the tree, including the root.
-pub fn functions<'a>(root: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    walk(root)
-        .into_iter()
-        .filter(|node| matches!(&*node.borrow(), Node::FunctionDefinition(_)))
-        .collect()
-}
-
-/// Every non empty statement list in the tree.
-///
-/// ljd ignores empty lists, because passes cannot do anything useful with them.
-pub fn statement_lists<'a>(root: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    walk(root)
-        .into_iter()
-        .filter(|node| matches!(&*node.borrow(), Node::Statements(items) if !items.is_empty()))
-        .collect()
-}
-
-/// Every non empty statement list that belongs to `function` itself.
-///
-/// The lists inside a nested function definition belong to that function, so
-/// they are left out. That is what makes it possible to run a pass over one
-/// function at a time.
-pub fn own_statement_lists<'a>(function: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    let mut result = Vec::new();
-    collect_own_statement_lists(function, true, &mut result);
-    result
-}
-
-fn collect_own_statement_lists<'a>(
-    node: NodeRef<'a>,
-    is_root: bool,
-    result: &mut Vec<NodeRef<'a>>,
-) {
-    let is_function = matches!(&*node.borrow(), Node::FunctionDefinition(_));
-    if !is_root && is_function {
-        return;
+impl<'a> ArenaNode<'a> {
+    /// Every function definition in the tree, including this node if it is
+    /// one.
+    ///
+    /// The result is a snapshot, collected up front: the passes rewrite the
+    /// functions they are handed, which is only sound while the walk itself is
+    /// over.
+    pub fn functions(self) -> Vec<ArenaNode<'a>> {
+        self.iter_nodes()
+            .filter(|node| node.is_function_definition())
+            .collect()
     }
 
-    if matches!(&*node.borrow(), Node::Statements(items) if !items.is_empty()) {
-        result.push(node);
+    /// Every non empty statement list that belongs to this function itself.
+    ///
+    /// The lists inside a nested function definition belong to that function,
+    /// so they are left out. That is what makes it possible to run a pass over
+    /// one function at a time.
+    pub fn own_statement_lists(self) -> Vec<ArenaNode<'a>> {
+        let mut result = Vec::new();
+        self.collect_own_statement_lists(&mut result);
+        result
     }
 
-    for child in children(&node.borrow()) {
-        collect_own_statement_lists(child, false, result);
+    fn collect_own_statement_lists(&self, result: &mut Vec<ArenaNode<'a>>) {
+        if self.is_statements_and(|items| !items.is_empty()) {
+            result.push(*self);
+        }
+
+        for child in self.borrow().children() {
+            if !child.is_function_definition() {
+                child.collect_own_statement_lists(result);
+            }
+        }
     }
 }
 
 // MARK: replacing
 
-/// Replaces the child `old` of `parent` with `new`.
-///
-/// Returns whether `old` was found.
-pub fn replace_child<'a>(parent: NodeRef<'a>, old: NodeRef<'a>, new: NodeRef<'a>) -> bool {
-    let mut borrowed = parent.borrow_mut();
-    match &mut *borrowed {
-        Node::Statements(items)
-        | Node::Expressions(items)
-        | Node::Variables(items)
-        | Node::Identifiers(items)
-        | Node::Records(items) => replace_in_list(items, old, new),
-        Node::Assignment(inner) => {
-            replace_slot(&mut inner.expressions, old, new)
-                || replace_slot(&mut inner.destinations, old, new)
-        }
-        Node::FunctionCall(inner) => {
-            replace_slot(&mut inner.arguments, old, new)
-                || replace_slot(&mut inner.function, old, new)
-        }
-        Node::Return(inner) => replace_slot(&mut inner.returns, old, new),
-        Node::If(inner) => {
-            if replace_slot(&mut inner.expression, old, new)
-                || replace_slot(&mut inner.then_block, old, new)
-                || replace_slot(&mut inner.else_block, old, new)
-            {
-                return true;
+impl<'a> Node<'a> {
+    /// Replaces the child `old` of this node with `new`.
+    ///
+    /// Returns whether `old` was found.
+    pub fn replace_child(&mut self, old: ArenaNode<'a>, new: ArenaNode<'a>) -> bool {
+        match self {
+            Node::Statements(items)
+            | Node::Expressions(items)
+            | Node::Variables(items)
+            | Node::Identifiers(items)
+            | Node::Records(items) => replace_in_list(items, old, new),
+            Node::Assignment(inner) => {
+                replace_slot(&mut inner.expressions, old, new)
+                    || replace_slot(&mut inner.destinations, old, new)
             }
-            inner
-                .elseifs
-                .iter_mut()
-                .any(|branch| replace_child(branch, old, new))
-        }
-        Node::ElseIf(inner) => {
-            replace_slot(&mut inner.expression, old, new)
-                || replace_slot(&mut inner.then_block, old, new)
-        }
-        Node::While(inner) => {
-            replace_slot(&mut inner.expression, old, new)
-                || replace_slot(&mut inner.statements, old, new)
-        }
-        Node::RepeatUntil(inner) => {
-            replace_slot(&mut inner.expression, old, new)
-                || replace_slot(&mut inner.statements, old, new)
-        }
-        Node::NumericFor(inner) => {
-            replace_slot(&mut inner.variable, old, new)
-                || replace_slot(&mut inner.expressions, old, new)
-                || replace_slot(&mut inner.statements, old, new)
-        }
-        Node::IteratorFor(inner) => {
-            replace_slot(&mut inner.expressions, old, new)
-                || replace_slot(&mut inner.identifiers, old, new)
-                || replace_slot(&mut inner.statements, old, new)
-        }
-        Node::FunctionDefinition(inner) => {
-            replace_slot(&mut inner.arguments, old, new)
-                || replace_slot(&mut inner.statements, old, new)
-        }
-        Node::TableElement(inner) => {
-            replace_slot(&mut inner.key, old, new) || replace_slot(&mut inner.table, old, new)
-        }
-        Node::TableConstructor(inner) => {
-            replace_slot(&mut inner.array, old, new) || replace_slot(&mut inner.records, old, new)
-        }
-        Node::BinaryOperator(inner) => {
-            replace_slot(&mut inner.left, old, new) || replace_slot(&mut inner.right, old, new)
-        }
-        Node::UnaryOperator(inner) => replace_slot(&mut inner.operand, old, new),
-        Node::ArrayRecord(inner) => replace_slot(&mut inner.value, old, new),
-        Node::TableRecord(inner) => {
-            replace_slot(&mut inner.key, old, new) || replace_slot(&mut inner.value, old, new)
-        }
-        Node::Block(inner) => {
-            if replace_in_list(&mut inner.contents, old, new) {
-                return true;
+            Node::FunctionCall(inner) => {
+                replace_slot(&mut inner.arguments, old, new)
+                    || replace_slot(&mut inner.function, old, new)
             }
-            if let Some(warp) = &mut inner.warp {
-                return replace_slot(warp, old, new);
+            Node::Return(inner) => replace_slot(&mut inner.returns, old, new),
+            Node::If(inner) => {
+                if replace_slot(&mut inner.expression, old, new)
+                    || replace_slot(&mut inner.then_block, old, new)
+                    || replace_slot(&mut inner.else_block, old, new)
+                {
+                    return true;
+                }
+                inner
+                    .elseifs
+                    .iter_mut()
+                    .any(|branch| branch.borrow_mut().replace_child(old, new))
             }
-            false
+            Node::ElseIf(inner) => {
+                replace_slot(&mut inner.expression, old, new)
+                    || replace_slot(&mut inner.then_block, old, new)
+            }
+            Node::While(inner) => {
+                replace_slot(&mut inner.expression, old, new)
+                    || replace_slot(&mut inner.statements, old, new)
+            }
+            Node::RepeatUntil(inner) => {
+                replace_slot(&mut inner.expression, old, new)
+                    || replace_slot(&mut inner.statements, old, new)
+            }
+            Node::NumericFor(inner) => {
+                replace_slot(&mut inner.variable, old, new)
+                    || replace_slot(&mut inner.expressions, old, new)
+                    || replace_slot(&mut inner.statements, old, new)
+            }
+            Node::IteratorFor(inner) => {
+                replace_slot(&mut inner.expressions, old, new)
+                    || replace_slot(&mut inner.identifiers, old, new)
+                    || replace_slot(&mut inner.statements, old, new)
+            }
+            Node::FunctionDefinition(inner) => {
+                replace_slot(&mut inner.arguments, old, new)
+                    || replace_slot(&mut inner.statements, old, new)
+            }
+            Node::TableElement(inner) => {
+                replace_slot(&mut inner.key, old, new) || replace_slot(&mut inner.table, old, new)
+            }
+            Node::TableConstructor(inner) => {
+                replace_slot(&mut inner.array, old, new)
+                    || replace_slot(&mut inner.records, old, new)
+            }
+            Node::BinaryOperator(inner) => {
+                replace_slot(&mut inner.left, old, new) || replace_slot(&mut inner.right, old, new)
+            }
+            Node::UnaryOperator(inner) => replace_slot(&mut inner.operand, old, new),
+            Node::ArrayRecord(inner) => replace_slot(&mut inner.value, old, new),
+            Node::TableRecord(inner) => {
+                replace_slot(&mut inner.key, old, new) || replace_slot(&mut inner.value, old, new)
+            }
+            Node::Block(inner) => {
+                if replace_in_list(&mut inner.contents, old, new) {
+                    return true;
+                }
+                if let Some(warp) = &mut inner.warp {
+                    return replace_slot(warp, old, new);
+                }
+                false
+            }
+            Node::ConditionalWarp(inner) => match &mut inner.condition {
+                Some(condition) => replace_slot(condition, old, new),
+                None => false,
+            },
+            Node::IteratorWarp(inner) => {
+                replace_slot(&mut inner.variables, old, new)
+                    || replace_slot(&mut inner.controls, old, new)
+            }
+            Node::NumericLoopWarp(inner) => {
+                replace_slot(&mut inner.index, old, new)
+                    || replace_slot(&mut inner.controls, old, new)
+            }
+            Node::EndWarp(_)
+            | Node::UnconditionalWarp(_)
+            | Node::Break
+            | Node::NoOp(_)
+            | Node::Identifier(_)
+            | Node::Constant(_)
+            | Node::Primitive(_)
+            | Node::Vararg
+            | Node::MulTres => false,
         }
-        Node::ConditionalWarp(inner) => match &mut inner.condition {
-            Some(condition) => replace_slot(condition, old, new),
-            None => false,
-        },
-        Node::IteratorWarp(inner) => {
-            replace_slot(&mut inner.variables, old, new)
-                || replace_slot(&mut inner.controls, old, new)
-        }
-        Node::NumericLoopWarp(inner) => {
-            replace_slot(&mut inner.index, old, new) || replace_slot(&mut inner.controls, old, new)
-        }
-        Node::EndWarp(_)
-        | Node::UnconditionalWarp(_)
-        | Node::Break
-        | Node::NoOp(_)
-        | Node::Identifier(_)
-        | Node::Constant(_)
-        | Node::Primitive(_)
-        | Node::Vararg
-        | Node::MulTres => false,
     }
 }
 
-fn replace_slot<'a>(slot: &mut NodeRef<'a>, old: NodeRef<'a>, new: NodeRef<'a>) -> bool {
-    if same_node(slot, old) {
+fn replace_slot<'a>(slot: &mut ArenaNode<'a>, old: ArenaNode<'a>, new: ArenaNode<'a>) -> bool {
+    if (*slot).same_as(old) {
         *slot = new;
         true
     } else {
@@ -639,12 +630,12 @@ fn replace_slot<'a>(slot: &mut NodeRef<'a>, old: NodeRef<'a>, new: NodeRef<'a>) 
 }
 
 fn replace_in_list<'a>(
-    items: &mut ArenaVec<'a, NodeRef<'a>>,
-    old: NodeRef<'a>,
-    new: NodeRef<'a>,
+    items: &mut ArenaVec<'a, ArenaNode<'a>>,
+    old: ArenaNode<'a>,
+    new: ArenaNode<'a>,
 ) -> bool {
     for item in items.iter_mut() {
-        if same_node(item, old) {
+        if (*item).same_as(old) {
             *item = new;
             return true;
         }
@@ -654,110 +645,334 @@ fn replace_in_list<'a>(
 
 // MARK: blocks
 
-/// The targets a warp can jump to.
-pub fn block_targets<'a>(warp: &Node<'a>) -> Vec<NodeRef<'a>> {
-    match warp {
-        Node::UnconditionalWarp(inner) => inner.target.iter().copied().collect(),
-        Node::ConditionalWarp(inner) => {
-            let mut out = Vec::new();
-            if let Some(target) = inner.false_target {
-                out.push(target);
-            }
-            if let Some(target) = inner.true_target {
-                out.push(target);
-            }
-            out
+impl<'a> Node<'a> {
+    /// The contents of a block node.
+    ///
+    /// This mirrors [`Node::list`](Node::list): a block holds its contents
+    /// directly rather than in a child node.
+    pub fn block(&self) -> Option<&ArenaVec<'a, ArenaNode<'a>>> {
+        match self {
+            Node::Block(inner) => Some(&inner.contents),
+            _ => None,
         }
-        Node::IteratorWarp(inner) => {
-            let mut out = Vec::new();
-            if let Some(target) = inner.way_out {
-                out.push(target);
-            }
-            if let Some(target) = inner.body {
-                out.push(target);
-            }
-            out
+    }
+
+    /// The contents of a block node, for mutation.
+    pub fn block_mut(&mut self) -> Option<&mut ArenaVec<'a, ArenaNode<'a>>> {
+        match self {
+            Node::Block(inner) => Some(&mut inner.contents),
+            _ => None,
         }
-        Node::NumericLoopWarp(inner) => {
-            let mut out = Vec::new();
-            if let Some(target) = inner.way_out {
-                out.push(target);
-            }
-            if let Some(target) = inner.body {
-                out.push(target);
-            }
-            out
+    }
+
+    /// Points a block node at a warp.
+    pub fn block_set_warp(&mut self, warp: ArenaNode<'a>) {
+        if let Node::Block(inner) = self {
+            inner.warp = Some(warp);
         }
-        _ => Vec::new(),
+    }
+
+    /// Makes a block flow into `target`.
+    ///
+    /// The warp left behind is a fallthrough, not a jump: this is the
+    /// unwarper's way of stitching two blocks together.
+    pub fn block_set_flow_to(&mut self, alloc: &'a Allocator, target: ArenaNode<'a>) {
+        let warp = ArenaNode::new(
+            alloc,
+            Node::UnconditionalWarp(ArenaBox::new_in(
+                UnconditionalWarp {
+                    kind: UnconditionalWarpKind::Flow,
+                    target: Some(target),
+                    is_uclo: false,
+                    meta: Meta::default(),
+                },
+                &alloc,
+            )),
+        );
+        self.block_set_warp(warp);
+    }
+
+    /// Ends the region that starts at this block.
+    ///
+    /// `force_no_target` leaves the end without a target, which matters for
+    /// loops: an end that points outside the loop would confuse the checks that
+    /// follow.
+    pub fn block_set_end(&mut self, alloc: &'a Allocator, force_no_target: bool) {
+        let target = if force_no_target {
+            None
+        } else {
+            self.block_warp().and_then(|warp| warp.target(true))
+        };
+
+        let end = ArenaNode::new(
+            alloc,
+            Node::EndWarp(ArenaBox::new_in(
+                EndWarp {
+                    target,
+                    meta: Meta::default(),
+                },
+                &alloc,
+            )),
+        );
+        self.block_set_warp(end);
+    }
+
+    /// Replaces the contents of a block node.
+    ///
+    /// This is an inherent method rather than an extension method because it
+    /// writes: a value that merely holds a node hands it back behind a shared
+    /// borrow, so a caller that wants to change one has to borrow it mutably
+    /// first. A node that is not a block is left alone.
+    pub fn block_set_contents(
+        &mut self,
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) {
+        if let Some(items) = self.block_mut() {
+            *items = ArenaVec::from_iter_in(contents, &alloc);
+        }
     }
 }
 
-/// Whether a warp simply falls through into the next block.
-pub fn is_flow(warp: &Node<'_>) -> bool {
-    matches!(
-        warp,
-        Node::UnconditionalWarp(inner) if inner.kind == UnconditionalWarpKind::Flow
-    )
-}
+/// The contents of a block node, and its first and last entry, asked of
+/// anything that may hold a node.
+///
+/// The counterpart of [`Node::block`](Node::block),
+/// [`block_first`](NodeBlockExt::block_first),
+/// [`block_last`](NodeBlockExt::block_last),
+/// [`block_warp`](NodeBlockExt::block_warp) and
+/// [`block_range`](NodeBlockExt::block_range) for a
+/// value that may not hold a node at all, so that `maybe_node.block_contents()`
+/// reads the same whether `maybe_node` is a [`Node`], a [`ArenaNode`] or an
+/// `Option` of either.
+pub trait NodeBlockExt<'a>: AsNode<'a> {
+    /// The targets a warp can jump to.
+    fn block_targets(&self) -> Vec<ArenaNode<'a>> {
+        let node = self.as_node();
+        let Some(node) = node.as_deref() else {
+            return Vec::new();
+        };
 
-/// Reads the contents of a block node.
-pub fn block_contents<'a>(block: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    match &*block.borrow() {
-        Node::Block(inner) => inner.contents.iter().copied().collect(),
-        _ => Vec::new(),
+        match node {
+            Node::UnconditionalWarp(inner) => inner.target.iter().copied().collect(),
+            Node::ConditionalWarp(inner) => {
+                let mut out = Vec::new();
+                if let Some(target) = inner.false_target {
+                    out.push(target);
+                }
+                if let Some(target) = inner.true_target {
+                    out.push(target);
+                }
+                out
+            }
+            Node::IteratorWarp(inner) => {
+                let mut out = Vec::new();
+                if let Some(target) = inner.way_out {
+                    out.push(target);
+                }
+                if let Some(target) = inner.body {
+                    out.push(target);
+                }
+                out
+            }
+            Node::NumericLoopWarp(inner) => {
+                let mut out = Vec::new();
+                if let Some(target) = inner.way_out {
+                    out.push(target);
+                }
+                if let Some(target) = inner.body {
+                    out.push(target);
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The contents of a block node.
+    ///
+    /// The copy is a plain `Vec`: it is a snapshot the caller works on, not part
+    /// of the tree.
+    fn block_contents(&self) -> Vec<ArenaNode<'a>> {
+        let node = self.as_node();
+        match node.as_deref().and_then(Node::block) {
+            Some(items) => items.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The first entry of a block node.
+    ///
+    /// This is [`block_contents`](NodeBlockExt::block_contents) narrowed to its
+    /// first entry: reaching for that entry through the copy would build the
+    /// whole list first. A node that is not a block, or a block that is empty,
+    /// has no first entry.
+    fn block_first(&self) -> Option<ArenaNode<'a>> {
+        let node = self.as_node();
+        node.as_deref()?.block()?.first().copied()
+    }
+
+    /// The last entry of a block node.
+    ///
+    /// The counterpart of [`block_first`](NodeBlockExt::block_first), and the
+    /// same reason to exist.
+    fn block_last(&self) -> Option<ArenaNode<'a>> {
+        let node = self.as_node();
+        node.as_deref()?.block()?.last().copied()
+    }
+
+    /// The warp that leaves a block node.
+    fn block_warp(&self) -> Option<ArenaNode<'a>> {
+        let node = self.as_node();
+        match node.as_deref() {
+            Some(Node::Block(inner)) => inner.warp,
+            _ => None,
+        }
+    }
+
+    /// The address range of a block node.
+    fn block_range(&self) -> Option<(u32, u32)> {
+        let node = self.as_node();
+        match node.as_deref() {
+            Some(Node::Block(inner)) => Some((inner.first_address, inner.last_address)),
+            _ => None,
+        }
+    }
+
+    /// The position of a block in its list.
+    ///
+    /// A node that is not a block has no position, so the worst one is reported
+    /// rather than the first: a stray comparison must not read as "the block at
+    /// the front". Three copies of this used to disagree about the fallback,
+    /// one answering `0` and two `u32::MAX`.
+    fn block_index(&self) -> u32 {
+        let node = self.as_node();
+        match node.as_deref() {
+            Some(Node::Block(inner)) => inner.index,
+            _ => u32::MAX,
+        }
+    }
+
+    /// How many warps lead to a block.
+    fn block_warpins(&self) -> u32 {
+        let node = self.as_node();
+        match node.as_deref() {
+            Some(Node::Block(inner)) => inner.warpins_count,
+            _ => 0,
+        }
+    }
+
+    /// Whether a block is the marker the compiler left for a loop body.
+    fn block_is_loop(&self) -> bool {
+        let node = self.as_node();
+        matches!(node.as_deref(), Some(Node::Block(inner)) if inner.is_loop)
     }
 }
 
-/// Replaces the contents of a block node.
-pub fn set_block_contents<'a>(
-    alloc: &'a Allocator,
-    block: NodeRef<'a>,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) {
-    if let Node::Block(inner) = &mut *block.borrow_mut() {
-        inner.contents = ArenaVec::from_iter_in(contents, &alloc);
+impl<'a, T: AsNode<'a>> NodeBlockExt<'a> for T {}
+
+// MARK: list
+
+impl<'a> Node<'a> {
+    /// The contents of a list node.
+    pub fn list(&self) -> Option<&ArenaVec<'a, ArenaNode<'a>>> {
+        match self {
+            Node::Statements(items)
+            | Node::Expressions(items)
+            | Node::Variables(items)
+            | Node::Identifiers(items)
+            | Node::Records(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// The contents of a list node, for mutation.
+    pub fn list_mut(&mut self) -> Option<&mut ArenaVec<'a, ArenaNode<'a>>> {
+        match self {
+            Node::Statements(items)
+            | Node::Expressions(items)
+            | Node::Variables(items)
+            | Node::Identifiers(items)
+            | Node::Records(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Whether `items` contains `node`, comparing identity.
+    pub fn list_contains(&self, node: ArenaNode<'a>) -> bool {
+        self.list()
+            .is_some_and(|items| items.iter().any(|item| (*item).same_as(node)))
+    }
+
+    /// The position of `node` in `items`, comparing identity.
+    pub fn list_position(&self, node: ArenaNode<'a>) -> Option<usize> {
+        self.list()
+            .and_then(|items| items.iter().position(|item| (*item).same_as(node)))
+    }
+
+    /// Replaces the contents of a list node.
+    ///
+    /// This is an inherent method rather than an extension method because it
+    /// writes: a value that merely holds a node hands it back behind a shared
+    /// borrow, so a caller that wants to change one has to borrow it mutably
+    /// first. A node that is not a list is left alone.
+    pub fn list_set_contents(
+        &mut self,
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) {
+        if let Some(items) = self.list_mut() {
+            *items = ArenaVec::from_iter_in(contents, &alloc);
+        }
+    }
+
+    /// Appends to a list node.
+    ///
+    /// The list already knows the arena it was allocated in, so no allocator is
+    /// needed here.
+    pub fn list_push(&mut self, child: ArenaNode<'a>) {
+        if let Some(items) = self.list_mut() {
+            items.push(child);
+        }
     }
 }
 
-/// Reads the warp of a block node.
-pub fn block_warp<'a>(block: NodeRef<'a>) -> Option<NodeRef<'a>> {
-    match &*block.borrow() {
-        Node::Block(inner) => inner.warp,
-        _ => None,
+/// The contents of a list node, and its first and last entry, asked of anything
+/// that may hold a node.
+pub trait NodeListExt<'a>: AsNode<'a> {
+    /// The contents of a list node.
+    ///
+    /// The copy is a plain `Vec`: it is a snapshot the caller works on, not part
+    /// of the tree.
+    fn list_contents(&self) -> Vec<ArenaNode<'a>> {
+        let node = self.as_node();
+        match node.as_deref().and_then(Node::list) {
+            Some(items) => items.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The first entry of a list node.
+    ///
+    /// This is [`list_contents`](NodeListExt::list_contents) narrowed to its
+    /// first entry: reaching for that entry through the copy would build the
+    /// whole list first, which is wasted work for a question about one node. A
+    /// node that is not a list, or a list that is empty, has no first entry.
+    fn list_first(&self) -> Option<ArenaNode<'a>> {
+        let node = self.as_node();
+        node.as_deref()?.list()?.first().copied()
+    }
+
+    /// The last entry of a list node.
+    ///
+    /// The counterpart of [`list_first`](NodeListExt::list_first), with the same
+    /// reason for existing: the whole list has no business being built to reach
+    /// its last entry. A node that is not a list, or a list that is empty, has
+    /// no last entry.
+    fn list_last(&self) -> Option<ArenaNode<'a>> {
+        let node = self.as_node();
+        node.as_deref()?.list()?.last().copied()
     }
 }
 
-/// Replaces the warp of a block node.
-pub fn set_block_warp<'a>(block: NodeRef<'a>, warp: NodeRef<'a>) {
-    if let Node::Block(inner) = &mut *block.borrow_mut() {
-        inner.warp = Some(warp);
-    }
-}
-
-/// Reads the address range of a block node.
-pub fn block_range(block: NodeRef<'_>) -> Option<(u32, u32)> {
-    match &*block.borrow() {
-        Node::Block(inner) => Some((inner.first_address, inner.last_address)),
-        _ => None,
-    }
-}
-
-/// The block that `warp` targets when it is an unconditional jump or flow.
-pub fn jump_target<'a>(warp: &Node<'a>) -> Option<NodeRef<'a>> {
-    match warp {
-        Node::UnconditionalWarp(inner) => inner.target,
-        _ => None,
-    }
-}
-
-// MARK: list lookups
-
-/// Whether `items` contains `node`, comparing identity.
-pub fn contains<'a>(items: &[NodeRef<'a>], node: NodeRef<'a>) -> bool {
-    items.iter().any(|item| same_node(item, node))
-}
-
-/// The position of `node` in `items`, comparing identity.
-pub fn position<'a>(items: &[NodeRef<'a>], node: NodeRef<'a>) -> Option<usize> {
-    items.iter().position(|item| same_node(item, node))
-}
+impl<'a, T: AsNode<'a>> NodeListExt<'a> for T {}

@@ -7,21 +7,21 @@
 
 mod support;
 
+use luajit_ripper::ast::ext::*;
 use luajit_ripper::ast::nodes::*;
-use luajit_ripper::ast::traverse;
 use luajit_ripper::bytecode::DebugInfo;
 use luajit_ripper::lua::writer;
 use oxc_allocator::{ArenaBox, ArenaVec};
 
 /// Builds a function definition holding `contents`.
-fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
+fn function(contents: Vec<ArenaNode<'static>>) -> ArenaNode<'static> {
     let alloc = support::arena();
-    Node::emplace(
+    ArenaNode::new(
         alloc,
         Node::FunctionDefinition(ArenaBox::new_in(
             FunctionDefinition {
-                arguments: Node::emplace_identifiers(alloc, Vec::new()),
-                statements: Node::emplace_statements(alloc, contents),
+                arguments: ArenaNode::new_identifiers(alloc, Vec::new()),
+                statements: ArenaNode::new_statements(alloc, contents),
                 upvalues: ArenaVec::new_in(&alloc),
                 debug: alloc.alloc(DebugInfo::new_in(alloc)),
                 instruction_count: 0,
@@ -33,10 +33,10 @@ fn function(contents: Vec<NodeRef<'static>>) -> NodeRef<'static> {
 }
 
 /// An assignment of `value` to the local `name`.
-fn assignment(name: &str, value: i32) -> NodeRef<'static> {
+fn assignment(name: &str, value: i32) -> ArenaNode<'static> {
     let alloc = support::arena();
 
-    let destination = Node::emplace(
+    let destination = ArenaNode::new(
         alloc,
         Node::Identifier(ArenaBox::new_in(
             Identifier::new(alloc, IdentifierKind::Local, 0, Meta::default()),
@@ -47,7 +47,7 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
         inner.name = Some(alloc.alloc_str(name));
     }
 
-    let source = Node::emplace(
+    let source = ArenaNode::new(
         alloc,
         Node::Constant(ArenaBox::new_in(
             Constant {
@@ -58,12 +58,12 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
         )),
     );
 
-    Node::emplace(
+    ArenaNode::new(
         alloc,
         Node::Assignment(ArenaBox::new_in(
             Assignment {
-                expressions: Node::emplace_expressions(alloc, vec![source]),
-                destinations: Node::emplace_variables(alloc, vec![destination]),
+                expressions: ArenaNode::new_expressions(alloc, vec![source]),
+                destinations: ArenaNode::new_variables(alloc, vec![destination]),
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             },
@@ -73,7 +73,7 @@ fn assignment(name: &str, value: i32) -> NodeRef<'static> {
 }
 
 /// Renders a function definition with the default options.
-fn render(function: NodeRef<'static>) -> String {
+fn render(function: ArenaNode<'static>) -> String {
     writer::write_function(support::arena(), function, &writer::Options::default())
         .expect("renderable")
 }
@@ -83,15 +83,15 @@ fn a_marked_statement_is_pointed_out_in_the_output() {
     let statement = assignment("a", 1);
     let root = function(vec![statement]);
 
-    assert!(!has_error(statement), "nothing has been marked yet");
+    assert!(!statement.has_error(), "nothing has been marked yet");
     let clean = render(root);
     assert!(
         !clean.contains("Decompilation error"),
         "an unmarked function must not carry the comment: {clean}"
     );
 
-    mark_error(statement);
-    assert!(has_error(statement), "the mark has to stick");
+    statement.mark_error();
+    assert!(statement.has_error(), "the mark has to stick");
 
     let marked = render(root);
     assert!(
@@ -110,27 +110,24 @@ fn a_marker_survives_a_deep_clone() {
     // mark on the original has to come along, or the loss it records would be
     // reported in only one of the two places.
     let statement = assignment("a", 1);
-    mark_error(statement);
+    statement.mark_error();
 
-    let copy = traverse::deep_clone(support::arena(), statement);
-    assert!(has_error(copy), "the copy carries the mark");
-    assert!(
-        !traverse::same_node(statement, copy),
-        "the clone is a node of its own"
-    );
+    let copy = statement.deep_clone(support::arena());
+    assert!(copy.has_error(), "the copy carries the mark");
+    assert!(!statement.same_as(copy), "the clone is a node of its own");
 }
 
 #[test]
 fn marking_a_list_or_a_primitive_is_harmless() {
     // List nodes and `Primitive` have nowhere to keep a mark; asking for one
     // must not panic.
-    let list = Node::emplace_statements(support::arena(), Vec::new());
-    let primitive = Node::emplace_primitive(support::arena(), PrimitiveKind::Nil);
+    let list = ArenaNode::new_statements(support::arena(), Vec::new());
+    let primitive = ArenaNode::new_primitive(support::arena(), PrimitiveKind::Nil);
 
-    assert!(!has_error(list));
-    mark_error(list);
-    assert!(!has_error(list));
+    assert!(!list.has_error());
+    list.mark_error();
+    assert!(!list.has_error());
 
-    mark_error(primitive);
-    assert!(!has_error(primitive));
+    primitive.mark_error();
+    assert!(!primitive.has_error());
 }

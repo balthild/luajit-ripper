@@ -13,8 +13,8 @@ use std::collections::HashMap;
 
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
+use super::ext::*;
 use super::nodes::*;
-use super::traverse;
 use crate::bytecode::constants::NumConst;
 use crate::bytecode::debuginfo::VariableInfo;
 use crate::bytecode::opcodes::{Mode, Opcode};
@@ -81,15 +81,15 @@ struct Builder<'a> {
     line_map: Vec<u32>,
     /// Local variable info; mutated by the repair passes.
     variables: Vec<VariableInfo<'a>>,
-    blocks: Vec<NodeRef<'a>>,
-    block_starts: HashMap<u32, NodeRef<'a>>,
+    blocks: Vec<ArenaNode<'a>>,
+    block_starts: HashMap<u32, ArenaNode<'a>>,
     /// Number of trailing instructions consumed by the warp that was just
     /// built.
     warp_shift: u32,
 }
 
 /// Builds the AST of the root prototype of a chunk into `alloc`.
-pub fn build<'a>(alloc: &'a Allocator, chunk: &'a Chunk<'a>) -> Result<NodeRef<'a>> {
+pub fn build<'a>(alloc: &'a Allocator, chunk: &'a Chunk<'a>) -> Result<ArenaNode<'a>> {
     build_function(alloc, chunk, chunk.root)
 }
 
@@ -98,7 +98,7 @@ pub fn build_function<'a>(
     alloc: &'a Allocator,
     chunk: &'a Chunk<'a>,
     prototype: &'a Prototype<'a>,
-) -> Result<NodeRef<'a>> {
+) -> Result<ArenaNode<'a>> {
     let mut builder = Builder {
         alloc,
         chunk,
@@ -118,8 +118,8 @@ impl<'a> Builder<'a> {
     // MARK: node construction
 
     /// Allocates a node in the arena this builder writes to.
-    fn node(&self, value: Node<'a>) -> NodeRef<'a> {
-        Node::emplace(self.alloc, value)
+    fn node(&self, value: Node<'a>) -> ArenaNode<'a> {
+        ArenaNode::new(self.alloc, value)
     }
 
     /// Allocates a payload struct in the arena this builder writes to.
@@ -129,7 +129,7 @@ impl<'a> Builder<'a> {
 
     // MARK: entry points
 
-    fn build_function_definition(&mut self, prototype: &Prototype<'a>) -> Result<NodeRef<'a>> {
+    fn build_function_definition(&mut self, prototype: &Prototype<'a>) -> Result<ArenaNode<'a>> {
         let mut arguments = Vec::new();
         for slot in 0..u32::from(prototype.num_params) {
             arguments.push(self.build_slot(0, slot));
@@ -139,7 +139,7 @@ impl<'a> Builder<'a> {
         }
 
         let statements = self.build_function_blocks()?;
-        let arguments = Node::emplace_identifiers(self.alloc, arguments);
+        let arguments = ArenaNode::new_identifiers(self.alloc, arguments);
         let definition = FunctionDefinition {
             arguments,
             statements,
@@ -155,14 +155,14 @@ impl<'a> Builder<'a> {
         Ok(self.node(Node::FunctionDefinition(self.payload(definition))))
     }
 
-    fn build_function_blocks(&mut self) -> Result<NodeRef<'a>> {
+    fn build_function_blocks(&mut self) -> Result<ArenaNode<'a>> {
         self.blockenize()?;
         self.establish_warps()?;
 
         self.set_warpins_count(0, 1);
 
         let blocks = self.blocks.clone();
-        let mut previous: Option<NodeRef> = None;
+        let mut previous: Option<ArenaNode> = None;
 
         for block in blocks {
             let (first, last, last_body) = self.block_addresses(block);
@@ -170,24 +170,10 @@ impl<'a> Builder<'a> {
 
             // A block that is empty, jumps away and directly follows a
             // conditional branch is an empty `then` body.
-            let empty_jump_block = {
-                let borrowed = block.borrow();
-                match &*borrowed {
-                    Node::Block(block) => {
-                        block.contents.is_empty()
-                            && block.warp.as_ref().is_some_and(|warp| {
-                                matches!(&*warp.borrow(), Node::UnconditionalWarp(w)
-                                    if w.kind == UnconditionalWarpKind::Jump)
-                            })
-                    }
-                    _ => false,
-                }
-            };
-            let previous_is_conditional = previous.as_ref().is_some_and(|previous| {
-                matches!(&*previous.borrow(), Node::Block(block)
-                    if block.warp.as_ref()
-                        .is_some_and(|warp| matches!(&*warp.borrow(), Node::ConditionalWarp(_))))
-            });
+            let empty_jump_block =
+                block.is_block_and(|block| block.contents.is_empty() && block.warp.is_jump());
+            let previous_is_conditional =
+                previous.is_block_and(|block| block.warp.is_conditional_warp());
 
             if empty_jump_block && previous_is_conditional {
                 self.create_no_op(first, block);
@@ -196,7 +182,7 @@ impl<'a> Builder<'a> {
             previous = Some(block);
         }
 
-        Ok(Node::emplace_statements(
+        Ok(ArenaNode::new_statements(
             self.alloc,
             self.blocks.iter().copied(),
         ))
@@ -205,7 +191,7 @@ impl<'a> Builder<'a> {
     /// Turns the instructions of a block into statements.
     fn fill_block(
         &mut self,
-        block: NodeRef<'a>,
+        block: ArenaNode<'a>,
         first: u32,
         last: u32,
         last_body: u32,
@@ -228,7 +214,7 @@ impl<'a> Builder<'a> {
             if let Some((statement, marked)) = self.build_statement(addr, instruction)? {
                 let meta = Meta::new(addr, self.line_of(addr));
                 for element in marked.iter().copied().chain(std::iter::once(statement)) {
-                    set_meta(element, meta);
+                    element.borrow_mut().set_meta(meta);
                 }
                 if let Node::Block(inner) = &mut *block.borrow_mut() {
                     inner.contents.push(statement);
@@ -238,7 +224,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn block_addresses(&self, block: NodeRef<'a>) -> (u32, u32, u32) {
+    fn block_addresses(&self, block: ArenaNode<'a>) -> (u32, u32, u32) {
         match &*block.borrow() {
             Node::Block(block) => (
                 block.first_address,
@@ -255,7 +241,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn mark_loop(&self, block: NodeRef<'a>) {
+    fn mark_loop(&self, block: ArenaNode<'a>) {
         if let Node::Block(inner) = &mut *block.borrow_mut() {
             inner.is_loop = true;
         }
@@ -353,7 +339,7 @@ impl<'a> Builder<'a> {
         // Building a warp may insert a placeholder block, so the loop has to
         // walk a snapshot of the block list rather than indices into it.
         let count = self.blocks.len();
-        let blocks: Vec<NodeRef<'a>> = self.blocks[..count.saturating_sub(1)].to_vec();
+        let blocks: Vec<ArenaNode<'a>> = self.blocks[..count.saturating_sub(1)].to_vec();
         for block in blocks {
             let (first, last, _) = self.block_addresses(block);
 
@@ -367,7 +353,7 @@ impl<'a> Builder<'a> {
                 inner.last_body_address = last_body;
                 inner.warp = Some(warp);
             }
-            set_meta(warp, Meta::new(last_body + 1, 0));
+            warp.borrow_mut().set_meta(Meta::new(last_body + 1, 0));
         }
 
         let last_block = self
@@ -395,7 +381,7 @@ impl<'a> Builder<'a> {
         last_addr: u32,
         start_addr: u32,
         end_addr: u32,
-    ) -> Result<NodeRef<'a>> {
+    ) -> Result<ArenaNode<'a>> {
         let last = self.instructions[last_addr as usize];
         let span = (end_addr - start_addr) as usize;
 
@@ -413,7 +399,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build_jump_warp(&mut self, last_addr: u32, span: usize) -> Result<NodeRef<'a>> {
+    fn build_jump_warp(&mut self, last_addr: u32, span: usize) -> Result<ArenaNode<'a>> {
         let last = self.instructions[last_addr as usize];
         let previous = if span == 1 {
             None
@@ -432,7 +418,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build_conditional_warp(&mut self, last_addr: u32) -> Result<NodeRef<'a>> {
+    fn build_conditional_warp(&mut self, last_addr: u32) -> Result<ArenaNode<'a>> {
         let condition_addr = last_addr - 1;
         let condition = self.instructions[condition_addr as usize];
         let jump = self.instructions[last_addr as usize];
@@ -466,7 +452,7 @@ impl<'a> Builder<'a> {
         {
             let block = self.node(Node::Block(self.payload(Block::new(
                 self.alloc,
-                block_index(original_true_target),
+                original_true_target.block_index(),
                 last_addr + 1,
                 last_addr + 1,
             ))));
@@ -487,7 +473,7 @@ impl<'a> Builder<'a> {
             let position = self
                 .blocks
                 .iter()
-                .position(|candidate| traverse::same_node(candidate, original_true_target))
+                .position(|candidate| (*candidate).same_as(original_true_target))
                 .ok_or_else(|| self.malformed("conditional target is not a block"))?;
             self.blocks.insert(position, block);
             self.create_no_op(last_addr, block);
@@ -508,7 +494,7 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn build_unconditional_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
+    fn build_unconditional_warp(&mut self, addr: u32, instruction: Ins) -> Result<ArenaNode<'a>> {
         let is_uclo = instruction.op == Opcode::UCLO;
         if is_uclo && instruction.jump_offset() == 0 {
             return self.build_flow_warp(addr, instruction);
@@ -527,7 +513,7 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn build_iterator_warp(&mut self, last_addr: u32) -> Result<NodeRef<'a>> {
+    fn build_iterator_warp(&mut self, last_addr: u32) -> Result<ArenaNode<'a>> {
         let iterator_addr = last_addr - 1;
         let iterator = self.instructions[iterator_addr as usize];
         if !matches!(iterator.op, Opcode::ITERC | Opcode::ITERN) {
@@ -535,7 +521,7 @@ impl<'a> Builder<'a> {
         }
 
         let base = iterator.a;
-        let controls = Node::emplace_expressions(
+        let controls = ArenaNode::new_expressions(
             self.alloc,
             vec![
                 self.build_slot(iterator_addr, base.wrapping_sub(3)),
@@ -557,7 +543,7 @@ impl<'a> Builder<'a> {
 
         self.warp_shift = 2;
         Ok(self.node(Node::IteratorWarp(self.payload(IteratorWarp {
-            variables: Node::emplace_variables(self.alloc, loop_variables),
+            variables: ArenaNode::new_variables(self.alloc, loop_variables),
             controls,
             body: Some(body),
             way_out: Some(way_out),
@@ -565,10 +551,10 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_numeric_loop_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
+    fn build_numeric_loop_warp(&mut self, addr: u32, instruction: Ins) -> Result<ArenaNode<'a>> {
         let base = instruction.a;
         let index = self.build_slot(addr, base + 3);
-        let controls = Node::emplace_expressions(
+        let controls = ArenaNode::new_expressions(
             self.alloc,
             vec![
                 self.build_slot(addr, base),
@@ -593,7 +579,7 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn build_flow_warp(&mut self, addr: u32, instruction: Ins) -> Result<NodeRef<'a>> {
+    fn build_flow_warp(&mut self, addr: u32, instruction: Ins) -> Result<ArenaNode<'a>> {
         let target = self.warp_in_block(addr + 1)?;
         self.warp_shift = if matches!(instruction.op, Opcode::FORI | Opcode::UCLO) {
             1
@@ -610,7 +596,7 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn warp_in_block(&mut self, addr: u32) -> Result<NodeRef<'a>> {
+    fn warp_in_block(&mut self, addr: u32) -> Result<ArenaNode<'a>> {
         let block = self.block_starts.get(&addr).copied().ok_or_else(|| {
             self.malformed(&format!("branch target {addr} is not the start of a block"))
         })?;
@@ -625,7 +611,7 @@ impl<'a> Builder<'a> {
         u32::try_from(target).map_err(|_| self.malformed("jump target is outside the function"))
     }
 
-    fn create_no_op(&self, addr: u32, block: NodeRef<'a>) {
+    fn create_no_op(&self, addr: u32, block: ArenaNode<'a>) {
         let statement = self.node(Node::NoOp(self.payload(NoOp {
             meta: Meta::new(addr, self.line_of(addr)),
         })));
@@ -640,7 +626,7 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<Option<(NodeRef<'a>, Vec<NodeRef<'a>>)>> {
+    ) -> Result<Option<(ArenaNode<'a>, Vec<ArenaNode<'a>>)>> {
         if matches!(instruction.def().a, Mode::Dst | Mode::Uv) {
             return self.build_var_assignment(addr, instruction).map(Some);
         }
@@ -670,7 +656,7 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let op = instruction.op;
 
         let expression = if op.is_unary() {
@@ -693,8 +679,8 @@ impl<'a> Builder<'a> {
             self.build_child(instruction.cd)?
         } else if op == Opcode::TNEW {
             self.node(Node::TableConstructor(self.payload(TableConstructor {
-                array: Node::emplace_records(self.alloc, Vec::new()),
-                records: Node::emplace_records(self.alloc, Vec::new()),
+                array: ArenaNode::new_records(self.alloc, Vec::new()),
+                records: ArenaNode::new_records(self.alloc, Vec::new()),
                 meta: Meta::default(),
             })))
         } else if op == Opcode::TDUP {
@@ -717,8 +703,8 @@ impl<'a> Builder<'a> {
         };
 
         let assignment = Assignment {
-            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
-            destinations: Node::emplace_variables(self.alloc, vec![destination]),
+            expressions: ArenaNode::new_expressions(self.alloc, vec![expression]),
+            destinations: ArenaNode::new_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -733,10 +719,10 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let mut assignment = self.build_range_assignment(addr, instruction.a, instruction.cd);
-        let primitive = Node::emplace_primitive(self.alloc, PrimitiveKind::Nil);
-        assignment.expressions = Node::emplace_expressions(self.alloc, vec![primitive]);
+        let primitive = ArenaNode::new_primitive(self.alloc, PrimitiveKind::Nil);
+        assignment.expressions = ArenaNode::new_expressions(self.alloc, vec![primitive]);
         Ok((
             self.node(Node::Assignment(self.payload(assignment))),
             vec![primitive],
@@ -747,12 +733,12 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let variable = self.build_global_variable(instruction.cd);
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
-            destinations: Node::emplace_variables(self.alloc, vec![variable]),
+            expressions: ArenaNode::new_expressions(self.alloc, vec![expression]),
+            destinations: ArenaNode::new_variables(self.alloc, vec![variable]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -766,12 +752,12 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let destination = self.build_table_element(addr, &instruction)?;
         let expression = self.build_slot(addr, instruction.a);
         let assignment = Assignment {
-            expressions: Node::emplace_expressions(self.alloc, vec![expression]),
-            destinations: Node::emplace_variables(self.alloc, vec![destination]),
+            expressions: ArenaNode::new_expressions(self.alloc, vec![expression]),
+            destinations: ArenaNode::new_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -785,7 +771,7 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let base = instruction.a;
         let table = self.build_slot(addr, base.wrapping_sub(1));
         let destination = self.node(Node::TableElement(self.payload(TableElement {
@@ -795,8 +781,8 @@ impl<'a> Builder<'a> {
         })));
         let multres = self.node(Node::MulTres);
         let assignment = Assignment {
-            expressions: Node::emplace_expressions(self.alloc, vec![multres]),
-            destinations: Node::emplace_variables(self.alloc, vec![destination]),
+            expressions: ArenaNode::new_expressions(self.alloc, vec![multres]),
+            destinations: ArenaNode::new_variables(self.alloc, vec![destination]),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         };
@@ -810,7 +796,7 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<Option<(NodeRef<'a>, Vec<NodeRef<'a>>)>> {
+    ) -> Result<Option<(ArenaNode<'a>, Vec<ArenaNode<'a>>)>> {
         let function = self.build_slot(addr, instruction.a);
         let arguments = self.build_call_arguments(addr, &instruction);
         let call = self.node(Node::FunctionCall(self.payload(FunctionCall {
@@ -825,9 +811,9 @@ impl<'a> Builder<'a> {
         let statement = if instruction.op <= Opcode::CALL {
             if instruction.b == 0 {
                 let destinations =
-                    Node::emplace_variables(self.alloc, vec![self.node(Node::MulTres)]);
+                    ArenaNode::new_variables(self.alloc, vec![self.node(Node::MulTres)]);
                 let assignment = Assignment {
-                    expressions: Node::emplace_expressions(self.alloc, vec![call]),
+                    expressions: ArenaNode::new_expressions(self.alloc, vec![call]),
                     destinations,
                     kind: AssignmentKind::Normal,
                     meta: Meta::default(),
@@ -839,11 +825,11 @@ impl<'a> Builder<'a> {
                 let from_slot = instruction.a;
                 let to_slot = instruction.a + instruction.b - 2;
                 let mut assignment = self.build_range_assignment(addr, from_slot, to_slot);
-                assignment.expressions = Node::emplace_expressions(self.alloc, vec![call]);
+                assignment.expressions = ArenaNode::new_expressions(self.alloc, vec![call]);
                 self.node(Node::Assignment(self.payload(assignment)))
             }
         } else {
-            let returns = Node::emplace_expressions(self.alloc, vec![call]);
+            let returns = ArenaNode::new_expressions(self.alloc, vec![call]);
             let return_node = self.node(Node::Return(self.payload(Return {
                 returns,
                 meta: Meta::default(),
@@ -855,7 +841,7 @@ impl<'a> Builder<'a> {
         Ok(Some((statement, marked)))
     }
 
-    fn build_call_arguments(&mut self, addr: u32, instruction: &Ins) -> NodeRef<'a> {
+    fn build_call_arguments(&mut self, addr: u32, instruction: &Ins) -> ArenaNode<'a> {
         let base = instruction.a;
         let is_variadic = matches!(instruction.op, Opcode::CALLM | Opcode::CALLMT);
         let mut last_argument_slot = i64::from(base) + i64::from(instruction.cd);
@@ -881,29 +867,29 @@ impl<'a> Builder<'a> {
             arguments.push(self.node(Node::MulTres));
         }
 
-        Node::emplace_expressions(self.alloc, arguments)
+        ArenaNode::new_expressions(self.alloc, arguments)
     }
 
     fn build_vararg(
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let base = instruction.a;
         let last_slot = i64::from(base) + i64::from(instruction.b) - 2;
         let vararg = self.node(Node::Vararg);
 
         let assignment = if last_slot < i64::from(base) {
-            let destinations = Node::emplace_variables(self.alloc, vec![self.node(Node::MulTres)]);
+            let destinations = ArenaNode::new_variables(self.alloc, vec![self.node(Node::MulTres)]);
             Assignment {
-                expressions: Node::emplace_expressions(self.alloc, vec![vararg]),
+                expressions: ArenaNode::new_expressions(self.alloc, vec![vararg]),
                 destinations,
                 kind: AssignmentKind::Normal,
                 meta: Meta::default(),
             }
         } else {
             let mut assignment = self.build_range_assignment(addr, base, last_slot as u32);
-            assignment.expressions = Node::emplace_expressions(self.alloc, vec![vararg]);
+            assignment.expressions = ArenaNode::new_expressions(self.alloc, vec![vararg]);
             assignment
         };
 
@@ -917,7 +903,7 @@ impl<'a> Builder<'a> {
         &mut self,
         addr: u32,
         instruction: Ins,
-    ) -> Result<(NodeRef<'a>, Vec<NodeRef<'a>>)> {
+    ) -> Result<(ArenaNode<'a>, Vec<ArenaNode<'a>>)> {
         let base = instruction.a;
         let mut last_slot = i64::from(base) + i64::from(instruction.cd) - 1;
         if instruction.op != Opcode::RETM {
@@ -934,7 +920,7 @@ impl<'a> Builder<'a> {
             returns.push(self.node(Node::MulTres));
         }
 
-        let returns_node = Node::emplace_expressions(self.alloc, returns.iter().copied());
+        let returns_node = ArenaNode::new_expressions(self.alloc, returns.iter().copied());
         let return_node = self.node(Node::Return(self.payload(Return {
             returns: returns_node,
             meta: Meta::default(),
@@ -958,8 +944,8 @@ impl<'a> Builder<'a> {
             slot += 1;
         }
         Assignment {
-            expressions: Node::emplace_expressions(self.alloc, Vec::new()),
-            destinations: Node::emplace_variables(self.alloc, destinations),
+            expressions: ArenaNode::new_expressions(self.alloc, Vec::new()),
+            destinations: ArenaNode::new_variables(self.alloc, destinations),
             kind: AssignmentKind::Normal,
             meta: Meta::default(),
         }
@@ -967,7 +953,7 @@ impl<'a> Builder<'a> {
 
     // MARK: expressions
 
-    fn build_binary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_binary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<ArenaNode<'a>> {
         let kind = binary_operator_kind(instruction.op)
             .ok_or_else(|| self.malformed("unknown binary operator"))?;
 
@@ -996,7 +982,7 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_bitop_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_bitop_expression(&mut self, addr: u32, instruction: &Ins) -> Result<ArenaNode<'a>> {
         let kind = match instruction.op {
             Opcode::BNOT => {
                 let operand = self.build_slot(addr, instruction.cd);
@@ -1025,7 +1011,7 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_concat_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_concat_expression(&mut self, addr: u32, instruction: &Ins) -> Result<ArenaNode<'a>> {
         let mut slot = instruction.b;
         let mut operator = BinaryOperator {
             kind: BinaryOperatorKind::Concat,
@@ -1050,7 +1036,7 @@ impl<'a> Builder<'a> {
         Ok(self.node(Node::BinaryOperator(self.payload(operator))))
     }
 
-    fn build_const_expression(&mut self, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_const_expression(&mut self, instruction: &Ins) -> Result<ArenaNode<'a>> {
         match instruction.def().c {
             Mode::Str => self.build_string_constant(instruction.cd),
             Mode::CData => self.build_cdata_constant(instruction.cd),
@@ -1062,7 +1048,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build_table_element(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_table_element(&mut self, addr: u32, instruction: &Ins) -> Result<ArenaNode<'a>> {
         let table = self.build_slot(addr, instruction.b);
         let key = if instruction.def().c == Mode::Var {
             self.build_slot(addr, instruction.cd)
@@ -1076,7 +1062,11 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_comparison_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_comparison_expression(
+        &mut self,
+        addr: u32,
+        instruction: &Ins,
+    ) -> Result<ArenaNode<'a>> {
         let left = self.build_slot(addr, instruction.a);
         let right = match instruction.def().c {
             Mode::Str => self.build_string_constant(instruction.cd)?,
@@ -1109,7 +1099,7 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_unary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<NodeRef<'a>> {
+    fn build_unary_expression(&mut self, addr: u32, instruction: &Ins) -> Result<ArenaNode<'a>> {
         let variable = self.build_slot(addr, instruction.cd);
 
         // Mind the inversion: these copy the value unchanged and only test it.
@@ -1133,7 +1123,7 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_child(&mut self, index: u32) -> Result<NodeRef<'a>> {
+    fn build_child(&mut self, index: u32) -> Result<ArenaNode<'a>> {
         let child = match self.kgc(index)? {
             Const::Child(child) => *child,
             _ => return Err(self.malformed("FNEW does not refer to a prototype")),
@@ -1141,7 +1131,7 @@ impl<'a> Builder<'a> {
         build_function(self.alloc, self.chunk, child)
     }
 
-    fn build_table_copy(&mut self, index: u32) -> Result<NodeRef<'a>> {
+    fn build_table_copy(&mut self, index: u32) -> Result<ArenaNode<'a>> {
         let table = match self.kgc(index)? {
             Const::Table(table) => table,
             _ => return Err(self.malformed("TDUP does not refer to a table")),
@@ -1167,20 +1157,20 @@ impl<'a> Builder<'a> {
 
         Ok(
             self.node(Node::TableConstructor(self.payload(TableConstructor {
-                array: Node::emplace_records(self.alloc, array),
-                records: Node::emplace_records(self.alloc, hash),
+                array: ArenaNode::new_records(self.alloc, array),
+                records: ArenaNode::new_records(self.alloc, hash),
                 meta: Meta::default(),
             }))),
         )
     }
 
-    fn build_table_record_item(&self, value: &ConstKey<'a>) -> NodeRef<'a> {
+    fn build_table_record_item(&self, value: &ConstKey<'a>) -> ArenaNode<'a> {
         match value {
             ConstKey::Nil | ConstKey::KeyMarker => {
-                Node::emplace_primitive(self.alloc, PrimitiveKind::Nil)
+                ArenaNode::new_primitive(self.alloc, PrimitiveKind::Nil)
             }
-            ConstKey::False => Node::emplace_primitive(self.alloc, PrimitiveKind::False),
-            ConstKey::True => Node::emplace_primitive(self.alloc, PrimitiveKind::True),
+            ConstKey::False => ArenaNode::new_primitive(self.alloc, PrimitiveKind::False),
+            ConstKey::True => ArenaNode::new_primitive(self.alloc, PrimitiveKind::True),
             ConstKey::Int(number) => self.node(Node::Constant(self.payload(Constant {
                 value: ConstantValue::Integer(*number),
                 meta: Meta::default(),
@@ -1198,13 +1188,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build_slot(&self, addr: u32, slot: u32) -> NodeRef<'a> {
+    fn build_slot(&self, addr: u32, slot: u32) -> ArenaNode<'a> {
         let identifier =
             Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::new(addr, 0));
         self.node(Node::Identifier(self.payload(identifier)))
     }
 
-    fn build_upvalue(&self, addr: u32, slot: u32) -> NodeRef<'a> {
+    fn build_upvalue(&self, addr: u32, slot: u32) -> ArenaNode<'a> {
         let name = self.prototype.debug.upvalue_name(slot);
         let mut identifier = Identifier::new(
             self.alloc,
@@ -1216,7 +1206,7 @@ impl<'a> Builder<'a> {
         self.node(Node::Identifier(self.payload(identifier)))
     }
 
-    fn build_global_variable(&self, index: u32) -> NodeRef<'a> {
+    fn build_global_variable(&self, index: u32) -> ArenaNode<'a> {
         let mut identifier =
             Identifier::new(self.alloc, IdentifierKind::Builtin, 0, Meta::default());
         identifier.name = Some("_env");
@@ -1233,7 +1223,7 @@ impl<'a> Builder<'a> {
         })))
     }
 
-    fn build_string_constant(&self, index: u32) -> Result<NodeRef<'a>> {
+    fn build_string_constant(&self, index: u32) -> Result<ArenaNode<'a>> {
         match self.kgc(index)? {
             // The string is borrowed from the prototype's constants rather than
             // copied into the arena.
@@ -1245,7 +1235,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn build_cdata_constant(&self, index: u32) -> Result<NodeRef<'a>> {
+    fn build_cdata_constant(&self, index: u32) -> Result<ArenaNode<'a>> {
         let value = match self.kgc(index)? {
             Const::Int64(number) => number.to_string(),
             Const::Uint64(number) => number.to_string(),
@@ -1259,7 +1249,7 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_numeric_constant(&self, index: u32) -> Result<NodeRef<'a>> {
+    fn build_numeric_constant(&self, index: u32) -> Result<ArenaNode<'a>> {
         let value = match self.knum(index)? {
             NumConst::Int(number) => ConstantValue::Integer(number),
             NumConst::Float(number) => ConstantValue::Float(number),
@@ -1270,20 +1260,20 @@ impl<'a> Builder<'a> {
         }))))
     }
 
-    fn build_literal(&self, value: i64) -> NodeRef<'a> {
+    fn build_literal(&self, value: i64) -> ArenaNode<'a> {
         self.node(Node::Constant(self.payload(Constant {
             value: ConstantValue::Integer(value as i32),
             meta: Meta::default(),
         })))
     }
 
-    fn build_primitive(&self, value: u64) -> NodeRef<'a> {
+    fn build_primitive(&self, value: u64) -> ArenaNode<'a> {
         let kind = match value {
             1 => PrimitiveKind::False,
             2 => PrimitiveKind::True,
             _ => PrimitiveKind::Nil,
         };
-        Node::emplace_primitive(self.alloc, kind)
+        ArenaNode::new_primitive(self.alloc, kind)
     }
 
     // MARK: instruction repair passes
@@ -1581,13 +1571,4 @@ fn binary_operator_kind(op: Opcode) -> Option<BinaryOperatorKind> {
         Opcode::POW => Pow,
         _ => return None,
     })
-}
-
-// MARK: block index
-
-fn block_index(block: NodeRef<'_>) -> u32 {
-    match &*block.borrow() {
-        Node::Block(block) => block.index,
-        _ => 0,
-    }
 }

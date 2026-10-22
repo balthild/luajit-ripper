@@ -16,14 +16,15 @@
 
 use oxc_allocator::{Allocator, ArenaBox};
 
-use super::helpers::{has_same_table, insert_table_record, is_equal};
+use super::ext::*;
+use super::helpers::{insert_table_record, is_equal};
 use super::nodes::*;
-use super::traverse::{self, Visitor};
+use super::traverse::Visitor;
 use crate::bytecode::SLOT_FALSE;
 
 /// Rewrites the graph into the shape the later passes expect.
-pub fn pre_pass<'a>(alloc: &'a Allocator, root: NodeRef<'a>) {
-    traverse::traverse(&mut SimpleLoopWarpSwapper::new(alloc), root);
+pub fn pre_pass<'a>(alloc: &'a Allocator, root: ArenaNode<'a>) {
+    root.traverse(&mut SimpleLoopWarpSwapper::new(alloc));
 }
 
 /// Cleans up the tree once the control flow is structured.
@@ -31,8 +32,8 @@ pub fn pre_pass<'a>(alloc: &'a Allocator, root: NodeRef<'a>) {
 /// This is a port of ljd's `primary_pass`: `if` statements nested in an `else`
 /// become `elseif` chains, and assignments that only fill in fields of a table
 /// are folded back into its constructor.
-pub fn primary_pass<'a>(alloc: &'a Allocator, root: NodeRef<'a>) {
-    traverse::traverse(&mut MutatorVisitor { alloc }, root);
+pub fn primary_pass<'a>(alloc: &'a Allocator, root: ArenaNode<'a>) {
+    root.traverse(&mut MutatorVisitor { alloc });
 }
 
 // MARK: primary pass
@@ -42,24 +43,24 @@ struct MutatorVisitor<'a> {
 }
 
 impl<'a> Visitor<'a> for MutatorVisitor<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
-        if matches!(&*node.borrow(), Node::Statements(_)) {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
+        if node.is_statements() {
             fill_constructors(self.alloc, node);
         }
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
-        if matches!(&*node.borrow(), Node::If(_)) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
+        if node.is_if() {
             merge_elseif(self.alloc, node);
         }
     }
 }
 
 /// Turns an `if` that is the only statement of an `else` into an `elseif`.
-fn merge_elseif<'a>(alloc: &'a Allocator, if_node: NodeRef<'a>) {
+fn merge_elseif<'a>(alloc: &'a Allocator, if_node: ArenaNode<'a>) {
     let else_contents = match &*if_node.borrow() {
-        Node::If(inner) => traverse::list_contents(inner.else_block),
+        Node::If(inner) => inner.else_block.list_contents(),
         _ => return,
     };
     if else_contents.len() != 1 {
@@ -76,7 +77,7 @@ fn merge_elseif<'a>(alloc: &'a Allocator, if_node: NodeRef<'a>) {
         sub.else_block,
     );
 
-    let entry = Node::emplace(
+    let entry = ArenaNode::new(
         alloc,
         Node::ElseIf(ArenaBox::new_in(
             ElseIf {
@@ -98,9 +99,9 @@ fn merge_elseif<'a>(alloc: &'a Allocator, if_node: NodeRef<'a>) {
 // MARK: folding constructors
 
 /// Folds `t.k = v` statements that follow `t = {}` into the constructor.
-fn fill_constructors<'a>(alloc: &'a Allocator, statements: NodeRef<'a>) {
-    let contents = traverse::list_contents(statements);
-    let mut patched: Vec<NodeRef<'a>> = Vec::new();
+fn fill_constructors<'a>(alloc: &'a Allocator, statements: ArenaNode<'a>) {
+    let contents = statements.list_contents();
+    let mut patched: Vec<ArenaNode<'a>> = Vec::new();
 
     let mut index = 0usize;
     while index < contents.len() {
@@ -111,15 +112,15 @@ fn fill_constructors<'a>(alloc: &'a Allocator, statements: NodeRef<'a>) {
         let Node::Assignment(assignment) = &*statement.borrow() else {
             continue;
         };
-        let expressions = traverse::list_contents(assignment.expressions);
+        let expressions = assignment.expressions.list_contents();
         let Some(source) = expressions.first().copied() else {
             continue;
         };
-        if !matches!(&*source.borrow(), Node::TableConstructor(_)) {
+        if !source.is_table_constructor() {
             continue;
         }
 
-        let destinations = traverse::list_contents(assignment.destinations);
+        let destinations = assignment.destinations.list_contents();
         let Some(destination) = destinations.first().copied() else {
             continue;
         };
@@ -130,7 +131,7 @@ fn fill_constructors<'a>(alloc: &'a Allocator, statements: NodeRef<'a>) {
         index += fill_constructor(alloc, destination, source, &contents[index..]);
     }
 
-    set_list_contents(alloc, statements, patched);
+    statements.borrow_mut().list_set_contents(alloc, patched);
 }
 
 /// Folds the following field assignments into `constructor`.
@@ -138,9 +139,9 @@ fn fill_constructors<'a>(alloc: &'a Allocator, statements: NodeRef<'a>) {
 /// Returns how many statements were consumed.
 fn fill_constructor<'a>(
     alloc: &'a Allocator,
-    table: NodeRef<'a>,
-    constructor: NodeRef<'a>,
-    statements: &[NodeRef<'a>],
+    table: ArenaNode<'a>,
+    constructor: ArenaNode<'a>,
+    statements: &[ArenaNode<'a>],
 ) -> usize {
     let mut consumed = 0;
 
@@ -149,7 +150,7 @@ fn fill_constructor<'a>(
             break;
         };
 
-        let destinations = traverse::list_contents(assignment.destinations);
+        let destinations = assignment.destinations.list_contents();
         if destinations.len() != 1 {
             break;
         }
@@ -161,14 +162,14 @@ fn fill_constructor<'a>(
             break;
         }
 
-        let expressions = traverse::list_contents(assignment.expressions);
+        let expressions = assignment.expressions.list_contents();
         let Some(source) = expressions.first().copied() else {
             break;
         };
         if expressions.len() != 1 {
             break;
         }
-        if has_same_table(source, table) {
+        if source.has_same_table(table) {
             break;
         }
 
@@ -184,80 +185,14 @@ fn fill_constructor<'a>(
 
 // MARK: warp helpers
 
-/// The position of a block in its list.
-fn block_index(block: NodeRef<'_>) -> u32 {
-    match &*block.borrow() {
-        Node::Block(inner) => inner.index,
-        _ => u32::MAX,
-    }
-}
-
-/// What a warp does, for the few places that only need the kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarpKind {
-    Unconditional,
-    Conditional,
-    Iterator,
-    NumericLoop,
-    End,
-    Other,
-}
-
-fn warp_kind<'a>(warp: NodeRef<'a>) -> WarpKind {
-    match &*warp.borrow() {
-        Node::UnconditionalWarp(_) => WarpKind::Unconditional,
-        Node::ConditionalWarp(_) => WarpKind::Conditional,
-        Node::IteratorWarp(_) => WarpKind::Iterator,
-        Node::NumericLoopWarp(_) => WarpKind::NumericLoop,
-        Node::EndWarp(_) => WarpKind::End,
-        _ => WarpKind::Other,
-    }
-}
-
-/// Whether two optional nodes are the same node.
-fn same<'a>(a: Option<NodeRef<'a>>, b: Option<NodeRef<'a>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => traverse::same_node(a, b),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-/// The loop body and way out of an iterator or numeric loop warp.
-fn loop_warp_targets<'a>(warp: NodeRef<'a>) -> Option<(NodeRef<'a>, Option<NodeRef<'a>>)> {
-    match &*warp.borrow() {
-        Node::IteratorWarp(inner) => Some((inner.body?, inner.way_out)),
-        Node::NumericLoopWarp(inner) => Some((inner.body?, inner.way_out)),
-        _ => None,
-    }
-}
-
-/// The target of an unconditional warp, and whether it jumps.
-fn jump_of<'a>(warp: NodeRef<'a>) -> Option<(UnconditionalWarpKind, Option<NodeRef<'a>>)> {
-    match &*warp.borrow() {
-        Node::UnconditionalWarp(inner) => Some((inner.kind, inner.target)),
-        _ => None,
-    }
-}
-
-/// The targets of a conditional warp.
-fn conditional_targets<'a>(
-    warp: NodeRef<'a>,
-) -> Option<(Option<NodeRef<'a>>, Option<NodeRef<'a>>, Option<u32>)> {
-    match &*warp.borrow() {
-        Node::ConditionalWarp(inner) => Some((inner.true_target, inner.false_target, inner.slot)),
-        _ => None,
-    }
-}
-
 // MARK: swapping loop warps
 
 struct LoopWarpSwapper<'a> {
     /// `(body, way_out)` of every loop seen so far in this function.
-    loops: Vec<(NodeRef<'a>, Option<NodeRef<'a>>)>,
+    loops: Vec<(ArenaNode<'a>, Option<ArenaNode<'a>>)>,
     /// Blocks that hold an `UCLO` return, remembered so that they can be
     /// turned into a `break` once all the loops are known.
-    jumps: Vec<(Vec<NodeRef<'a>>, usize)>,
+    jumps: Vec<(Vec<ArenaNode<'a>>, usize)>,
 }
 
 struct SimpleLoopWarpSwapper<'a> {
@@ -285,20 +220,20 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
     /// `end_index` is the position of the block holding the loop warp, which
     /// ljd calls the end of the loop: for a numeric loop that is the block with
     /// the `FORL` in it.
-    fn swap_loop_warp(&mut self, blocks: &mut [NodeRef<'a>], end_index: usize, iterator: bool) {
+    fn swap_loop_warp(&mut self, blocks: &mut [ArenaNode<'a>], end_index: usize, iterator: bool) {
         let Some(end) = blocks.get(end_index).copied() else {
             return;
         };
-        let Some(warp) = traverse::block_warp(end) else {
+        let Some(warp) = end.block_warp() else {
             return;
         };
 
-        let body = match loop_warp_targets(warp) {
-            Some((body, _)) if (warp_kind(warp) == WarpKind::Iterator) == iterator => body,
+        let body = match warp.loop_targets() {
+            Some((body, _)) if warp.is_iterator_warp() == iterator => body,
             _ => return,
         };
 
-        let Some(body_index) = traverse::position(blocks, body) else {
+        let Some(body_index) = blocks.iter().position(|item| *item == body) else {
             return;
         };
         if body_index == 0 {
@@ -308,7 +243,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
         let Some(start) = blocks.get(body_index - 1).copied() else {
             return;
         };
-        let Some(start_warp) = traverse::block_warp(start) else {
+        let Some(start_warp) = start.block_warp() else {
             return;
         };
 
@@ -320,10 +255,8 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
         // A generic loop opens with a jump to the test at its end, while a
         // numeric loop flows straight into its body.
         let expected_target = if iterator { end } else { body };
-        let matches = match jump_of(start_warp) {
-            Some((kind, target)) => {
-                kind == expected && target.is_some_and(|t| traverse::same_node(t, expected_target))
-            }
+        let matches = match start_warp.jump_of() {
+            Some((kind, target)) => kind == expected && target.same_as(expected_target),
             None => false,
         };
         if !matches {
@@ -341,10 +274,11 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             inner.kind = UnconditionalWarpKind::Jump;
             inner.target = Some(start);
         }
-        set_meta(warp, Meta::new(start_addr.unwrap_or(0), 0));
+        warp.borrow_mut()
+            .set_meta(Meta::new(start_addr.unwrap_or(0), 0));
 
-        traverse::set_block_warp(end, start_warp);
-        traverse::set_block_warp(start, warp);
+        end.borrow_mut().block_set_warp(start_warp);
+        start.borrow_mut().block_set_warp(warp);
     }
 
     // MARK: unreachable branches
@@ -357,16 +291,16 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
     /// original comparison could have changed where execution goes.
     fn simplify_unreachable_conditional_warps(
         &mut self,
-        blocks: &mut Vec<NodeRef<'a>>,
+        blocks: &mut Vec<ArenaNode<'a>>,
         index: usize,
     ) {
         let Some(block) = blocks.get(index).copied() else {
             return;
         };
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             return;
         };
-        let Some((target, false_target, _)) = conditional_targets(warp) else {
+        let Some((target, false_target, _)) = warp.conditional_targets() else {
             return;
         };
         let Some(target) = target else {
@@ -376,41 +310,38 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
         // Walk the chain of no-op blocks the true target jumps through.
         let mut current = target;
         let end_of_chain = loop {
-            let Some(node_warp) = traverse::block_warp(current) else {
+            let Some(node_warp) = current.block_warp() else {
                 return;
             };
-            let is_jump = matches!(jump_of(node_warp), Some((UnconditionalWarpKind::Jump, _)));
-            if !is_jump {
+            if !node_warp.is_jump() {
                 return;
             }
 
-            let contents = traverse::block_contents(current);
-            if !contents.is_empty()
-                && (contents.len() > 1 || !matches!(&*contents[0].borrow(), Node::NoOp(_)))
-            {
+            let contents = current.block_contents();
+            if !contents.is_empty() && (contents.len() > 1 || !contents[0].is_no_op()) {
                 return;
             }
 
-            if !traverse::same_node(current, target) {
+            if !current.same_as(target) {
                 break current;
             }
 
-            let Some(next) = jump_of(node_warp).and_then(|(_, target)| target) else {
+            let Some(next) = node_warp.jump_of().and_then(|(_, target)| target) else {
                 return;
             };
             current = next;
         };
 
-        let node_warp = match traverse::block_warp(end_of_chain) {
+        let node_warp = match end_of_chain.block_warp() {
             Some(warp) => warp,
             None => return,
         };
-        let reaches_false = jump_of(node_warp).and_then(|(_, target)| target);
-        if !same(reaches_false, false_target) {
+        let reaches_false = node_warp.jump_of().and_then(|(_, target)| target);
+        if !reaches_false.same_optional_as(false_target) {
             return;
         }
 
-        let Some(old_index) = traverse::position(blocks, end_of_chain) else {
+        let Some(old_index) = blocks.iter().position(|item| *item == end_of_chain) else {
             return;
         };
         let Some(next_block) = blocks.get(old_index + 1).copied() else {
@@ -430,7 +361,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
 
         // The block needs a condition again: the true branch now skips the
         // block that used to hold the `false` constant.
-        let condition = Node::emplace(
+        let condition = ArenaNode::new(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(
@@ -442,7 +373,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
                 &self.alloc,
             )),
         );
-        let new_warp = Node::emplace(
+        let new_warp = ArenaNode::new(
             self.alloc,
             Node::ConditionalWarp(ArenaBox::new_in(
                 ConditionalWarp {
@@ -455,14 +386,14 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
                 &self.alloc,
             )),
         );
-        traverse::set_block_warp(target, new_warp);
+        target.borrow_mut().block_set_warp(new_warp);
 
         if let Node::Block(inner) = &mut *target.borrow_mut() {
             inner.last_address += 1;
         }
-        let mut contents = traverse::block_contents(target);
+        let mut contents = target.block_contents();
         contents.remove(0);
-        traverse::set_block_contents(self.alloc, target, contents);
+        target.borrow_mut().block_set_contents(self.alloc, contents);
     }
 
     // MARK: materialised conditions
@@ -472,32 +403,32 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
     /// LuaJIT evaluates a condition into a register of its own when the source
     /// used the value as well, as in `x = a < b`; the extra block keeps the
     /// graph a tree so that the unwarper can handle it.
-    fn create_dummy_block(&self, block: NodeRef<'a>, slot: u32) -> NodeRef<'a> {
+    fn create_dummy_block(&self, block: ArenaNode<'a>, slot: u32) -> ArenaNode<'a> {
         let (address, index) = match &*block.borrow() {
             Node::Block(inner) => (inner.last_address, inner.index),
             _ => (0, 0),
         };
 
-        let operand = Node::emplace(
+        let operand = ArenaNode::new(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::default()),
                 &self.alloc,
             )),
         );
-        let destination = Node::emplace(
+        let destination = ArenaNode::new(
             self.alloc,
             Node::Identifier(ArenaBox::new_in(
                 Identifier::new(self.alloc, IdentifierKind::Slot, slot, Meta::default()),
                 &self.alloc,
             )),
         );
-        let statement = Node::emplace(
+        let statement = ArenaNode::new(
             self.alloc,
             Node::Assignment(ArenaBox::new_in(
                 Assignment {
-                    expressions: Node::emplace_expressions(self.alloc, vec![operand]),
-                    destinations: Node::emplace_variables(self.alloc, vec![destination]),
+                    expressions: ArenaNode::new_expressions(self.alloc, vec![operand]),
+                    destinations: ArenaNode::new_variables(self.alloc, vec![destination]),
                     kind: AssignmentKind::Normal,
                     meta: Meta::default(),
                 },
@@ -505,18 +436,19 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             )),
         );
 
-        let false_target = traverse::block_warp(block).and_then(|warp| {
-            conditional_targets(warp).and_then(|(_, false_target, _)| false_target)
-        });
+        let false_target = block
+            .block_warp()
+            .and_then(|warp| warp.conditional_targets())
+            .and_then(|(_, false_target, _)| false_target);
 
-        let new_block = Node::emplace(
+        let new_block = ArenaNode::new(
             self.alloc,
             Node::Block(ArenaBox::new_in(
                 Block::new(self.alloc, index + 1, address, address),
                 &self.alloc,
             )),
         );
-        let flow = Node::emplace(
+        let flow = ArenaNode::new(
             self.alloc,
             Node::UnconditionalWarp(ArenaBox::new_in(
                 UnconditionalWarp {
@@ -534,7 +466,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             inner.warp = Some(flow);
         }
 
-        if let Some(warp) = traverse::block_warp(block)
+        if let Some(warp) = block.block_warp()
             && let Node::ConditionalWarp(inner) = &mut *warp.borrow_mut()
         {
             inner.true_target = Some(new_block);
@@ -547,27 +479,25 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
 
     /// Remembers a `return` that only closes an upvalue, so that it can be
     /// turned into a `break` once the surrounding loops are known.
-    fn note_uclo_return(&mut self, blocks: &[NodeRef<'a>], index: usize) {
+    fn note_uclo_return(&mut self, blocks: &[ArenaNode<'a>], index: usize) {
         let Some(block) = blocks.get(index).copied() else {
             return;
         };
-        let Some(warp) = traverse::block_warp(block) else {
+        let Some(warp) = block.block_warp() else {
             return;
         };
-        let target = jump_of(warp).and_then(|(_, target)| target);
+        let target = warp.jump_of().and_then(|(_, target)| target);
         let Some(target) = target else {
             return;
         };
 
-        let contents = traverse::block_contents(target);
-        if contents.len() != 1 || !matches!(&*contents[0].borrow(), Node::Return(_)) {
+        // The block the return jumps to has to hold nothing but that return.
+        let contents = target.block_contents();
+        if contents.len() != 1 || !contents[0].is_return() {
             return;
         }
 
-        let is_return = traverse::block_contents(block)
-            .last()
-            .is_some_and(|last| matches!(&*last.borrow(), Node::Return(_)));
-        if is_return {
+        if block.block_last().is_return() {
             return;
         }
 
@@ -580,37 +510,33 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
     /// The list can be shortened while it is being walked, exactly like ljd
     /// does: the index is only advanced by hand, so a removed block shifts the
     /// rest of the walk.
-    fn visit_blocks(&mut self, node: NodeRef<'a>) {
-        let mut blocks = traverse::list_contents(node);
-        let mut fixed: Vec<NodeRef<'a>> = Vec::with_capacity(blocks.len());
+    fn visit_blocks(&mut self, node: ArenaNode<'a>) {
+        let mut blocks = node.list_contents();
+        let mut fixed: Vec<ArenaNode<'a>> = Vec::with_capacity(blocks.len());
         let mut index_shift = 0i64;
 
         let mut index = 0;
         while index < blocks.len() {
             let block = blocks[index];
-            let original_index = block_index(block);
-            let warp = traverse::block_warp(block);
+            let original_index = block.block_index();
+            let warp = block.block_warp();
             fixed.push(block);
 
             if let Node::Block(inner) = &mut *block.borrow_mut() {
                 inner.index = (i64::from(inner.index) + index_shift) as u32;
             }
 
-            let kind = warp.map(warp_kind).unwrap_or(WarpKind::Other);
+            let iterator = warp.is_iterator_warp();
+            if iterator || warp.is_numeric_loop_warp() {
+                self.swap_loop_warp(&mut blocks, index, iterator);
 
-            match kind {
-                WarpKind::Iterator | WarpKind::NumericLoop => {
-                    self.swap_loop_warp(&mut blocks, index, kind == WarpKind::Iterator);
-
-                    if let Some(warp) = traverse::block_warp(block)
-                        && let Some((body, way_out)) = loop_warp_targets(warp)
-                    {
-                        self.state().loops.push((body, way_out));
-                    }
-                    index += 1;
-                    continue;
+                if let Some(warp) = block.block_warp()
+                    && let Some((body, way_out)) = warp.loop_targets()
+                {
+                    self.state().loops.push((body, way_out));
                 }
-                _ => {}
+                index += 1;
+                continue;
             }
 
             let Some(warp) = warp else {
@@ -618,16 +544,12 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
                 continue;
             };
 
-            let is_uclo = matches!(
-                &*warp.borrow(),
-                Node::UnconditionalWarp(inner) if inner.is_uclo
-            );
-            if is_uclo && index + 1 < blocks.len() {
+            if warp.is_unconditional_warp_and(|inner| inner.is_uclo) && index + 1 < blocks.len() {
                 self.note_uclo_return(&blocks, index);
             }
 
-            if let Some((true_target, false_target, slot)) = conditional_targets(warp) {
-                if !same(true_target, false_target) {
+            if let Some((true_target, false_target, slot)) = warp.conditional_targets() {
+                if !true_target.same_optional_as(false_target) {
                     self.simplify_unreachable_conditional_warps(&mut blocks, index);
                 } else if let Some(slot) = slot {
                     // The block that reads the condition has to be the one
@@ -635,7 +557,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
                     // there is nothing sensible to add: the condition is not a
                     // value that was stored somewhere first.
                     let expected = original_index + 1;
-                    let actual = false_target.map(block_index);
+                    let actual = false_target.map(|block| block.block_index());
                     if actual == Some(expected) {
                         let new_block = self.create_dummy_block(block, slot);
                         fixed.push(new_block);
@@ -647,7 +569,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             index += 1;
         }
 
-        set_list_contents(self.alloc, node, fixed);
+        node.borrow_mut().list_set_contents(self.alloc, fixed);
     }
 
     /// Finishes the `UCLO` returns of a function once all its loops are known.
@@ -658,10 +580,10 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             let Some(block) = blocks.get(index).copied() else {
                 continue;
             };
-            let Some(warp) = traverse::block_warp(block) else {
+            let Some(warp) = block.block_warp() else {
                 continue;
             };
-            let target = jump_of(warp).and_then(|(_, target)| target);
+            let target = warp.jump_of().and_then(|(_, target)| target);
             let Some(target) = target else {
                 continue;
             };
@@ -670,29 +592,33 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
             // encloses it.
             let mut use_break = false;
             for (start, end) in &state.loops {
-                if same(*end, Some(target)) {
-                    use_break = traverse::position(&blocks, start) < Some(index);
+                if end.same_optional_as(Some(target)) {
+                    use_break = blocks.iter().position(|item| *item == *start) < Some(index);
                     break;
                 }
             }
 
             let statement = if use_break {
-                Node::emplace(self.alloc, Node::Break)
+                ArenaNode::new(self.alloc, Node::Break)
             } else {
-                let contents = traverse::block_contents(target);
+                let contents = target.block_contents();
                 if contents.is_empty() {
                     continue;
                 }
                 let statement = contents[0];
-                traverse::set_block_contents(self.alloc, target, Vec::new());
+                target
+                    .borrow_mut()
+                    .block_set_contents(self.alloc, Vec::new());
                 statement
             };
 
-            let address = traverse::block_range(block).map(|(_, last)| last);
-            let mut contents = traverse::block_contents(block);
+            let address = block.block_range().map(|(_, last)| last);
+            let mut contents = block.block_contents();
             contents.push(statement);
-            traverse::set_block_contents(self.alloc, block, contents);
-            set_meta(statement, Meta::new(address.unwrap_or(0), 0));
+            block.borrow_mut().block_set_contents(self.alloc, contents);
+            statement
+                .borrow_mut()
+                .set_meta(Meta::new(address.unwrap_or(0), 0));
 
             if let Node::UnconditionalWarp(inner) = &mut *warp.borrow_mut() {
                 inner.kind = UnconditionalWarpKind::Flow;
@@ -703,7 +629,7 @@ impl<'a> SimpleLoopWarpSwapper<'a> {
 }
 
 impl<'a> Visitor<'a> for SimpleLoopWarpSwapper<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         enum Action {
             None,
             Enter,
@@ -731,8 +657,8 @@ impl<'a> Visitor<'a> for SimpleLoopWarpSwapper<'a> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
-        if matches!(&*node.borrow(), Node::FunctionDefinition(_)) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
+        if node.is_function_definition() {
             self.finish_function();
         }
     }

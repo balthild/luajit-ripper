@@ -5,7 +5,7 @@
 //! of a chunk to do it. That is what is collected here.
 
 /// A shared, mutable AST node.
-pub use luajit_ripper::ast::nodes::NodeRef;
+pub use luajit_ripper::ast::nodes::ArenaNode;
 use luajit_ripper::bytecode::{Chunk, Prototype};
 
 use super::parse;
@@ -35,7 +35,7 @@ pub fn count_prototypes(chunk: &Chunk) -> usize {
 ///
 /// This is the order the decompiler uses: the graph is repaired, the local
 /// variable names are recovered, and the temporary registers are inlined.
-pub fn prepare(chunk: &'static Chunk<'static>) -> Result<NodeRef<'static>, luajit_ripper::Error> {
+pub fn prepare(chunk: &'static Chunk<'static>) -> Result<ArenaNode<'static>, luajit_ripper::Error> {
     let alloc = parse::arena();
     let root = luajit_ripper::ast::builder::build(alloc, chunk)?;
     pre_pass(alloc, root)?;
@@ -52,7 +52,7 @@ pub fn prepare(chunk: &'static Chunk<'static>) -> Result<NodeRef<'static>, luaji
 pub fn prepare_function(
     chunk: &'static Chunk<'static>,
     prototype: &'static Prototype<'static>,
-) -> Option<NodeRef<'static>> {
+) -> Option<ArenaNode<'static>> {
     let alloc = parse::arena();
     let root = luajit_ripper::ast::builder::build_function(alloc, chunk, prototype).ok()?;
     pre_pass(alloc, root).ok()?;
@@ -62,7 +62,7 @@ pub fn prepare_function(
 /// The passes that run between building the graph and unwarping it.
 fn pre_pass(
     alloc: &'static oxc_allocator::Allocator,
-    root: NodeRef<'static>,
+    root: ArenaNode<'static>,
 ) -> Result<(), luajit_ripper::Error> {
     luajit_ripper::ast::mutator::pre_pass(alloc, root);
     luajit_ripper::ast::locals::mark_locals(root, false);
@@ -77,7 +77,7 @@ fn pre_pass(
 }
 
 /// How many blocks a graph holds.
-pub fn count_blocks(root: NodeRef<'static>) -> usize {
+pub fn count_blocks(root: ArenaNode<'static>) -> usize {
     use luajit_ripper::ast::nodes::Node;
 
     let mut count = 0;
@@ -154,7 +154,7 @@ pub fn unwarp_function(
 
 /// Structures one already prepared graph.
 pub fn unwarp(
-    root: NodeRef<'static>,
+    root: ArenaNode<'static>,
     recovery: luajit_ripper::ast::unwarper::Recovery,
 ) -> Result<(), luajit_ripper::Error> {
     luajit_ripper::ast::unwarper::unwarp_chunk(parse::arena(), root, recovery)

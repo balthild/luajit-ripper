@@ -133,6 +133,7 @@ fn every_dump_builds_an_ast() {
 /// inlined almost nothing should be left as a plain register.
 #[test]
 fn locals_are_recovered_for_the_whole_corpus() {
+    use luajit_ripper::ast::ext::*;
     use luajit_ripper::ast::nodes::{AssignmentKind, Node};
 
     let Some(corpus) = Corpus::load() else {
@@ -175,7 +176,7 @@ fn locals_are_recovered_for_the_whole_corpus() {
                 failures.push(format!("{}: {error}", file.display()));
             }
 
-            for node in luajit_ripper::ast::traverse::walk(root) {
+            for node in root.iter_nodes() {
                 let borrowed = node.borrow();
                 match &*borrowed {
                     Node::Identifier(identifier) => {
@@ -189,9 +190,7 @@ fn locals_are_recovered_for_the_whole_corpus() {
                     Node::Assignment(assignment)
                         if assignment.kind == AssignmentKind::LocalDefinition =>
                     {
-                        for destination in
-                            luajit_ripper::ast::traverse::list_contents(assignment.destinations)
-                        {
+                        for destination in assignment.destinations.list_contents() {
                             if let Node::Identifier(identifier) = &*destination.borrow() {
                                 definitions += 1;
                                 unnamed_definitions += usize::from(identifier.name.is_none());

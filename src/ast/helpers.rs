@@ -6,15 +6,16 @@
 
 use oxc_allocator::{Allocator, ArenaBox};
 
+use super::ext::*;
 use super::nodes::*;
-use super::traverse::{self, Visitor};
+use super::traverse::Visitor;
 
 /// Whether two nodes describe the same thing.
 ///
 /// Only identifiers, constants and table elements are compared; anything else
 /// counts as unequal. `strict` says the caller expects one of those three
 /// kinds, which ljd turns into an assertion.
-pub fn is_equal<'a>(a: NodeRef<'a>, b: NodeRef<'a>, strict: bool) -> bool {
+pub fn is_equal<'a>(a: ArenaNode<'a>, b: ArenaNode<'a>, strict: bool) -> bool {
     let nested = {
         let (borrowed_a, borrowed_b) = (a.borrow(), b.borrow());
         match (&*borrowed_a, &*borrowed_b) {
@@ -48,29 +49,31 @@ pub fn is_equal<'a>(a: NodeRef<'a>, b: NodeRef<'a>, strict: bool) -> bool {
     is_equal(table_a, table_b, strict) && is_equal(key_a, key_b, strict)
 }
 
-/// Whether any part of `node` reads `table`.
-///
-/// The check is used to keep a table constructor from being folded into itself:
-/// if the constructor ends up containing an expression that reads the table,
-/// the reads would refer to the wrong value.
-pub fn has_same_table<'a>(node: NodeRef<'a>, table: NodeRef<'a>) -> bool {
-    let mut checker = TableChecker {
-        table,
-        found: false,
-        function_depth: 0,
-    };
-    traverse::traverse(&mut checker, node);
-    checker.found
+impl<'a> ArenaNode<'a> {
+    /// Whether any part of this node reads `table`.
+    ///
+    /// The check is used to keep a table constructor from being folded into
+    /// itself: if the constructor ends up containing an expression that reads
+    /// the table, the reads would refer to the wrong value.
+    pub fn has_same_table(self, table: ArenaNode<'a>) -> bool {
+        let mut checker = TableChecker {
+            table,
+            found: false,
+            function_depth: 0,
+        };
+        self.traverse(&mut checker);
+        checker.found
+    }
 }
 
 struct TableChecker<'a> {
-    table: NodeRef<'a>,
+    table: ArenaNode<'a>,
     found: bool,
     function_depth: usize,
 }
 
 impl<'a> Visitor<'a> for TableChecker<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         if self.found {
             return false;
         }
@@ -100,8 +103,8 @@ impl<'a> Visitor<'a> for TableChecker<'a> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
-        if matches!(&*node.borrow(), Node::FunctionDefinition(_)) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
+        if node.is_function_definition() {
             self.function_depth -= 1;
         }
     }
@@ -114,9 +117,9 @@ impl<'a> Visitor<'a> for TableChecker<'a> {
 /// already taken by a different value is left alone.
 pub fn insert_table_record<'a>(
     alloc: &'a Allocator,
-    constructor: NodeRef<'a>,
-    key: NodeRef<'a>,
-    value: NodeRef<'a>,
+    constructor: ArenaNode<'a>,
+    key: ArenaNode<'a>,
+    value: ArenaNode<'a>,
     replace: bool,
 ) -> bool {
     let (array, records) = match &*constructor.borrow() {
@@ -126,8 +129,8 @@ pub fn insert_table_record<'a>(
 
     // `...` spreads the results of a call or a vararg across the rest of the
     // constructor, so the value itself is the record.
-    if matches!(&*key.borrow(), Node::MulTres) {
-        push(records, value);
+    if key.is_mul_tres() {
+        records.borrow_mut().list_push(value);
         return true;
     }
 
@@ -140,12 +143,12 @@ pub fn insert_table_record<'a>(
     };
 
     if let Some(position) = index {
-        let mut array_contents = list_contents(array);
+        let mut array_contents = array.list_contents();
 
         // `t = {nil, x}` uses an explicit nil for the hole at index one.
         if position == 1 && array_contents.is_empty() {
-            let nil = Node::emplace_primitive(alloc, PrimitiveKind::Nil);
-            array_contents.push(Node::emplace(
+            let nil = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+            array_contents.push(ArenaNode::new(
                 alloc,
                 Node::ArrayRecord(ArenaBox::new_in(
                     ArrayRecord {
@@ -158,9 +161,9 @@ pub fn insert_table_record<'a>(
         }
 
         if position > array_contents.len() {
-            set_list_contents(alloc, array, array_contents);
+            array.borrow_mut().list_set_contents(alloc, array_contents);
         } else {
-            let record = Node::emplace(
+            let record = ArenaNode::new(
                 alloc,
                 Node::ArrayRecord(ArenaBox::new_in(
                     ArrayRecord {
@@ -173,12 +176,12 @@ pub fn insert_table_record<'a>(
 
             if array_contents.is_empty() || position == array_contents.len() {
                 array_contents.push(record);
-                set_list_contents(alloc, array, array_contents);
+                array.borrow_mut().list_set_contents(alloc, array_contents);
                 return true;
             }
             if replace {
                 array_contents[position] = record;
-                set_list_contents(alloc, array, array_contents);
+                array.borrow_mut().list_set_contents(alloc, array_contents);
                 return true;
             }
 
@@ -189,22 +192,20 @@ pub fn insert_table_record<'a>(
                 Node::ArrayRecord(record) => record.value,
                 _ => current,
             };
-            let is_hole = matches!(&*current_value.borrow(), Node::Primitive(inner)
-                if inner.kind == PrimitiveKind::Nil);
-            if !is_hole {
-                set_list_contents(alloc, array, array_contents);
+            if !current_value.is_primitive_nil() {
+                array.borrow_mut().list_set_contents(alloc, array_contents);
                 return false;
             }
 
             array_contents[position] = record;
-            set_list_contents(alloc, array, array_contents);
+            array.borrow_mut().list_set_contents(alloc, array_contents);
             return true;
         }
     }
 
     // Records are not as critical as array entries: whatever the order, both
     // values end up in the table.
-    let record = Node::emplace(
+    let record = ArenaNode::new(
         alloc,
         Node::TableRecord(ArenaBox::new_in(
             TableRecord {
@@ -216,22 +217,25 @@ pub fn insert_table_record<'a>(
         )),
     );
 
-    let mut records_contents = list_contents(records);
+    let mut records_contents = records.list_contents();
     if records_contents.is_empty() {
         records_contents.push(record);
-        set_list_contents(alloc, records, records_contents);
+        records
+            .borrow_mut()
+            .list_set_contents(alloc, records_contents);
         return true;
     }
 
     let last = *records_contents.last().expect("checked above");
-    let is_multi = matches!(&*last.borrow(), Node::FunctionCall(_) | Node::Vararg);
-    if is_multi {
+    if last.is_function_call() || last.is_vararg() {
         let position = records_contents.len() - 1;
         records_contents.insert(position, record);
     } else {
         records_contents.push(record);
     }
-    set_list_contents(alloc, records, records_contents);
+    records
+        .borrow_mut()
+        .list_set_contents(alloc, records_contents);
 
     true
 }

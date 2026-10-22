@@ -30,9 +30,10 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, ArenaHashSet, ArenaVec};
 
+use super::ext::*;
 use super::helpers::insert_table_record;
 use super::nodes::*;
-use super::traverse::{self, Visitor, node_key};
+use super::traverse::Visitor;
 use crate::error::{Error, Result};
 
 // MARK: passes
@@ -71,7 +72,7 @@ impl Default for Options {
 /// Inlines every register that can be inlined without changing the program.
 pub fn eliminate_temporary<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     options: Options,
 ) -> Result<()> {
     let invalidated = Invalidated::new_in(alloc);
@@ -92,10 +93,10 @@ pub fn eliminate_temporary<'a>(
 /// Runs the simplifier over the tree, calling `callback` for the parts it changed.
 pub fn simplify_ast<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
-    callback: &mut dyn FnMut(NodeRef<'a>),
+    root: ArenaNode<'a>,
+    callback: &mut dyn FnMut(ArenaNode<'a>),
 ) {
-    traverse::traverse(&mut SimplifyVisitor::new(alloc, callback), root);
+    root.traverse(&mut SimplifyVisitor::new(alloc, callback));
 }
 
 fn internal(message: &str) -> Error {
@@ -124,22 +125,22 @@ impl<'a> Invalidated<'a> {
         Invalidated(alloc.alloc(RefCell::new(ArenaHashSet::new_in(alloc))))
     }
 
-    fn mark(&self, node: NodeRef<'a>) {
-        self.0.borrow_mut().insert(node_key(node));
+    fn mark(&self, node: ArenaNode<'a>) {
+        self.0.borrow_mut().insert(node.key());
     }
 
-    fn is_marked(&self, node: NodeRef<'a>) -> bool {
-        self.0.borrow().contains(&node_key(node))
+    fn is_marked(&self, node: ArenaNode<'a>) -> bool {
+        self.0.borrow().contains(&node.key())
     }
 }
 
 /// Drops the statements the pass marked as deleted.
 fn cleanup_invalid_nodes<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     invalidated: &Invalidated<'a>,
 ) {
-    traverse::traverse(&mut TreeCleanup { alloc, invalidated }, root);
+    root.traverse(&mut TreeCleanup { alloc, invalidated });
 }
 
 struct TreeCleanup<'a, 'b> {
@@ -148,89 +149,24 @@ struct TreeCleanup<'a, 'b> {
 }
 
 impl<'a> Visitor<'a> for TreeCleanup<'a, '_> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
-        if !matches!(&*node.borrow(), Node::Block(_)) {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
+        if !node.is_block() {
             return true;
         }
 
-        let contents = traverse::block_contents(node);
+        let contents = node.block_contents();
         let kept = contents
             .into_iter()
-            .filter(|statement| !self.invalidated.is_marked(statement));
-        traverse::set_block_contents(self.alloc, node, kept);
+            .filter(|statement| !self.invalidated.is_marked(*statement));
+        node.borrow_mut().block_set_contents(self.alloc, kept);
 
         true
     }
 }
 
-// MARK: identifier accessors
-
-/// The register of an identifier that still stands for a register.
-fn is_slot_identifier<'a>(node: NodeRef<'a>) -> Option<u32> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) if identifier.kind == IdentifierKind::Slot => {
-            Some(identifier.slot)
-        }
-        _ => None,
-    }
-}
-
-fn identifier_slot<'a>(node: NodeRef<'a>) -> Option<u32> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => Some(identifier.slot),
-        _ => None,
-    }
-}
-
-fn identifier_id<'a>(node: NodeRef<'a>) -> Option<u32> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => identifier.id,
-        _ => None,
-    }
-}
-
-fn identifier_possible_ids<'a>(node: NodeRef<'a>) -> Vec<u32> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => identifier.possible_ids.iter().copied().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn identifier_name<'a>(node: NodeRef<'a>) -> Option<&'a str> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => identifier.name,
-        _ => None,
-    }
-}
-
-fn identifier_kind<'a>(node: NodeRef<'a>) -> Option<IdentifierKind> {
-    match &*node.borrow() {
-        Node::Identifier(identifier) => Some(identifier.kind),
-        _ => None,
-    }
-}
-
-fn set_identifier_id<'a>(node: NodeRef<'a>, id: u32) {
-    if let Node::Identifier(identifier) = &mut *node.borrow_mut() {
-        identifier.id = Some(id);
-    }
-}
-
-fn set_identifier_possible_ids<'a>(alloc: &'a Allocator, node: NodeRef<'a>, ids: Vec<u32>) {
-    if let Node::Identifier(identifier) = &mut *node.borrow_mut() {
-        identifier.possible_ids = ArenaVec::from_iter_in(ids, &alloc);
-    }
-}
-
-fn forget_possible_id<'a>(node: NodeRef<'a>, id: u32) {
-    if let Node::Identifier(identifier) = &mut *node.borrow_mut() {
-        identifier.possible_ids.retain(|candidate| *candidate != id);
-    }
-}
-
 // MARK: path helpers
 
-fn is_list<'a>(node: NodeRef<'a>) -> bool {
+fn is_list<'a>(node: ArenaNode<'a>) -> bool {
     matches!(
         &*node.borrow(),
         Node::Variables(_) | Node::Identifiers(_) | Node::Expressions(_) | Node::Statements(_)
@@ -241,25 +177,27 @@ fn is_list<'a>(node: NodeRef<'a>) -> bool {
 ///
 /// An identifier always sits inside some list, so the list itself is never the
 /// thing the pass has to rewrite.
-fn get_holder<'a>(path: &[NodeRef<'a>]) -> Option<NodeRef<'a>> {
+fn get_holder<'a>(path: &[ArenaNode<'a>]) -> Option<ArenaNode<'a>> {
     path.iter()
         .rev()
         .skip(1)
-        .find(|node| !is_list(node))
+        .find(|node| !node.is_slot_list())
         .copied()
 }
 
 // MARK: assignment source
 
 /// The value an assignment computes.
-fn assignment_source<'a>(assignment: NodeRef<'a>) -> Result<NodeRef<'a>> {
+fn assignment_source<'a>(assignment: ArenaNode<'a>) -> Result<ArenaNode<'a>> {
     let borrowed = assignment.borrow();
     let Node::Assignment(inner) = &*borrowed else {
         return Err(internal(
             "a register was defined by something other than an assignment",
         ));
     };
-    traverse::list_contents(inner.expressions)
+    inner
+        .expressions
+        .list_contents()
         .into_iter()
         .next()
         .ok_or_else(|| internal("an assignment without a value"))
@@ -269,16 +207,16 @@ fn assignment_source<'a>(assignment: NodeRef<'a>) -> Result<NodeRef<'a>> {
 
 fn replace_in_list<'a>(
     alloc: &'a Allocator,
-    list: NodeRef<'a>,
-    original: NodeRef<'a>,
-    replacement: NodeRef<'a>,
+    list: ArenaNode<'a>,
+    original: ArenaNode<'a>,
+    replacement: ArenaNode<'a>,
 ) -> bool {
-    let contents = traverse::list_contents(list);
-    match traverse::position(&contents, original) {
+    let contents = list.list_contents();
+    match contents.iter().position(|item| *item == original) {
         Some(index) => {
             let mut contents = contents;
             contents[index] = replacement;
-            set_list_contents(alloc, list, contents);
+            list.borrow_mut().list_set_contents(alloc, contents);
             true
         }
         None => false,
@@ -288,14 +226,14 @@ fn replace_in_list<'a>(
 /// Replaces `original` with `replacement` where the reference points.
 fn replace_node<'a>(
     alloc: &'a Allocator,
-    holder: NodeRef<'a>,
-    original: NodeRef<'a>,
-    replacement: NodeRef<'a>,
+    holder: ArenaNode<'a>,
+    original: ArenaNode<'a>,
+    replacement: ArenaNode<'a>,
 ) -> bool {
-    if is_list(holder) {
+    if holder.is_slot_list() {
         return replace_in_list(alloc, holder, original, replacement);
     }
-    traverse::replace_child(holder, original, replacement)
+    holder.borrow_mut().replace_child(original, replacement)
 }
 
 // MARK: slot bookkeeping
@@ -303,8 +241,8 @@ fn replace_node<'a>(
 /// One place a register is read.
 struct SlotReference<'a> {
     /// The nodes from the root down to the reference, the reference included.
-    path: ArenaVec<'a, NodeRef<'a>>,
-    identifier: NodeRef<'a>,
+    path: ArenaVec<'a, ArenaNode<'a>>,
+    identifier: ArenaNode<'a>,
 }
 
 impl<'a> SlotReference<'a> {
@@ -324,18 +262,23 @@ impl<'a> SlotReference<'a> {
 struct SlotInfo<'a> {
     slot: u32,
     /// The assignment that writes the register.
-    assignment: NodeRef<'a>,
+    assignment: ArenaNode<'a>,
     references: ArenaVec<'a, SlotReference<'a>>,
     /// The node that ended this register's life. ljd records it for debugging;
     /// nothing in the pass reads it back.
-    termination: Option<NodeRef<'a>>,
+    termination: Option<ArenaNode<'a>>,
     /// Position of the write in the input, used to order the slots.
     slot_id: u32,
 }
 
 impl<'a> SlotInfo<'a> {
     /// Allocates a fresh register record in the arena the tree lives in.
-    fn emplace(alloc: &'a Allocator, slot: u32, assignment: NodeRef<'a>, slot_id: u32) -> Info<'a> {
+    fn emplace(
+        alloc: &'a Allocator,
+        slot: u32,
+        assignment: ArenaNode<'a>,
+        slot_id: u32,
+    ) -> Info<'a> {
         alloc.alloc(RefCell::new(SlotInfo {
             slot,
             assignment,
@@ -365,7 +308,7 @@ struct CollectorState<'a> {
     block_slots: HashMap<usize, KnownSlots<'a>>,
     /// Which blocks the warp of a block can reach, by target identity.
     block_refs: HashMap<usize, Vec<usize>>,
-    block: Option<NodeRef<'a>>,
+    block: Option<ArenaNode<'a>>,
 }
 
 impl<'a> CollectorState<'a> {
@@ -400,10 +343,10 @@ impl<'a> CollectorState<'a> {
 struct SlotsCollector<'a> {
     alloc: &'a Allocator,
     states: Vec<CollectorState<'a>>,
-    path: Vec<NodeRef<'a>>,
+    path: Vec<ArenaNode<'a>>,
     /// The expression list of the assignment being visited, skipped because it
     /// was already walked before the destinations were registered.
-    skip: Option<NodeRef<'a>>,
+    skip: Option<ArenaNode<'a>>,
     next_slot_id: u32,
     identify: bool,
     unwarped: bool,
@@ -414,7 +357,7 @@ struct SlotsCollector<'a> {
 impl<'a> SlotsCollector<'a> {
     fn run(
         alloc: &'a Allocator,
-        root: NodeRef<'a>,
+        root: ArenaNode<'a>,
         identify: bool,
         unwarped: bool,
     ) -> (Vec<Info<'a>>, Vec<Info<'a>>) {
@@ -429,7 +372,7 @@ impl<'a> SlotsCollector<'a> {
             slots: Vec::new(),
             unused: Vec::new(),
         };
-        traverse::traverse(&mut collector, root);
+        root.traverse(&mut collector);
 
         (collector.slots, collector.unused)
     }
@@ -505,7 +448,7 @@ impl<'a> SlotsCollector<'a> {
         visited: &mut HashSet<usize>,
     ) -> Option<Vec<Info<'a>>> {
         let state = self.read_state();
-        let current = state.block.map(node_key);
+        let current = state.block.map(|node| node.key());
         let block = block.or(current)?;
 
         // While a block is being walked its state lives in the collector; once
@@ -556,7 +499,7 @@ impl<'a> SlotsCollector<'a> {
     }
 
     /// Ends the life of the definition `id` refers to.
-    fn commit_slot(&mut self, slot: u32, id: Option<u32>, node: NodeRef<'a>) {
+    fn commit_slot(&mut self, slot: u32, id: Option<u32>, node: ArenaNode<'a>) {
         let Some(info) = self.get_slot(slot, id, true) else {
             return;
         };
@@ -567,11 +510,16 @@ impl<'a> SlotsCollector<'a> {
     }
 
     /// Starts a new definition of `slot`.
-    fn register_slot(&mut self, node: NodeRef<'a>, slot: NodeRef<'a>, assignment: NodeRef<'a>) {
-        let Some(slot_number) = identifier_slot(slot) else {
+    fn register_slot(
+        &mut self,
+        node: ArenaNode<'a>,
+        slot: ArenaNode<'a>,
+        assignment: ArenaNode<'a>,
+    ) {
+        let Some(slot_number) = slot.identifier_slot() else {
             return;
         };
-        let id = identifier_id(slot);
+        let id = slot.identifier_id();
         self.commit_slot(slot_number, id, node);
 
         // A register can be registered again by a later run over the same tree;
@@ -581,7 +529,7 @@ impl<'a> SlotsCollector<'a> {
             None => {
                 let id = self.next_slot_id;
                 self.next_slot_id += 1;
-                set_identifier_id(slot, id);
+                slot.borrow_mut().identifier_set_id(id);
                 id
             }
         };
@@ -590,19 +538,19 @@ impl<'a> SlotsCollector<'a> {
         self.set_slot(slot_number, Some(slot_id), info);
     }
 
-    fn register_all_slots(&mut self, node: NodeRef<'a>, slots: &[NodeRef<'a>]) {
+    fn register_all_slots(&mut self, node: ArenaNode<'a>, slots: &[ArenaNode<'a>]) {
         for slot in slots {
-            if is_slot_identifier(slot).is_some() {
-                self.register_slot(node, slot, node);
+            if slot.unnamed_slot().is_some() {
+                self.register_slot(node, *slot, node);
             }
         }
     }
 
     /// Records that `node` reads the register `info` describes.
-    fn register_slot_reference(&mut self, info: Info<'a>, node: NodeRef<'a>, update_id: bool) {
+    fn register_slot_reference(&mut self, info: Info<'a>, node: ArenaNode<'a>, update_id: bool) {
         let slot_id = info.borrow().slot_id;
-        let id = identifier_id(node);
-        let possible_ids = identifier_possible_ids(node);
+        let id = node.identifier_id();
+        let possible_ids = node.identifier_possible_ids();
 
         if id.is_none() && !possible_ids.contains(&slot_id) {
             if update_id {
@@ -611,12 +559,13 @@ impl<'a> SlotsCollector<'a> {
                     // reference belongs to a different one.
                     return;
                 }
-                set_identifier_id(node, slot_id);
+                node.borrow_mut().identifier_set_id(slot_id);
             } else if self.identify {
                 let mut possible_ids = possible_ids;
                 possible_ids.push(slot_id);
                 possible_ids.sort_unstable();
-                set_identifier_possible_ids(self.alloc, node, possible_ids);
+                node.borrow_mut()
+                    .identifier_set_possible_ids(self.alloc, possible_ids);
             }
         }
 
@@ -631,26 +580,26 @@ impl<'a> SlotsCollector<'a> {
 
     fn visit_assignment(
         &mut self,
-        node: NodeRef<'a>,
-        expressions: NodeRef<'a>,
-        destinations: Vec<NodeRef<'a>>,
+        node: ArenaNode<'a>,
+        expressions: ArenaNode<'a>,
+        destinations: Vec<ArenaNode<'a>>,
     ) {
         // The expressions have to be collected first: registering the
         // destinations makes them definitions, and a definition must not be
         // mistaken for a read of the previous value.
-        traverse::visit_subtree(self, expressions);
+        expressions.traverse(self);
         self.skip = Some(expressions);
         self.register_all_slots(node, &destinations);
     }
 
-    fn visit_identifier(&mut self, node: NodeRef<'a>) {
-        let Some(slot) = is_slot_identifier(node) else {
+    fn visit_identifier(&mut self, node: ArenaNode<'a>) {
+        let Some(slot) = node.unnamed_slot() else {
             return;
         };
 
         // A register may have been identified in a previous block; the most
         // recent definition is the one meant here.
-        if let Some(info) = self.get_slot(slot, identifier_id(node), false) {
+        if let Some(info) = self.get_slot(slot, node.identifier_id(), false) {
             self.register_slot_reference(info, node, true);
             return;
         }
@@ -667,16 +616,16 @@ impl<'a> SlotsCollector<'a> {
         }
     }
 
-    fn leave_block(&mut self, node: NodeRef<'a>) {
-        let targets = match traverse::block_warp(node) {
-            Some(warp) => traverse::block_targets(&warp.borrow()),
+    fn leave_block(&mut self, node: ArenaNode<'a>) {
+        let targets = match node.block_warp() {
+            Some(warp) => warp.borrow().block_targets(),
             None => Vec::new(),
         };
 
         let state = self.state();
         for target in targets {
-            let refs = state.block_refs.entry(node_key(target)).or_default();
-            let key = node_key(node);
+            let refs = state.block_refs.entry(target.key()).or_default();
+            let key = node.key();
             if !refs.contains(&key) {
                 refs.push(key);
             }
@@ -687,7 +636,7 @@ impl<'a> SlotsCollector<'a> {
         let infos = state.definitions();
         state
             .block_slots
-            .insert(node_key(node), state.known_slots.clone());
+            .insert(node.key(), state.known_slots.clone());
         state.known_slots = KnownSlots::new();
 
         for info in infos {
@@ -697,9 +646,9 @@ impl<'a> SlotsCollector<'a> {
 }
 
 impl<'a> Visitor<'a> for SlotsCollector<'a> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         if let Some(skip) = self.skip
-            && traverse::same_node(skip, node)
+            && skip.same_as(node)
         {
             return false;
         }
@@ -709,7 +658,7 @@ impl<'a> Visitor<'a> for SlotsCollector<'a> {
         enum Action<'b> {
             None,
             Enter,
-            Assignment(NodeRef<'b>, Vec<NodeRef<'b>>),
+            Assignment(ArenaNode<'b>, Vec<ArenaNode<'b>>),
             Identifier,
             Block,
         }
@@ -718,10 +667,9 @@ impl<'a> Visitor<'a> for SlotsCollector<'a> {
             let borrowed = node.borrow();
             match &*borrowed {
                 Node::FunctionDefinition(_) => Action::Enter,
-                Node::Assignment(inner) => Action::Assignment(
-                    inner.expressions,
-                    traverse::list_contents(inner.destinations),
-                ),
+                Node::Assignment(inner) => {
+                    Action::Assignment(inner.expressions, inner.destinations.list_contents())
+                }
                 Node::Identifier(_) => Action::Identifier,
                 Node::Block(_) => Action::Block,
                 _ => Action::None,
@@ -741,7 +689,7 @@ impl<'a> Visitor<'a> for SlotsCollector<'a> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         self.path.pop();
 
         enum Action {
@@ -782,7 +730,7 @@ impl<'a> Visitor<'a> for SlotsCollector<'a> {
 
 fn collect_slots<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     identify: bool,
     unwarped: bool,
 ) -> Vec<Info<'a>> {
@@ -806,9 +754,9 @@ struct SimpleReference<'a> {
 struct RefsProcessData<'a> {
     slots: Vec<Info<'a>>,
     simple: Vec<SimpleReference<'a>>,
-    massive: Vec<(NodeRef<'a>, Info<'a>, NodeRef<'a>, NodeRef<'a>)>,
+    massive: Vec<(ArenaNode<'a>, Info<'a>, ArenaNode<'a>, ArenaNode<'a>)>,
     tables: Vec<(Info<'a>, SlotReference<'a>)>,
-    iterators: Vec<(Info<'a>, NodeRef<'a>, NodeRef<'a>)>,
+    iterators: Vec<(Info<'a>, ArenaNode<'a>, ArenaNode<'a>)>,
     unsafe_slots: Vec<Info<'a>>,
 }
 
@@ -827,7 +775,7 @@ impl<'a> RefsProcessData<'a> {
 
 fn eliminate_collected<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     slots: Vec<Info<'a>>,
     options: Options,
     invalidated: &Invalidated<'a>,
@@ -862,7 +810,7 @@ fn fill_refs<'a>(
     for info in data.slots.clone() {
         let assignment = info.borrow().assignment;
         let destination_count = match &*assignment.borrow() {
-            Node::Assignment(inner) => traverse::list_contents(inner.destinations).len(),
+            Node::Assignment(inner) => inner.destinations.list_contents().len(),
             _ => {
                 return Err(internal(
                     "a register was defined by something other than an assignment",
@@ -889,9 +837,8 @@ fn fill_simple_refs<'a>(
 ) -> Result<()> {
     let assignment = info.borrow().assignment;
     let source = assignment_source(assignment)?;
-    let source_is_table = matches!(&*source.borrow(), Node::TableConstructor(_));
 
-    let mut holders: Vec<NodeRef<'a>> = Vec::new();
+    let mut holders: Vec<ArenaNode<'a>> = Vec::new();
     let mut new_simple: Vec<SimpleReference<'a>> = Vec::new();
 
     // Once a reference that cannot be part of the constructor has been seen,
@@ -903,7 +850,7 @@ fn fill_simple_refs<'a>(
     for reference in references.references.iter().skip(1) {
         // A reference that could not be pinned to a single definition is
         // skipped: inlining it could pick the wrong value.
-        if ignore_ambiguous && identifier_id(reference.identifier).is_none() {
+        if ignore_ambiguous && reference.identifier.identifier_id().is_none() {
             continue;
         }
 
@@ -911,32 +858,28 @@ fn fill_simple_refs<'a>(
             continue;
         };
 
-        let is_element = matches!(&*holder.borrow(), Node::TableElement(_));
+        let is_element = holder.is_table_element();
         if is_element {
             // The compiler can evaluate part of an index expression once and
             // move it to another register, which gives two references with the
             // same holder; only the first one counts.
-            if traverse::contains(&holders, holder) {
+            if holders.contains(&holder) {
                 continue;
             }
             holders.push(holder);
         }
 
-        let Some(path_index) = traverse::position(&reference.path, holder) else {
+        let Some(path_index) = reference.path.iter().position(|item| *item == holder) else {
             continue;
         };
 
         // The statement the reference belongs to, if it reached the holder
         // through an assignment destination.
         let statement = get_holder(&reference.path[..path_index]);
-        let is_destination = statement.is_some_and(|statement| {
-            matches!(&*statement.borrow(), Node::Assignment(inner)
-                if traverse::list_contents(inner.destinations)
-                    .first()
-                    .is_some_and(|destination| traverse::same_node(destination, holder)))
-        });
+        let is_destination =
+            statement.is_assignment_and(|inner| inner.destinations.list_first().same_as(holder));
 
-        if source_is_table && is_element && is_destination && all_ctor_refs {
+        if source.is_table_constructor() && is_element && is_destination && all_ctor_refs {
             data.tables.push((info, reference.clone_in(alloc)));
         } else {
             new_simple.push(SimpleReference {
@@ -974,13 +917,11 @@ fn fill_massive_refs<'a>(
     // `local a = nil; local b = nil` compiles into a single `KNIL`, which has
     // nothing to do with multiple results: every value is nil on its own, so
     // the ordinary inlining rules apply.
-    if matches!(&*source.borrow(), Node::Primitive(primitive)
-        if primitive.kind == PrimitiveKind::Nil)
-    {
+    if source.is_primitive_nil() {
         return fill_simple_refs(alloc, info, data, ignore_ambiguous, safe_mode);
     }
 
-    if !matches!(&*source.borrow(), Node::FunctionCall(_) | Node::Vararg) {
+    if !source.is_function_call() && !source.is_vararg() {
         return Err(internal("a multiple assignment did not come from a call"));
     }
 
@@ -1012,10 +953,12 @@ fn fill_massive_refs<'a>(
             else {
                 break;
             };
-            if identifier_id(last.identifier).is_some() {
+            if last.identifier.identifier_id().is_some() {
                 break;
             }
-            forget_possible_id(last.identifier, slot_id);
+            last.identifier
+                .borrow_mut()
+                .identifier_forget_possible_id(slot_id);
             info.borrow_mut().references.pop();
         }
     }
@@ -1029,8 +972,7 @@ fn fill_massive_refs<'a>(
 
     match &*holder.borrow() {
         Node::Assignment(inner) => {
-            let Some(destination) = traverse::list_contents(inner.destinations).first().copied()
-            else {
+            let Some(destination) = inner.destinations.list_first() else {
                 return Ok(());
             };
             let origin = info.borrow().references[0].identifier;
@@ -1045,7 +987,7 @@ fn fill_massive_refs<'a>(
             let Some(base) = base else {
                 return Ok(());
             };
-            if !matches!(&*base.borrow(), Node::Assignment(_)) {
+            if !base.is_assignment() {
                 return Ok(());
             }
 
@@ -1088,32 +1030,28 @@ fn eliminate_simple_cases<'a>(
 
         // Inlining a constant into a place that cannot hold one produces code
         // Lua will not parse, as in `local a = nil; a()`.
-        if matches!(&*source.borrow(), Node::Primitive(_) | Node::Constant(_)) {
-            let is_string = matches!(&*source.borrow(), Node::Constant(inner)
-                if matches!(inner.value, ConstantValue::String(_)));
-            if matches!(&*holder.borrow(), Node::FunctionCall(call)
-                if traverse::same_node(call.function, destination))
-            {
+        if source.is_primitive() || source.is_constant() {
+            if holder.is_function_call_and(|call| call.function.same_as(destination)) {
                 continue;
             }
-            if matches!(&*holder.borrow(), Node::TableElement(element)
-                if traverse::same_node(element.table, destination) && !is_string)
+            // A string survives being inlined into an index, because it is a
+            // key; any other constant does not.
+            if !source.is_constant_string()
+                && holder.is_table_element_and(|element| element.table.same_as(destination))
             {
                 continue;
             }
         }
 
-        if matches!(&*source.borrow(), Node::FunctionDefinition(_))
-            && info.borrow().references.len() >= 3
-        {
+        if source.is_function_definition() && info.borrow().references.len() >= 3 {
             // A function that is called more than once has to stay a variable.
             let count = info
                 .borrow()
                 .references
                 .iter()
                 .filter(|reference| {
-                    identifier_id(reference.identifier).is_some()
-                        || identifier_possible_ids(reference.identifier).len() == 1
+                    reference.identifier.identifier_id().is_some()
+                        || reference.identifier.identifier_possible_ids().len() == 1
                 })
                 .count();
             if count >= 3 {
@@ -1149,17 +1087,19 @@ fn eliminate_simple_cases<'a>(
                 && let Node::FunctionCall(call) = &mut *function.borrow_mut()
                 && call.is_method
             {
-                let key_is_name = matches!(&*call.function.borrow(), Node::TableElement(element)
-                    if matches!(&*element.key.borrow(), Node::Constant(key)
-                        if matches!(key.value, ConstantValue::String(_))));
+                let key_is_name = call
+                    .function
+                    .is_table_element_and(|element| element.key.is_constant_string());
                 let table = match &*holder.borrow() {
                     Node::TableElement(element) => Some(element.table),
                     _ => None,
                 };
                 if !key_is_name && let Some(table) = table {
-                    let mut arguments = traverse::list_contents(call.arguments);
+                    let mut arguments = call.arguments.list_contents();
                     arguments.insert(0, table);
-                    set_list_contents(alloc, call.arguments, arguments);
+                    call.arguments
+                        .borrow_mut()
+                        .list_set_contents(alloc, arguments);
                     call.is_method = false;
                 }
             }
@@ -1187,8 +1127,7 @@ fn is_index_key<'a>(entry: &SimpleReference<'a>) -> bool {
         return false;
     };
 
-    matches!(&*holder.borrow(), Node::TableElement(element)
-        if traverse::same_node(element.key, entry.reference.identifier))
+    holder.is_table_element_and(|element| element.key.same_as(entry.reference.identifier))
 }
 
 /// Folds a register that only assigns into a table constructor into it.
@@ -1209,7 +1148,7 @@ fn eliminate_into_table_constructors<'a>(
         let element = reference.path[reference.path.len() - 2];
         let base = reference.path[reference.path.len() - 4];
 
-        if !matches!(&*base.borrow(), Node::Assignment(_)) {
+        if !base.is_assignment() {
             continue;
         }
 
@@ -1230,13 +1169,13 @@ fn eliminate_into_table_constructors<'a>(
 /// Moves the results of a call or vararg back into a multiple assignment.
 fn eliminate_mass_assignments<'a>(
     alloc: &'a Allocator,
-    massive: &[(NodeRef<'a>, Info<'a>, NodeRef<'a>, NodeRef<'a>)],
+    massive: &[(ArenaNode<'a>, Info<'a>, ArenaNode<'a>, ArenaNode<'a>)],
     invalidated: &Invalidated<'a>,
 ) {
     for (identifier, info, base_assignment, destination) in massive {
         // The simple case elimination may have removed this assignment
         // already, in which case there is nothing left to do.
-        if invalidated.is_marked(base_assignment) {
+        if invalidated.is_marked(*base_assignment) {
             continue;
         }
 
@@ -1246,8 +1185,8 @@ fn eliminate_mass_assignments<'a>(
             _ => continue,
         };
 
-        if replace_in_list(alloc, destinations, identifier, destination) {
-            invalidated.mark(base_assignment);
+        if replace_in_list(alloc, destinations, *identifier, *destination) {
+            invalidated.mark(*base_assignment);
         }
     }
 }
@@ -1255,13 +1194,13 @@ fn eliminate_mass_assignments<'a>(
 /// Turns the registers of a generic `for` loop into its variables.
 fn eliminate_iterators<'a>(
     alloc: &'a Allocator,
-    iterators: &[(Info<'a>, NodeRef<'a>, NodeRef<'a>)],
+    iterators: &[(Info<'a>, ArenaNode<'a>, ArenaNode<'a>)],
     invalidated: &Invalidated<'a>,
 ) -> Result<()> {
-    let mut processed: Vec<NodeRef<'a>> = Vec::new();
+    let mut processed: Vec<ArenaNode<'a>> = Vec::new();
 
     for (info, source, warp) in iterators {
-        if traverse::contains(&processed, warp) {
+        if processed.contains(warp) {
             continue;
         }
         let assignment = info.borrow().assignment;
@@ -1272,13 +1211,13 @@ fn eliminate_iterators<'a>(
                 continue;
             };
             let destinations = match &*assignment.borrow() {
-                Node::Assignment(inner) => traverse::list_contents(inner.destinations),
+                Node::Assignment(inner) => inner.destinations.list_contents(),
                 _ => Vec::new(),
             };
             (inner.controls, destinations)
         };
 
-        let mut control_contents = traverse::list_contents(controls);
+        let mut control_contents = controls.list_contents();
 
         // `for a in b` iterates over `b` itself when `b` is not a call, in
         // which case the first control is kept.
@@ -1288,13 +1227,13 @@ fn eliminate_iterators<'a>(
         }
 
         for (index, slot) in destinations.iter().enumerate() {
-            let Some(slot_number) = identifier_slot(slot) else {
+            let Some(slot_number) = slot.identifier_slot() else {
                 continue;
             };
             let Some(control) = control_contents.get(index) else {
                 continue;
             };
-            let Some(control_number) = identifier_slot(control) else {
+            let Some(control_number) = control.identifier_slot() else {
                 continue;
             };
             if control_number != slot_number {
@@ -1307,7 +1246,7 @@ fn eliminate_iterators<'a>(
             None => vec![*source],
         };
         if let Node::IteratorWarp(inner) = &mut *warp.borrow_mut() {
-            inner.controls = Node::emplace_expressions(alloc, replacement);
+            inner.controls = ArenaNode::new_expressions(alloc, replacement);
         }
 
         processed.push(*warp);
@@ -1326,7 +1265,7 @@ fn eliminate_iterators<'a>(
 /// surrounding registers have been inlined.
 fn recheck_unsafe_cases<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     unsafe_slots: &[Info<'a>],
     options: Options,
     invalidated: &Invalidated<'a>,
@@ -1335,7 +1274,7 @@ fn recheck_unsafe_cases<'a>(
         return Ok(());
     }
 
-    let mut blocks: Vec<NodeRef<'a>> = Vec::new();
+    let mut blocks: Vec<ArenaNode<'a>> = Vec::new();
     let mut slots: Vec<(u32, u32)> = Vec::new();
     for info in unsafe_slots {
         let borrowed = info.borrow();
@@ -1348,9 +1287,9 @@ fn recheck_unsafe_cases<'a>(
                 .path
                 .iter()
                 .rev()
-                .find(|node| matches!(&*node.borrow(), Node::Block(_)))
+                .find(|node| node.is_block())
                 .copied()
-                && !traverse::contains(&blocks, block)
+                && !blocks.contains(&block)
             {
                 blocks.push(block);
             }
@@ -1362,8 +1301,8 @@ fn recheck_unsafe_cases<'a>(
     }
 
     let invalidated = *invalidated;
-    let mut callback = |node: NodeRef<'a>| {
-        if !options.unwarped && !matches!(&*node.borrow(), Node::Block(_)) {
+    let mut callback = |node: ArenaNode<'a>| {
+        if !options.unwarped && !node.is_block() {
             return;
         }
 
@@ -1412,13 +1351,13 @@ fn recheck_unsafe_cases<'a>(
 /// otherwise have too many references.
 struct SimplifyVisitor<'a, 'c> {
     alloc: &'a Allocator,
-    callback: &'c mut dyn FnMut(NodeRef<'a>),
+    callback: &'c mut dyn FnMut(ArenaNode<'a>),
     dirty: bool,
-    root: Option<NodeRef<'a>>,
+    root: Option<ArenaNode<'a>>,
 }
 
 impl<'a, 'c> SimplifyVisitor<'a, 'c> {
-    fn new(alloc: &'a Allocator, callback: &'c mut dyn FnMut(NodeRef<'a>)) -> Self {
+    fn new(alloc: &'a Allocator, callback: &'c mut dyn FnMut(ArenaNode<'a>)) -> Self {
         SimplifyVisitor {
             alloc,
             callback,
@@ -1427,14 +1366,14 @@ impl<'a, 'c> SimplifyVisitor<'a, 'c> {
         }
     }
 
-    fn flush(&mut self, node: NodeRef<'a>) {
+    fn flush(&mut self, node: ArenaNode<'a>) {
         if self.dirty {
             (self.callback)(node);
             self.dirty = false;
         }
     }
 
-    fn try_make_method_call(&mut self, node: NodeRef<'a>, function: NodeRef<'a>) {
+    fn try_make_method_call(&mut self, node: ArenaNode<'a>, function: ArenaNode<'a>) {
         let (arguments, is_method) = match &*node.borrow() {
             Node::FunctionCall(inner) => (inner.arguments, inner.is_method),
             _ => return,
@@ -1443,7 +1382,7 @@ impl<'a, 'c> SimplifyVisitor<'a, 'c> {
             return;
         }
 
-        let mut argument_contents = traverse::list_contents(arguments);
+        let mut argument_contents = arguments.list_contents();
         let Some(first) = argument_contents.first().copied() else {
             return;
         };
@@ -1455,28 +1394,27 @@ impl<'a, 'c> SimplifyVisitor<'a, 'c> {
 
         // The receiver is the callee's table, passed a second time as a hidden
         // argument.
-        let matches_table = identifier_slot(first) == identifier_slot(table)
-            && identifier_name(first) == identifier_name(table)
-            && identifier_kind(first) == identifier_kind(table)
-            && matches!(&*first.borrow(), Node::Identifier(_))
-            && matches!(&*table.borrow(), Node::Identifier(_));
+        let matches_table = first.identifier_slot() == table.identifier_slot()
+            && first.identifier_name() == table.identifier_name()
+            && first.identifier_kind() == table.identifier_kind()
+            && first.is_identifier()
+            && table.is_identifier();
         if !matches_table {
             return;
         }
 
         // A string key can be written as a method call; anything else cannot,
         // so the receiver has to stay an ordinary argument.
-        let key_is_valid = match &*key.borrow() {
-            Node::Identifier(identifier) => identifier.kind == IdentifierKind::Slot,
-            Node::Constant(constant) => matches!(constant.value, ConstantValue::String(_)),
-            _ => false,
-        };
-        if !key_is_valid {
+        if !key.is_identifier_and(|identifier| identifier.kind == IdentifierKind::Slot)
+            && !key.is_constant_string()
+        {
             return;
         }
 
         argument_contents.remove(0);
-        set_list_contents(self.alloc, arguments, argument_contents);
+        arguments
+            .borrow_mut()
+            .list_set_contents(self.alloc, argument_contents);
         if let Node::FunctionCall(inner) = &mut *node.borrow_mut() {
             inner.is_method = true;
         }
@@ -1485,7 +1423,7 @@ impl<'a, 'c> SimplifyVisitor<'a, 'c> {
 }
 
 impl<'a> Visitor<'a> for SimplifyVisitor<'a, '_> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         if self.root.is_none() {
             self.root = Some(node);
         }
@@ -1501,19 +1439,16 @@ impl<'a> Visitor<'a> for SimplifyVisitor<'a, '_> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         // The outermost node is the last one to be left, so it is where a
         // change that no block reported gets reported.
-        if self
-            .root
-            .is_some_and(|root| traverse::same_node(root, node))
-        {
+        if self.root.same_as(node) {
             self.root = None;
             self.flush(node);
             return;
         }
 
-        if matches!(&*node.borrow(), Node::Block(_)) {
+        if node.is_block() {
             self.flush(node);
         }
     }
@@ -1528,13 +1463,13 @@ impl<'a> Visitor<'a> for SimplifyVisitor<'a, '_> {
 /// The marker is what this rewrites.
 struct MultresEliminator<'a, 'c> {
     alloc: &'a Allocator,
-    last_value: Option<NodeRef<'a>>,
+    last_value: Option<ArenaNode<'a>>,
     invalidated: &'c Invalidated<'a>,
     failure: Option<Error>,
 }
 
 impl<'a> Visitor<'a> for MultresEliminator<'a, '_> {
-    fn visit(&mut self, node: NodeRef<'a>) -> bool {
+    fn visit(&mut self, node: ArenaNode<'a>) -> bool {
         let list = {
             let borrowed = node.borrow();
             match &*borrowed {
@@ -1556,7 +1491,7 @@ impl<'a> Visitor<'a> for MultresEliminator<'a, '_> {
         true
     }
 
-    fn leave(&mut self, node: NodeRef<'a>) {
+    fn leave(&mut self, node: ArenaNode<'a>) {
         if self.failure.is_some() {
             return;
         }
@@ -1567,8 +1502,8 @@ impl<'a> Visitor<'a> for MultresEliminator<'a, '_> {
                 return;
             };
             (
-                traverse::list_contents(inner.destinations).first().copied(),
-                traverse::list_contents(inner.expressions).first().copied(),
+                inner.destinations.list_first(),
+                inner.expressions.list_first(),
             )
         };
 
@@ -1576,8 +1511,8 @@ impl<'a> Visitor<'a> for MultresEliminator<'a, '_> {
             return;
         };
 
-        if matches!(&*destination.borrow(), Node::MulTres) {
-            if !matches!(&*source.borrow(), Node::FunctionCall(_) | Node::Vararg) {
+        if destination.is_mul_tres() {
+            if !source.is_function_call() && !source.is_vararg() {
                 return;
             }
             // The assignment only existed to hold the results for the marker,
@@ -1603,23 +1538,23 @@ impl<'a> Visitor<'a> for MultresEliminator<'a, '_> {
 }
 
 /// The position of the `MULTRES` marker in a list, if it has one.
-fn mul_res_index<'a>(list: NodeRef<'a>) -> Option<usize> {
-    traverse::list_contents(list)
+fn mul_res_index<'a>(list: ArenaNode<'a>) -> Option<usize> {
+    list.list_contents()
         .iter()
-        .position(|node| matches!(&*node.borrow(), Node::MulTres))
+        .position(|node| node.is_mul_tres())
 }
 
 /// Puts `value` at `index` of a list.
-fn replace_at<'a>(alloc: &'a Allocator, list: NodeRef<'a>, index: usize, value: NodeRef<'a>) {
-    let mut contents = traverse::list_contents(list);
+fn replace_at<'a>(alloc: &'a Allocator, list: ArenaNode<'a>, index: usize, value: ArenaNode<'a>) {
+    let mut contents = list.list_contents();
     contents[index] = value;
-    set_list_contents(alloc, list, contents);
+    list.borrow_mut().list_set_contents(alloc, contents);
 }
 
 /// Rewrites `MULTRES` back into the call it stands for.
 fn eliminate_multres<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     invalidated: &Invalidated<'a>,
 ) -> Result<()> {
     let mut visitor = MultresEliminator {
@@ -1628,7 +1563,7 @@ fn eliminate_multres<'a>(
         invalidated,
         failure: None,
     };
-    traverse::traverse(&mut visitor, root);
+    root.traverse(&mut visitor);
 
     if let Some(error) = visitor.failure {
         return Err(error);

@@ -1,31 +1,26 @@
-//! The decompiler's intermediate representation.
+//! The node model.
 //!
-//! The representation mirrors ljd's AST: every node lives in an
-//! [`oxc_allocator::Allocator`] and passes hold [`NodeRef`]s to it, so that they
-//! can hold on to a node, compare identities and rewrite nodes in place, exactly
-//! like the Python implementation does with its objects. Because the nodes are
-//! arena allocated, the control flow graph's cycles cost nothing to free: the
-//! whole arena is released at once when the decompiler is done with it.
+//! The [`Node`] enum, every payload it can hold, and the methods those types
+//! own. This is what the rest of the decompiler builds and rewrites; reading a
+//! node from the outside lives in [`super::accessors`], what reads and replaces
+//! a node's list or block contents lives in [`super::traverse`], and the traits
+//! that put those methods on a node are gathered in [`super::ext`].
 //!
-//! Child nodes are always [`NodeRef`]s, including lists: a statement list is a
-//! node of its own so that a pass can find it and rewrite its contents.
+//! The free functions of those two modules are re-exported here, so that
+//! `use crate::ast::nodes::*` still brings in the whole model along with the few
+//! helpers that are used as functions rather than as methods.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 
 use oxc_allocator::{Allocator, ArenaBox, ArenaVec};
 
 use crate::bytecode::DebugInfo;
 
-// MARK: building nodes
-
-/// A shared, mutable AST node.
-///
-/// Nodes are allocated in an arena and never freed individually, so a plain
-/// shared reference to a [`RefCell`] is all that is needed: identity is the
-/// address of the node, and the borrow flag is what keeps the passes honest.
-pub type NodeRef<'a> = &'a RefCell<Node<'a>>;
+// MARK: meta
 
 /// Where a node came from in the bytecode.
 ///
@@ -63,22 +58,24 @@ impl Meta {
     }
 }
 
+// MARK: node
+
 /// Every kind of node the decompiler knows about.
 #[derive(Debug)]
 pub enum Node<'a> {
-    // MARK: list kinds
+    // MARK: node - list
     /// A list of statements.
-    Statements(ArenaVec<'a, NodeRef<'a>>),
+    Statements(ArenaVec<'a, ArenaNode<'a>>),
     /// A list of expressions.
-    Expressions(ArenaVec<'a, NodeRef<'a>>),
+    Expressions(ArenaVec<'a, ArenaNode<'a>>),
     /// A list of assignable variables.
-    Variables(ArenaVec<'a, NodeRef<'a>>),
+    Variables(ArenaVec<'a, ArenaNode<'a>>),
     /// A list of identifiers.
-    Identifiers(ArenaVec<'a, NodeRef<'a>>),
+    Identifiers(ArenaVec<'a, ArenaNode<'a>>),
     /// A list of table constructor records.
-    Records(ArenaVec<'a, NodeRef<'a>>),
+    Records(ArenaVec<'a, ArenaNode<'a>>),
 
-    // MARK: statement kinds
+    // MARK: node - statement
     /// An assignment; `kind` distinguishes `local x = 1` from `x = 1`.
     Assignment(ArenaBox<'a, Assignment<'a>>),
     /// A function call used as a statement.
@@ -104,7 +101,7 @@ pub enum Node<'a> {
     /// An `elseif` branch.
     ElseIf(ArenaBox<'a, ElseIf<'a>>),
 
-    // MARK: expression kinds
+    // MARK: node - expression
     /// A variable reference.
     Identifier(ArenaBox<'a, Identifier<'a>>),
     /// A table indexing expression.
@@ -128,7 +125,7 @@ pub enum Node<'a> {
     /// A key/value pair inside a table constructor.
     TableRecord(ArenaBox<'a, TableRecord<'a>>),
 
-    // MARK: control flow kinds
+    // MARK: node - control flow
     /// A basic block. Only present before unwarping.
     Block(ArenaBox<'a, Block<'a>>),
     /// An unconditional jump or fallthrough.
@@ -143,78 +140,18 @@ pub enum Node<'a> {
     EndWarp(ArenaBox<'a, EndWarp<'a>>),
 }
 
-// MARK: constructors
-
 impl<'a> Node<'a> {
-    /// Wraps a node into an arena allocated node.
-    pub fn emplace(alloc: &'a Allocator, node: Node<'a>) -> NodeRef<'a> {
-        alloc.alloc(RefCell::new(node))
+    /// The instruction address this node was built from, if it has one.
+    ///
+    /// Only statements, the root of the expression an assignment computes, the
+    /// warp of a block and placeholder nodes carry one, mirroring the `_addr`
+    /// attribute ljd assigns while building the AST. Address `0` is the
+    /// synthesised function header and is never attached to a node, so it is
+    /// reported as "no address".
+    pub fn addr(&self) -> Option<u32> {
+        let addr = self.meta()?.addr;
+        (addr != 0).then_some(addr)
     }
-
-    /// Creates a statement list node.
-    pub fn emplace_statements(
-        alloc: &'a Allocator,
-        contents: impl IntoIterator<Item = NodeRef<'a>>,
-    ) -> NodeRef<'a> {
-        Node::emplace(
-            alloc,
-            Node::Statements(ArenaVec::from_iter_in(contents, &alloc)),
-        )
-    }
-
-    /// Creates an expression list node.
-    pub fn emplace_expressions(
-        alloc: &'a Allocator,
-        contents: impl IntoIterator<Item = NodeRef<'a>>,
-    ) -> NodeRef<'a> {
-        Node::emplace(
-            alloc,
-            Node::Expressions(ArenaVec::from_iter_in(contents, &alloc)),
-        )
-    }
-
-    /// Creates a variable list node.
-    pub fn emplace_variables(
-        alloc: &'a Allocator,
-        contents: impl IntoIterator<Item = NodeRef<'a>>,
-    ) -> NodeRef<'a> {
-        Node::emplace(
-            alloc,
-            Node::Variables(ArenaVec::from_iter_in(contents, &alloc)),
-        )
-    }
-
-    /// Creates an identifier list node.
-    pub fn emplace_identifiers(
-        alloc: &'a Allocator,
-        contents: impl IntoIterator<Item = NodeRef<'a>>,
-    ) -> NodeRef<'a> {
-        Node::emplace(
-            alloc,
-            Node::Identifiers(ArenaVec::from_iter_in(contents, &alloc)),
-        )
-    }
-
-    /// Creates a record list node.
-    pub fn emplace_records(
-        alloc: &'a Allocator,
-        contents: impl IntoIterator<Item = NodeRef<'a>>,
-    ) -> NodeRef<'a> {
-        Node::emplace(
-            alloc,
-            Node::Records(ArenaVec::from_iter_in(contents, &alloc)),
-        )
-    }
-
-    /// Creates a `nil`, `true` or `false` node.
-    pub fn emplace_primitive(alloc: &'a Allocator, kind: PrimitiveKind) -> NodeRef<'a> {
-        Node::emplace(alloc, Node::Primitive(Primitive { kind }))
-    }
-}
-
-// MARK: accessors
-
-impl<'a> Node<'a> {
     /// Human readable node kind, used in error messages.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -254,19 +191,6 @@ impl<'a> Node<'a> {
             Node::EndWarp(_) => "end warp",
         }
     }
-
-    /// The instruction address this node was built from, if it has one.
-    ///
-    /// Only statements, the root of the expression an assignment computes, the
-    /// warp of a block and placeholder nodes carry one, mirroring the `_addr`
-    /// attribute ljd assigns while building the AST. Address `0` is the
-    /// synthesised function header and is never attached to a node, so it is
-    /// reported as "no address".
-    pub fn addr(&self) -> Option<u32> {
-        let addr = self.meta()?.addr;
-        (addr != 0).then_some(addr)
-    }
-
     /// The metadata of this node, if it carries any.
     ///
     /// List nodes and `Primitive` carry none.
@@ -331,35 +255,12 @@ impl<'a> Node<'a> {
         }
     }
 
-    /// The contents of a list node.
-    pub fn list(&self) -> Option<&ArenaVec<'a, NodeRef<'a>>> {
-        match self {
-            Node::Statements(items)
-            | Node::Expressions(items)
-            | Node::Variables(items)
-            | Node::Identifiers(items)
-            | Node::Records(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    /// The contents of a list node, for mutation.
-    pub fn list_mut(&mut self) -> Option<&mut ArenaVec<'a, NodeRef<'a>>> {
-        match self {
-            Node::Statements(items)
-            | Node::Expressions(items)
-            | Node::Variables(items)
-            | Node::Identifiers(items)
-            | Node::Records(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    /// The identifier payload, if this is an identifier.
-    pub fn identifier(&self) -> Option<&Identifier<'a>> {
-        match self {
-            Node::Identifier(identifier) => Some(identifier),
-            _ => None,
+    /// Replaces the metadata of this node.
+    ///
+    /// Nodes that carry no metadata of their own are left alone.
+    pub fn set_meta(&mut self, meta: Meta) {
+        if let Some(target) = self.meta_mut() {
+            *target = meta;
         }
     }
 }
@@ -373,84 +274,134 @@ impl fmt::Display for Node<'_> {
     }
 }
 
-// MARK: lists
+// MARK: arena wrapper
 
-/// Reads the contents of a list node.
+/// A shared, mutable AST node on the arena.
 ///
-/// The copy is a plain `Vec`: it is a snapshot the caller works on, not part of
-/// the tree.
-pub fn list_contents<'a>(node: NodeRef<'a>) -> Vec<NodeRef<'a>> {
-    match node.borrow().list() {
-        Some(items) => items.iter().copied().collect(),
-        None => Vec::new(),
+/// Nodes are allocated in an arena and never freed individually, so a plain
+/// shared reference to a [`RefCell`] is all that is needed: identity is the
+/// address of the node, and the borrow flag is what keeps the passes honest.
+#[derive(Clone, Copy)]
+pub struct ArenaNode<'a> {
+    inner: &'a RefCell<Node<'a>>,
+}
+
+impl fmt::Debug for ArenaNode<'_> {
+    /// Names the node rather than printing it.
+    ///
+    /// The graph is cyclic — a block's warp points at another block — so
+    /// recursing into the payload would not terminate. The key is the stable
+    /// name of the node, which is what a debugging pass wants anyway, and
+    /// printing it also keeps a `{:?}` of a whole tree from taking the stack
+    /// down with it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ArenaNode({:#x})", self.key())
     }
 }
 
-/// Replaces the contents of a list node.
-pub fn set_list_contents<'a>(
-    alloc: &'a Allocator,
-    node: NodeRef<'a>,
-    contents: impl IntoIterator<Item = NodeRef<'a>>,
-) {
-    if let Some(items) = node.borrow_mut().list_mut() {
-        *items = ArenaVec::from_iter_in(contents, &alloc);
-    }
-}
-
-/// Appends to a list node.
+/// Whether two wrappers are the same node.
 ///
-/// The list already knows the arena it was allocated in, so no allocator is
-/// needed here.
-pub fn push<'a>(node: NodeRef<'a>, child: NodeRef<'a>) {
-    if let Some(items) = node.borrow_mut().list_mut() {
-        items.push(child);
+/// This is the same question
+/// [`same_as`](crate::ast::accessors::NodeAccessorExt::same_as) asks, written
+/// the way a [`HashSet`](std::collections::HashSet) needs it. It is deliberately
+/// *not* derived: a derived `PartialEq` would compare the payloads, which would
+/// read through the borrow flag and recurse into a cyclic graph.
+impl PartialEq for ArenaNode<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
     }
 }
 
-// MARK: metadata
+impl Eq for ArenaNode<'_> {}
 
-/// Replaces the metadata of a node.
+/// Hashes the node's identity, not its contents.
 ///
-/// Nodes that carry no metadata of their own are left alone.
-pub fn set_meta<'a>(node: NodeRef<'a>, meta: Meta) {
-    if let Some(target) = node.borrow_mut().meta_mut() {
-        *target = meta;
+/// Written by hand for the same reason as [`PartialEq`]: a derived `Hash` would
+/// walk the payload, and a node that appears in its own subtree — every loop in
+/// the control flow graph — would not terminate.
+impl Hash for ArenaNode<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
     }
 }
 
-// MARK: recovery markers
+impl<'a> ArenaNode<'a> {
+    /// The address of a node, which is what identity means in this tree.
+    ///
+    /// The arena never moves what it has handed out, so the address of a node is
+    /// a stable name for it, just like the pointer `Rc` used to expose.
+    pub fn key(&self) -> usize {
+        self.inner.as_ptr().addr()
+    }
 
-/// Records that a pass gave up on `node`.
-pub fn mark_error<'a>(node: NodeRef<'a>) {
-    if let Some(meta) = node.borrow_mut().meta_mut() {
-        meta.error_here = true;
+    pub fn borrow(&self) -> std::cell::Ref<'_, Node<'a>> {
+        self.inner.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Node<'a>> {
+        self.inner.borrow_mut()
     }
 }
 
-/// Whether a pass gave up on `node`.
-pub fn has_error<'a>(node: NodeRef<'a>) -> bool {
-    node.borrow().meta().is_some_and(|meta| meta.error_here)
-}
+// MARK: constructors
 
-/// Records that `node`'s function could not be decompiled.
-pub fn mark_failure<'a>(node: NodeRef<'a>) {
-    if let Some(meta) = node.borrow_mut().meta_mut() {
-        meta.failed_here = true;
+impl<'a> ArenaNode<'a> {
+    /// Wraps a node into an arena allocated node.
+    pub fn new(alloc: &'a Allocator, node: Node<'a>) -> Self {
+        let inner = alloc.alloc(RefCell::new(node));
+        Self { inner }
     }
-}
 
-/// Whether `node`'s function could not be decompiled.
-pub fn has_failure<'a>(node: NodeRef<'a>) -> bool {
-    node.borrow().meta().is_some_and(|meta| meta.failed_here)
-}
+    /// Creates a statement list node.
+    pub fn new_statements(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) -> Self {
+        let node = Node::Statements(ArenaVec::from_iter_in(contents, &alloc));
+        Self::new(alloc, node)
+    }
 
-/// Whether the decompiler had to give up on `node`, wholly or in part.
-///
-/// This is what tells a chunk that came out whole from one that only came out
-/// in part: either a region around the node was recovered, or the function the
-/// node belongs to was replaced by a call that reports the failure.
-pub fn has_recovery<'a>(node: NodeRef<'a>) -> bool {
-    has_error(node) || has_failure(node)
+    /// Creates an expression list node.
+    pub fn new_expressions(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) -> Self {
+        let node = Node::Expressions(ArenaVec::from_iter_in(contents, &alloc));
+        Self::new(alloc, node)
+    }
+
+    /// Creates a variable list node.
+    pub fn new_variables(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) -> Self {
+        let node = Node::Variables(ArenaVec::from_iter_in(contents, &alloc));
+        Self::new(alloc, node)
+    }
+
+    /// Creates an identifier list node.
+    pub fn new_identifiers(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) -> Self {
+        let node = Node::Identifiers(ArenaVec::from_iter_in(contents, &alloc));
+        Self::new(alloc, node)
+    }
+
+    /// Creates a record list node.
+    pub fn new_records(
+        alloc: &'a Allocator,
+        contents: impl IntoIterator<Item = ArenaNode<'a>>,
+    ) -> Self {
+        let node = Node::Records(ArenaVec::from_iter_in(contents, &alloc));
+        Self::new(alloc, node)
+    }
+
+    /// Creates a `nil`, `true` or `false` node.
+    pub fn new_primitive(alloc: &'a Allocator, kind: PrimitiveKind) -> Self {
+        let node = Node::Primitive(Primitive { kind });
+        Self::new(alloc, node)
+    }
 }
 
 // MARK: statements
@@ -467,8 +418,8 @@ pub enum AssignmentKind {
 /// An assignment statement.
 #[derive(Debug)]
 pub struct Assignment<'a> {
-    pub expressions: NodeRef<'a>,
-    pub destinations: NodeRef<'a>,
+    pub expressions: ArenaNode<'a>,
+    pub destinations: ArenaNode<'a>,
     pub kind: AssignmentKind,
     pub meta: Meta,
 }
@@ -476,8 +427,8 @@ pub struct Assignment<'a> {
 /// A function call.
 #[derive(Debug)]
 pub struct FunctionCall<'a> {
-    pub function: NodeRef<'a>,
-    pub arguments: NodeRef<'a>,
+    pub function: ArenaNode<'a>,
+    pub arguments: ArenaNode<'a>,
     pub is_method: bool,
     pub meta: Meta,
 }
@@ -485,67 +436,67 @@ pub struct FunctionCall<'a> {
 /// A `return` statement.
 #[derive(Debug)]
 pub struct Return<'a> {
-    pub returns: NodeRef<'a>,
+    pub returns: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// An `if` statement.
 #[derive(Debug)]
 pub struct If<'a> {
-    pub expression: NodeRef<'a>,
-    pub then_block: NodeRef<'a>,
-    pub elseifs: ArenaVec<'a, NodeRef<'a>>,
-    pub else_block: NodeRef<'a>,
+    pub expression: ArenaNode<'a>,
+    pub then_block: ArenaNode<'a>,
+    pub elseifs: ArenaVec<'a, ArenaNode<'a>>,
+    pub else_block: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// An `elseif` branch.
 #[derive(Debug)]
 pub struct ElseIf<'a> {
-    pub expression: NodeRef<'a>,
-    pub then_block: NodeRef<'a>,
+    pub expression: ArenaNode<'a>,
+    pub then_block: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A `while` loop.
 #[derive(Debug)]
 pub struct While<'a> {
-    pub expression: NodeRef<'a>,
-    pub statements: NodeRef<'a>,
+    pub expression: ArenaNode<'a>,
+    pub statements: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A `repeat ... until` loop.
 #[derive(Debug)]
 pub struct RepeatUntil<'a> {
-    pub expression: NodeRef<'a>,
-    pub statements: NodeRef<'a>,
+    pub expression: ArenaNode<'a>,
+    pub statements: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A numeric `for` loop.
 #[derive(Debug)]
 pub struct NumericFor<'a> {
-    pub variable: NodeRef<'a>,
-    pub expressions: NodeRef<'a>,
-    pub statements: NodeRef<'a>,
+    pub variable: ArenaNode<'a>,
+    pub expressions: ArenaNode<'a>,
+    pub statements: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A generic `for ... in` loop.
 #[derive(Debug)]
 pub struct IteratorFor<'a> {
-    pub identifiers: NodeRef<'a>,
-    pub expressions: NodeRef<'a>,
-    pub statements: NodeRef<'a>,
+    pub identifiers: ArenaNode<'a>,
+    pub expressions: ArenaNode<'a>,
+    pub statements: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A function definition.
 #[derive(Debug)]
 pub struct FunctionDefinition<'a> {
-    pub arguments: NodeRef<'a>,
-    pub statements: NodeRef<'a>,
+    pub arguments: ArenaNode<'a>,
+    pub statements: ArenaNode<'a>,
     /// Raw upvalue references of the prototype.
     pub upvalues: ArenaVec<'a, u16>,
     /// Debug information of the prototype.
@@ -627,8 +578,8 @@ impl<'a> Identifier<'a> {
 /// A table indexing expression.
 #[derive(Debug)]
 pub struct TableElement<'a> {
-    pub table: NodeRef<'a>,
-    pub key: NodeRef<'a>,
+    pub table: ArenaNode<'a>,
+    pub key: ArenaNode<'a>,
     pub meta: Meta,
 }
 
@@ -675,23 +626,23 @@ pub struct Primitive {
 /// A table constructor.
 #[derive(Debug)]
 pub struct TableConstructor<'a> {
-    pub array: NodeRef<'a>,
-    pub records: NodeRef<'a>,
+    pub array: ArenaNode<'a>,
+    pub records: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// An array part entry of a table constructor.
 #[derive(Debug)]
 pub struct ArrayRecord<'a> {
-    pub value: NodeRef<'a>,
+    pub value: ArenaNode<'a>,
     pub meta: Meta,
 }
 
 /// A hash part entry of a table constructor.
 #[derive(Debug)]
 pub struct TableRecord<'a> {
-    pub key: NodeRef<'a>,
-    pub value: NodeRef<'a>,
+    pub key: ArenaNode<'a>,
+    pub value: ArenaNode<'a>,
     pub meta: Meta,
 }
 
@@ -701,8 +652,8 @@ pub struct TableRecord<'a> {
 #[derive(Debug)]
 pub struct BinaryOperator<'a> {
     pub kind: BinaryOperatorKind,
-    pub left: NodeRef<'a>,
-    pub right: NodeRef<'a>,
+    pub left: ArenaNode<'a>,
+    pub right: ArenaNode<'a>,
     pub meta: Meta,
 }
 
@@ -812,7 +763,7 @@ pub enum Precedence {
 #[derive(Debug)]
 pub struct UnaryOperator<'a> {
     pub kind: UnaryOperatorKind,
-    pub operand: NodeRef<'a>,
+    pub operand: ArenaNode<'a>,
     pub meta: Meta,
 }
 
@@ -878,8 +829,8 @@ pub struct Block<'a> {
     pub warpins_count: u32,
     /// Whether the block contains a loop marker instruction.
     pub is_loop: bool,
-    pub contents: ArenaVec<'a, NodeRef<'a>>,
-    pub warp: Option<NodeRef<'a>>,
+    pub contents: ArenaVec<'a, ArenaNode<'a>>,
+    pub warp: Option<ArenaNode<'a>>,
 }
 
 impl<'a> Block<'a> {
@@ -916,7 +867,7 @@ pub struct EndWarp<'a> {
     /// Where control would have gone, if the block that ends here had a warp
     /// that pointed somewhere. Keeping it lets the passes look through a
     /// region that has already been closed off.
-    pub target: Option<NodeRef<'a>>,
+    pub target: Option<ArenaNode<'a>>,
     pub meta: Meta,
 }
 
@@ -924,7 +875,7 @@ pub struct EndWarp<'a> {
 #[derive(Debug)]
 pub struct UnconditionalWarp<'a> {
     pub kind: UnconditionalWarpKind,
-    pub target: Option<NodeRef<'a>>,
+    pub target: Option<ArenaNode<'a>>,
     pub is_uclo: bool,
     pub meta: Meta,
 }
@@ -932,9 +883,9 @@ pub struct UnconditionalWarp<'a> {
 /// A conditional branch.
 #[derive(Debug)]
 pub struct ConditionalWarp<'a> {
-    pub condition: Option<NodeRef<'a>>,
-    pub true_target: Option<NodeRef<'a>>,
-    pub false_target: Option<NodeRef<'a>>,
+    pub condition: Option<ArenaNode<'a>>,
+    pub true_target: Option<ArenaNode<'a>>,
+    pub false_target: Option<ArenaNode<'a>>,
     /// Register the condition was computed into.
     ///
     /// A comparison leaves the condition in no register at all, so this is
@@ -947,19 +898,199 @@ pub struct ConditionalWarp<'a> {
 /// A generic `for ... in` loop head.
 #[derive(Debug)]
 pub struct IteratorWarp<'a> {
-    pub variables: NodeRef<'a>,
-    pub controls: NodeRef<'a>,
-    pub body: Option<NodeRef<'a>>,
-    pub way_out: Option<NodeRef<'a>>,
+    pub variables: ArenaNode<'a>,
+    pub controls: ArenaNode<'a>,
+    pub body: Option<ArenaNode<'a>>,
+    pub way_out: Option<ArenaNode<'a>>,
     pub meta: Meta,
 }
 
 /// A numeric `for` loop head.
 #[derive(Debug)]
 pub struct NumericLoopWarp<'a> {
-    pub index: NodeRef<'a>,
-    pub controls: NodeRef<'a>,
-    pub body: Option<NodeRef<'a>>,
-    pub way_out: Option<NodeRef<'a>>,
+    pub index: ArenaNode<'a>,
+    pub controls: ArenaNode<'a>,
+    pub body: Option<ArenaNode<'a>>,
+    pub way_out: Option<ArenaNode<'a>>,
     pub meta: Meta,
+}
+
+// MARK: conversion
+
+/// A value that may hold a node.
+///
+/// This is what lets one predicate be asked of a node, of a reference to one, or
+/// of an `Option` of either, so that a call site reads the same whichever of the
+/// four it happens to have. It is the bound of the `Node*Ext` traits.
+///
+/// The node comes back behind a [`Deref`]: a [`Node`] is handed over as itself,
+/// while an [`ArenaNode`] borrows the [`RefCell`](std::cell::RefCell) it points
+/// at and hands over the [`Ref`](std::cell::Ref) that keeps the borrow alive.
+pub trait AsNode<'a> {
+    /// The node, if there is one.
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>>;
+
+    /// Identity of the node, if there is one.
+    ///
+    /// This is the one answer to "which node is this": the address of the node
+    /// itself, the same number [`ArenaNode::key`] reports.
+    /// [`same_as`](crate::ast::accessors::NodeAccessorExt::same_as) compares
+    /// these, and the passes key their sets on them, so an implementation that
+    /// named the wrapper rather than the node would quietly make every set hold
+    /// a different number for one node.
+    ///
+    /// Taking it never borrows the cell: a pass may ask whether two nodes are
+    /// the same while it holds a mutable borrow of one of them, which a
+    /// borrow-based answer would turn into a panic. The [`ArenaNode`] forms
+    /// therefore override this instead of going through [`as_node`](Self::as_node).
+    fn as_key(&self) -> Option<usize> {
+        self.as_node().map(|node| std::ptr::from_ref(&*node).addr())
+    }
+}
+
+impl<'a> AsNode<'a> for Node<'a> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        Some(self)
+    }
+}
+
+impl<'a> AsNode<'a> for Option<Node<'a>> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        self.as_ref()
+    }
+}
+
+impl<'a> AsNode<'a> for Option<&Node<'a>> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        *self
+    }
+}
+
+impl<'a> AsNode<'a> for ArenaNode<'a> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        Some(self.borrow())
+    }
+
+    fn as_key(&self) -> Option<usize> {
+        Some(self.key())
+    }
+}
+
+impl<'a> AsNode<'a> for Option<ArenaNode<'a>> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        Some(self.as_ref()?.borrow())
+    }
+
+    fn as_key(&self) -> Option<usize> {
+        self.map(|node| node.key())
+    }
+}
+
+impl<'a> AsNode<'a> for Option<&ArenaNode<'a>> {
+    fn as_node(&self) -> Option<impl Deref<Target = Node<'a>>> {
+        Some(self.as_ref()?.borrow())
+    }
+
+    fn as_key(&self) -> Option<usize> {
+        self.map(|node| node.key())
+    }
+}
+
+// MARK: tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::accessors::NodeAccessorExt;
+
+    #[test]
+    fn identity_names_the_node_rather_than_the_wrapper() {
+        let alloc = &Allocator::new();
+        let node = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+        let other = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+
+        // `key` and `same_as` have to agree: when one of them named the wrapper
+        // instead of the node, every identity-keyed set in the passes held a
+        // different number for one node and the output came out garbled with
+        // no error anywhere.
+        assert_eq!(node.as_key(), Some(node.key()));
+        assert_ne!(node.key(), other.key());
+        assert!(node.same_as(node));
+        assert!(!node.same_as(other));
+
+        // A copy of the wrapper is the same node, because it is the same cell.
+        let copy = node;
+        assert_eq!(copy.key(), node.key());
+        assert!(node.same_as(copy));
+
+        // The `Option` forms answer the same way, which is what the graph
+        // passes actually hold.
+        let absent: Option<ArenaNode<'_>> = None;
+        assert!(Some(node).same_as(Some(copy)));
+        assert!(!Some(node).same_as(Some(other)));
+        assert!(!Some(node).same_as(absent));
+        assert!(Some(node).same_optional_as(Some(copy)));
+        assert!(!node.same_optional_as(Some(other)));
+    }
+
+    #[test]
+    fn identity_can_be_asked_while_the_node_is_mutably_borrowed() {
+        let alloc = &Allocator::new();
+        let node = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+
+        // Identity must not borrow: a pass asks whether a node is the one it
+        // wants while it is in the middle of rewriting it, and a borrow-based
+        // answer would panic there instead. A plain borrow really does panic
+        // with this one alive, which is what makes the two lines below mean
+        // something.
+        let held = node.borrow_mut();
+        let plain_borrow = std::panic::AssertUnwindSafe(|| {
+            let _ = node.borrow();
+        });
+        assert!(
+            std::panic::catch_unwind(plain_borrow).is_err(),
+            "a borrow while the node is mutably borrowed has to panic"
+        );
+        assert!(node.same_as(node));
+        assert!(node.same_optional_as(Some(node)));
+        assert_eq!(node.as_key(), Some(node.key()));
+        drop(held);
+    }
+
+    #[test]
+    fn equality_and_hashing_are_identity() {
+        use std::collections::HashSet;
+
+        let alloc = &Allocator::new();
+        let node = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+        let other = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+
+        // Two wrappers of one node are one node, whatever path they came by,
+        // and two identical-looking nodes are still two nodes.
+        let copy = node;
+        assert_eq!(node, copy);
+        assert_ne!(node, other);
+        assert!(node != other);
+
+        // Equality and hashing have to agree, or a set would keep two entries
+        // for one node and never find the one it stored.
+        let mut seen = HashSet::new();
+        assert!(seen.insert(node));
+        assert!(!seen.insert(copy), "the same node must not be stored twice");
+        assert!(seen.insert(other));
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&copy));
+
+        // A table the node is keyed in behaves the same way.
+        let mut names = std::collections::HashMap::new();
+        names.insert(node, "first");
+        names.insert(other, "second");
+        assert_eq!(names.get(&copy), Some(&"first"));
+        assert_eq!(names.len(), 2);
+
+        // Identity, not contents: nodes that would compare equal by their
+        // payload are still distinct keys.
+        let nil_again = ArenaNode::new_primitive(alloc, PrimitiveKind::Nil);
+        assert_ne!(node, nil_again);
+    }
 }

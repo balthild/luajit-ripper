@@ -16,6 +16,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
+use luajit_ripper::ast::ext::*;
 use luajit_ripper::{Options, ast, bytecode, decompile_ast};
 use rayon::prelude::*;
 
@@ -66,7 +67,7 @@ struct Decompiled {
     /// Whether any part of the chunk had to be given up on.
     ///
     /// This is what tells a chunk that came out whole from one that only came
-    /// out in part; see [`ast::nodes::has_recovery`].
+    /// out in part; see [`NodeAccessorExt::has_recovery`].
     recovered: bool,
 }
 
@@ -85,9 +86,7 @@ fn decompile(file: &Path, options: &Options) -> Result<Decompiled, Failure> {
         let name = chunk.header.name.map(str::to_owned);
         let root = ast::builder::build(alloc, &chunk)?;
         let source = decompile_ast(alloc, root, options)?;
-        let recovered = ast::traverse::walk(root)
-            .into_iter()
-            .any(ast::nodes::has_recovery);
+        let recovered = root.iter_nodes().any(|node| node.has_recovery());
         Ok::<_, luajit_ripper::Error>(Decompiled {
             source,
             name,

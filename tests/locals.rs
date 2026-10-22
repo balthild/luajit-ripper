@@ -7,14 +7,14 @@
 
 mod support;
 
+use luajit_ripper::ast::ext::*;
+use luajit_ripper::ast::locals;
 use luajit_ripper::ast::nodes::{AssignmentKind, IdentifierKind, Node};
-use luajit_ripper::ast::{locals, traverse};
-use support::NodeRef;
+use support::ArenaNode;
 
 /// The names of all identifiers in the tree, without the synthetic ones.
-fn names(root: NodeRef<'_>) -> Vec<String> {
-    traverse::walk(root)
-        .iter()
+fn names(root: ArenaNode<'_>) -> Vec<String> {
+    root.iter_nodes()
         .filter_map(|node| match &*node.borrow() {
             Node::Identifier(identifier) => Some(identifier.name_or_slot().into_owned()),
             _ => None,
@@ -23,12 +23,13 @@ fn names(root: NodeRef<'_>) -> Vec<String> {
 }
 
 /// The names of the variables the local definitions introduce.
-fn declared_locals(root: NodeRef<'_>) -> Vec<String> {
-    traverse::walk(root)
-        .iter()
+fn declared_locals(root: ArenaNode<'_>) -> Vec<String> {
+    root.iter_nodes()
         .filter_map(|node| match &*node.borrow() {
             Node::Assignment(inner) if inner.kind == AssignmentKind::LocalDefinition => Some(
-                traverse::list_contents(inner.destinations)
+                inner
+                    .destinations
+                    .list_contents()
                     .iter()
                     .filter_map(|destination| match &*destination.borrow() {
                         Node::Identifier(identifier) => {
@@ -45,17 +46,15 @@ fn declared_locals(root: NodeRef<'_>) -> Vec<String> {
 }
 
 /// How many assignments declare a local.
-fn local_definitions(root: NodeRef<'_>) -> usize {
-    traverse::walk(root)
-        .iter()
+fn local_definitions(root: ArenaNode<'_>) -> usize {
+    root.iter_nodes()
         .filter(|node| {
-            matches!(&*node.borrow(), Node::Assignment(inner)
-                if inner.kind == AssignmentKind::LocalDefinition)
+            node.is_assignment_and(|inner| inner.kind == AssignmentKind::LocalDefinition)
         })
         .count()
 }
 
-fn build(chunk: &'static luajit_ripper::bytecode::Chunk<'static>) -> NodeRef<'static> {
+fn build(chunk: &'static luajit_ripper::bytecode::Chunk<'static>) -> ArenaNode<'static> {
     support::prepare(chunk).expect("the passes should run")
 }
 
@@ -141,21 +140,18 @@ fn a_dump_without_debug_information_keeps_its_slots() {
 }
 
 /// The name of the first identifier of a given kind in the tree.
-fn first_name_of_kind(root: NodeRef<'_>, kind: IdentifierKind) -> Option<String> {
-    traverse::walk(root)
-        .iter()
-        .find_map(|node| match &*node.borrow() {
-            Node::Identifier(identifier) if identifier.kind == kind => {
-                Some(identifier.name_or_slot().into_owned())
-            }
-            _ => None,
-        })
+fn first_name_of_kind(root: ArenaNode<'_>, kind: IdentifierKind) -> Option<String> {
+    root.iter_nodes().find_map(|node| match &*node.borrow() {
+        Node::Identifier(identifier) if identifier.kind == kind => {
+            Some(identifier.name_or_slot().into_owned())
+        }
+        _ => None,
+    })
 }
 
 /// The names of the index of every numeric loop head.
-fn numeric_loop_indices(root: NodeRef<'_>) -> Vec<String> {
-    traverse::walk(root)
-        .iter()
+fn numeric_loop_indices(root: ArenaNode<'_>) -> Vec<String> {
+    root.iter_nodes()
         .filter_map(|node| match &*node.borrow() {
             Node::NumericLoopWarp(warp) => Some(warp.index),
             _ => None,
@@ -168,11 +164,10 @@ fn numeric_loop_indices(root: NodeRef<'_>) -> Vec<String> {
 }
 
 /// The names of the variables of every generic loop head.
-fn iterator_loop_variables(root: NodeRef<'_>) -> Vec<String> {
-    traverse::walk(root)
-        .iter()
+fn iterator_loop_variables(root: ArenaNode<'_>) -> Vec<String> {
+    root.iter_nodes()
         .filter_map(|node| match &*node.borrow() {
-            Node::IteratorWarp(warp) => Some(traverse::list_contents(warp.variables)),
+            Node::IteratorWarp(warp) => Some(warp.variables.list_contents()),
             _ => None,
         })
         .flatten()

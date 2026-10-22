@@ -21,8 +21,8 @@ use std::collections::HashSet;
 
 use oxc_allocator::{Allocator, ArenaBox};
 
+use crate::ast::ext::*;
 use crate::ast::nodes::*;
-use crate::ast::traverse;
 use crate::bytecode::{SLOT_FALSE, SLOT_TRUE};
 use crate::error::{Error, Result};
 
@@ -107,7 +107,7 @@ impl Default for Options {
 /// assignment that defines it is.
 pub fn write_function<'a>(
     alloc: &'a Allocator,
-    root: NodeRef<'a>,
+    root: ArenaNode<'a>,
     options: &Options,
 ) -> Result<String> {
     let statements = match &*root.borrow() {
@@ -160,7 +160,7 @@ enum Command {
 /// The part of the writer's state that belongs to one function.
 struct State<'a> {
     current_statement: Statement,
-    function_name: Option<NodeRef<'a>>,
+    function_name: Option<ArenaNode<'a>>,
     function_local: bool,
     function_method: bool,
 }
@@ -180,13 +180,9 @@ struct Writer<'a, 'c> {
     alloc: &'a Allocator,
     options: &'c Options,
     queue: Vec<Command>,
-    path: Vec<NodeRef<'a>>,
+    path: Vec<ArenaNode<'a>>,
     skipped: Vec<HashSet<usize>>,
     states: Vec<State<'a>>,
-}
-
-fn node_key(node: NodeRef<'_>) -> usize {
-    traverse::node_key(node)
 }
 
 impl<'a, 'c> Writer<'a, 'c> {
@@ -236,15 +232,15 @@ impl<'a, 'c> Writer<'a, 'c> {
     }
 
     /// Marks a node as printed, so it is not printed again from elsewhere.
-    fn skip(&mut self, node: NodeRef<'a>) {
+    fn skip(&mut self, node: ArenaNode<'a>) {
         self.skipped
             .last_mut()
             .expect("the skip stack is never empty")
-            .insert(node_key(node));
+            .insert(node.key());
     }
 
     /// Writes the text of a constant that stands for a name.
-    fn write_name(&mut self, key: NodeRef<'a>) {
+    fn write_name(&mut self, key: ArenaNode<'a>) {
         if let Node::Constant(constant) = &*key.borrow()
             && let ConstantValue::String(text) = &constant.value
         {
@@ -258,7 +254,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
     // MARK: statements
 
-    fn visit_function_definition(&mut self, node: NodeRef<'a>) {
+    fn visit_function_definition(&mut self, node: ArenaNode<'a>) {
         let (arguments, statements) = {
             let borrowed = node.borrow();
             let Node::FunctionDefinition(inner) = &*borrowed else {
@@ -304,7 +300,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.write("function (");
         }
 
-        let mut arguments = traverse::list_contents(arguments);
+        let mut arguments = arguments.list_contents();
 
         // A method receives its `self` from the call, so it is not written.
         if is_method && !self.options.write_function_definition_self_arg {
@@ -319,16 +315,17 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_line();
 
         // A function ends with an implicit `return`; it is not written out.
-        let contents = traverse::list_contents(statements);
+        let contents = statements.list_contents();
         let ends_with_empty_return = contents.len() > 1
-            && contents.last().is_some_and(|last| {
-                matches!(&*last.borrow(), Node::Return(inner)
-                    if traverse::list_contents(inner.returns).is_empty())
-            });
+            && contents
+                .last()
+                .is_return_and(|inner| inner.returns.list_contents().is_empty());
         if ends_with_empty_return {
             let mut contents = contents;
             contents.pop();
-            traverse::set_list_contents(self.alloc, statements, contents);
+            statements
+                .borrow_mut()
+                .list_set_contents(self.alloc, contents);
         }
 
         self.visit_node(statements);
@@ -339,7 +336,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_table_constructor(&mut self, constructor: NodeRef<'a>) {
+    fn visit_table_constructor(&mut self, constructor: ArenaNode<'a>) {
         let (array, records) = {
             let borrowed = constructor.borrow();
             let Node::TableConstructor(inner) = &*borrowed else {
@@ -352,9 +349,9 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.skip(array);
         self.skip(records);
 
-        let array_contents = traverse::list_contents(array);
+        let array_contents = array.list_contents();
         let mut contents = array_contents.clone();
-        contents.extend(traverse::list_contents(records));
+        contents.extend(records.list_contents());
 
         if !array_contents.is_empty() {
             // The array part comes first, so its first entry is the first entry
@@ -366,11 +363,8 @@ impl<'a, 'c> Writer<'a, 'c> {
                 Node::ArrayRecord(record) => record.value,
                 _ => first,
             };
-            let is_nil = matches!(&*value.borrow(), Node::Primitive(primitive)
-                if primitive.kind == PrimitiveKind::Nil);
-
-            if !is_nil {
-                let key = crate::ast::nodes::Node::emplace(
+            if !value.is_primitive_nil() {
+                let key = crate::ast::nodes::ArenaNode::new(
                     self.alloc,
                     Node::Constant(ArenaBox::new_in(
                         Constant {
@@ -382,7 +376,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 );
                 contents.insert(
                     0,
-                    crate::ast::nodes::Node::emplace(
+                    crate::ast::nodes::ArenaNode::new(
                         self.alloc,
                         Node::TableRecord(ArenaBox::new_in(
                             TableRecord {
@@ -409,7 +403,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.write("}");
     }
 
-    fn visit_table_record(&mut self, node: NodeRef<'a>) {
+    fn visit_table_record(&mut self, node: ArenaNode<'a>) {
         let (key, value) = {
             let borrowed = node.borrow();
             let Node::TableRecord(inner) = &*borrowed else {
@@ -418,7 +412,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             (inner.key, inner.value)
         };
 
-        if is_valid_name(key) {
+        if key.is_valid_name() {
             self.write_name(key);
             self.skip(key);
             self.write(" = ");
@@ -431,7 +425,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.visit_node(value);
     }
 
-    fn visit_assignment(&mut self, node: NodeRef<'a>) {
+    fn visit_assignment(&mut self, node: ArenaNode<'a>) {
         let (kind, destinations, expressions) = {
             let borrowed = node.borrow();
             let Node::Assignment(inner) = &*borrowed else {
@@ -441,14 +435,14 @@ impl<'a, 'c> Writer<'a, 'c> {
         };
 
         let is_local = kind == AssignmentKind::LocalDefinition;
-        let dsts = traverse::list_contents(destinations);
-        let srcs = traverse::list_contents(expressions);
+        let dsts = destinations.list_contents();
+        let srcs = expressions.list_contents();
 
         // A register that stands for a constant is not a variable, so an
         // assignment to one cannot be written out. It is left over from a
         // branch the decompiler could not make sense of; dropping it keeps the
         // output readable Lua instead of `false = ...`.
-        if !dsts.is_empty() && dsts.iter().all(|node| is_constant_slot(node)) {
+        if !dsts.is_empty() && dsts.iter().all(|node| node.is_constant_slot()) {
             return;
         }
 
@@ -456,19 +450,19 @@ impl<'a, 'c> Writer<'a, 'c> {
         if dsts.len() == 1 && srcs.len() == 1 {
             let destination = dsts[0];
             let source = srcs[0];
-            source_is_function = matches!(&*source.borrow(), Node::FunctionDefinition(_));
+            source_is_function = source.is_function_definition();
 
             if source_is_function {
                 let acceptable = if self.options.function_definition_sugar {
-                    is_acceptable_function_destination(destination)
+                    destination.is_acceptable_function_destination()
                 } else {
-                    is_variable(destination)
+                    destination.is_variable()
                 };
 
                 if acceptable {
                     self.state().function_name = Some(destination);
                     self.state().function_local = is_local;
-                    self.state().function_method = is_method(destination, source);
+                    self.state().function_method = destination.is_method(source);
 
                     self.visit_node(source);
                     self.skip(destinations);
@@ -498,7 +492,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
     // MARK: expression statements
 
-    fn visit_binary_operator(&mut self, node: NodeRef<'a>) {
+    fn visit_binary_operator(&mut self, node: ArenaNode<'a>) {
         let (kind, left, right) = {
             let borrowed = node.borrow();
             let Node::BinaryOperator(inner) = &*borrowed else {
@@ -581,7 +575,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_unary_operator(&mut self, node: NodeRef<'a>) {
+    fn visit_unary_operator(&mut self, node: ArenaNode<'a>) {
         let (kind, operand) = {
             let borrowed = node.borrow();
             let Node::UnaryOperator(inner) = &*borrowed else {
@@ -637,8 +631,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         // `- -x` has to keep a space, or it turns into a comment.
         if matches!(kind, UnaryOperatorKind::Minus)
             && !need_parentheses
-            && matches!(&*operand.borrow(), Node::UnaryOperator(inner)
-                if inner.kind == UnaryOperatorKind::Minus)
+            && operand.is_unary_operator_and(|inner| inner.kind == UnaryOperatorKind::Minus)
         {
             self.write(" ");
         }
@@ -649,7 +642,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_function_call(&mut self, node: NodeRef<'a>) {
+    fn visit_function_call(&mut self, node: ArenaNode<'a>) {
         let (function, arguments, is_method) = {
             let borrowed = node.borrow();
             let Node::FunctionCall(inner) = &*borrowed else {
@@ -669,7 +662,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 _ => (function, function),
             };
 
-            let needs_parentheses = neighbours_a_constructor(table);
+            let needs_parentheses = table.neighbours_a_constructor();
             if needs_parentheses {
                 self.write("(");
             }
@@ -688,7 +681,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.write(")");
             self.skip(arguments);
         } else {
-            let needs_parentheses = neighbours_a_constructor(function);
+            let needs_parentheses = function.neighbours_a_constructor();
             if needs_parentheses {
                 self.write("(");
             }
@@ -708,7 +701,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
     // MARK: control flow
 
-    fn visit_if(&mut self, node: NodeRef<'a>) {
+    fn visit_if(&mut self, node: ArenaNode<'a>) {
         let (expression, then_block, elseifs, else_block) = {
             let borrowed = node.borrow();
             let Node::If(inner) = &*borrowed else {
@@ -731,10 +724,10 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.visit_node(then_block);
 
         for branch in &elseifs {
-            self.visit_node(branch);
+            self.visit_node(*branch);
         }
 
-        if traverse::list_contents(else_block).is_empty() {
+        if else_block.list_contents().is_empty() {
             self.skip(else_block);
         } else {
             self.write("else");
@@ -746,7 +739,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::If);
     }
 
-    fn visit_elseif(&mut self, node: NodeRef<'a>) {
+    fn visit_elseif(&mut self, node: ArenaNode<'a>) {
         let (expression, then_block) = {
             let borrowed = node.borrow();
             let Node::ElseIf(inner) = &*borrowed else {
@@ -762,7 +755,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.visit_node(then_block);
     }
 
-    fn visit_while(&mut self, node: NodeRef<'a>) {
+    fn visit_while(&mut self, node: ArenaNode<'a>) {
         let (expression, statements) = {
             let borrowed = node.borrow();
             let Node::While(inner) = &*borrowed else {
@@ -781,7 +774,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::While);
     }
 
-    fn visit_repeat_until(&mut self, node: NodeRef<'a>) {
+    fn visit_repeat_until(&mut self, node: ArenaNode<'a>) {
         let (expression, statements) = {
             let borrowed = node.borrow();
             let Node::RepeatUntil(inner) = &*borrowed else {
@@ -799,7 +792,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::RepeatUntil);
     }
 
-    fn visit_numeric_for(&mut self, node: NodeRef<'a>) {
+    fn visit_numeric_for(&mut self, node: ArenaNode<'a>) {
         let (variable, expressions, statements) = {
             let borrowed = node.borrow();
             let Node::NumericFor(inner) = &*borrowed else {
@@ -815,10 +808,10 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.skip(expressions);
 
         // The step is left out when it is one.
-        let mut expressions = traverse::list_contents(expressions);
+        let mut expressions = expressions.list_contents();
         let default_step = expressions.len() == 3
-            && matches!(&*expressions[2].borrow(), Node::Constant(constant)
-                if constant.value == ConstantValue::Integer(1));
+            && expressions[2]
+                .is_constant_and(|constant| constant.value == ConstantValue::Integer(1));
         if default_step {
             expressions.pop();
         }
@@ -827,10 +820,10 @@ impl<'a, 'c> Writer<'a, 'c> {
             return;
         }
         for part in &expressions[..expressions.len() - 1] {
-            self.visit_node(part);
+            self.visit_node(*part);
             self.write(", ");
         }
-        self.visit_node(expressions.last().expect("checked above"));
+        self.visit_node(*expressions.last().expect("checked above"));
 
         self.write(" do");
         self.end_line();
@@ -839,7 +832,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::NumericFor);
     }
 
-    fn visit_iterator_for(&mut self, node: NodeRef<'a>) {
+    fn visit_iterator_for(&mut self, node: ArenaNode<'a>) {
         let (identifiers, expressions, statements) = {
             let borrowed = node.borrow();
             let Node::IteratorFor(inner) = &*borrowed else {
@@ -860,14 +853,14 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.end_statement(Statement::IteratorFor);
     }
 
-    fn visit_return(&mut self, node: NodeRef<'a>) {
+    fn visit_return(&mut self, node: ArenaNode<'a>) {
         let returns = match &*node.borrow() {
             Node::Return(inner) => inner.returns,
             _ => return,
         };
 
         self.start_statement(Statement::Return);
-        if traverse::list_contents(returns).is_empty() {
+        if returns.list_contents().is_empty() {
             self.write("return");
         } else {
             self.write("return ");
@@ -884,7 +877,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
     // MARK: lists
 
-    fn visit_statements_list(&mut self, node: NodeRef<'a>) {
+    fn visit_statements_list(&mut self, node: ArenaNode<'a>) {
         if self.states.len() > 1 {
             self.start_block();
         }
@@ -894,16 +887,13 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.states.push(State::new());
 
         if self.options.comment_empty_blocks && self.path.len() > 1 {
-            let contents = traverse::list_contents(node);
-            let block_is_shape = matches!(
-                &*self.path[self.path.len() - 2].borrow(),
-                Node::IteratorFor(_) | Node::If(_) | Node::ElseIf(_)
-            );
+            let contents = node.list_contents();
+            let parent = self.path[self.path.len() - 2];
 
             let add_comment = if contents.is_empty() {
-                block_is_shape
+                parent.is_iterator_for() || parent.is_if() || parent.is_else_if()
             } else {
-                contents.len() == 1 && matches!(&*contents[0].borrow(), Node::NoOp(_))
+                contents.len() == 1 && contents[0].is_no_op()
             };
 
             if add_comment {
@@ -921,37 +911,37 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_comma_separated_list(&mut self, contents: &[NodeRef<'a>]) {
+    fn visit_comma_separated_list(&mut self, contents: &[ArenaNode<'a>]) {
         if contents.is_empty() {
             return;
         }
 
         for subnode in &contents[..contents.len() - 1] {
-            self.visit_node(subnode);
+            self.visit_node(*subnode);
             self.write(", ");
         }
 
-        self.visit_node(contents.last().expect("checked above"));
+        self.visit_node(*contents.last().expect("checked above"));
     }
 
-    fn visit_record_list(&mut self, contents: &[NodeRef<'a>]) {
+    fn visit_record_list(&mut self, contents: &[ArenaNode<'a>]) {
         if contents.is_empty() {
             return;
         }
 
         for subnode in &contents[..contents.len() - 1] {
-            self.visit_node(subnode);
+            self.visit_node(*subnode);
             self.write(",");
             self.end_line();
         }
 
-        self.visit_node(contents.last().expect("checked above"));
+        self.visit_node(*contents.last().expect("checked above"));
         self.end_line();
     }
 
     // MARK: values
 
-    fn visit_identifier(&mut self, node: NodeRef<'a>) {
+    fn visit_identifier(&mut self, node: ArenaNode<'a>) {
         enum Action {
             Slot {
                 slot: u32,
@@ -1028,7 +1018,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_table_element(&mut self, node: NodeRef<'a>) {
+    fn visit_table_element(&mut self, node: ArenaNode<'a>) {
         let (key, table) = {
             let borrowed = node.borrow();
             let Node::TableElement(inner) = &*borrowed else {
@@ -1037,7 +1027,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             (inner.key, inner.table)
         };
 
-        if is_global(node) {
+        if node.is_global() {
             // A global is written as its name, without the environment table.
             self.skip(table);
             self.skip(key);
@@ -1045,7 +1035,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             return;
         }
 
-        let needs_parentheses = neighbours_a_constructor(table);
+        let needs_parentheses = table.neighbours_a_constructor();
         if needs_parentheses {
             self.write("(");
         }
@@ -1054,7 +1044,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.write(")");
         }
 
-        if is_valid_name(key) {
+        if key.is_valid_name() {
             self.write(".");
             self.write_name(key);
             self.skip(key);
@@ -1065,7 +1055,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_constant(&mut self, node: NodeRef<'a>) {
+    fn visit_constant(&mut self, node: ArenaNode<'a>) {
         let value = match &*node.borrow() {
             Node::Constant(constant) => constant.value.clone(),
             _ => return,
@@ -1125,7 +1115,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.write(escaped);
     }
 
-    fn visit_primitive(&mut self, node: NodeRef<'a>) {
+    fn visit_primitive(&mut self, node: ArenaNode<'a>) {
         let kind = match &*node.borrow() {
             Node::Primitive(inner) => inner.kind,
             _ => return,
@@ -1142,20 +1132,18 @@ impl<'a, 'c> Writer<'a, 'c> {
     // MARK: walk
 
     /// Prints a node and its children.
-    fn visit_node(&mut self, node: NodeRef<'a>) {
+    fn visit_node(&mut self, node: ArenaNode<'a>) {
         if self
             .skipped
             .last()
             .expect("the skip stack is never empty")
-            .contains(&node_key(node))
+            .contains(&node.key())
         {
             // A `nil` right after a comma is an empty slot in an argument
             // list, and those are written out.
             let after_comma =
                 matches!(self.queue.last(), Some(Command::Write(text)) if text == ", ");
-            let is_nil = matches!(&*node.borrow(), Node::Primitive(inner)
-                if inner.kind == PrimitiveKind::Nil);
-            if !(is_nil && after_comma) {
+            if !(node.is_primitive_nil() && after_comma) {
                 return;
             }
         }
@@ -1166,7 +1154,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
         // A node a pass gave up on is pointed out, so that the code around it
         // is not mistaken for a faithful rendering.
-        if has_error(node) {
+        if node.has_error() {
             self.end_line();
             self.write("-- Decompilation error in this vicinity:");
             self.end_line();
@@ -1178,7 +1166,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.skipped.pop();
     }
 
-    fn dispatch(&mut self, node: NodeRef<'a>) {
+    fn dispatch(&mut self, node: ArenaNode<'a>) {
         let action = {
             let borrowed = node.borrow();
             match &*borrowed {
@@ -1234,11 +1222,11 @@ impl<'a, 'c> Writer<'a, 'c> {
                 self.leave_statements_list();
             }
             Action::List => {
-                let contents = traverse::list_contents(node);
+                let contents = node.list_contents();
                 self.visit_comma_separated_list(&contents);
             }
             Action::RecordsList => {
-                let contents = traverse::list_contents(node);
+                let contents = node.list_contents();
                 self.visit_record_list(&contents);
             }
             Action::Identifier => self.visit_identifier(node),
@@ -1252,8 +1240,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
     }
 
-    fn visit_children(&mut self, node: NodeRef<'a>) {
-        let children = traverse::children(&node.borrow());
+    fn visit_children(&mut self, node: ArenaNode<'a>) {
+        let children = node.borrow().children();
         for child in children {
             self.visit_node(child);
         }
@@ -1307,7 +1295,7 @@ fn bit_library_name(kind: BinaryOperatorKind) -> Option<&'static str> {
 }
 
 /// How tightly a node binds, when it is an operator.
-fn precedence_of(node: NodeRef<'_>) -> Option<Precedence> {
+fn precedence_of(node: ArenaNode<'_>) -> Option<Precedence> {
     match &*node.borrow() {
         Node::BinaryOperator(inner) => Some(inner.kind.precedence()),
         Node::UnaryOperator(_) => Some(Precedence::Unary),
@@ -1319,7 +1307,7 @@ fn precedence_of(node: NodeRef<'_>) -> Option<Precedence> {
 ///
 /// Every binary operator binds less tightly than a unary one, so it always
 /// needs them; between two unary operators it depends on which one comes first.
-fn needs_parentheses_around(kind: UnaryOperatorKind, operand: NodeRef<'_>) -> bool {
+fn needs_parentheses_around(kind: UnaryOperatorKind, operand: ArenaNode<'_>) -> bool {
     match &*operand.borrow() {
         Node::BinaryOperator(_) => true,
         Node::UnaryOperator(inner) => inner.kind.rank() < kind.rank(),
@@ -1328,7 +1316,7 @@ fn needs_parentheses_around(kind: UnaryOperatorKind, operand: NodeRef<'_>) -> bo
 }
 
 /// The operator of a binary operator node.
-fn binary_kind_of(node: NodeRef<'_>) -> Option<BinaryOperatorKind> {
+fn binary_kind_of(node: ArenaNode<'_>) -> Option<BinaryOperatorKind> {
     match &*node.borrow() {
         Node::BinaryOperator(inner) => Some(inner.kind),
         _ => None,
@@ -1337,107 +1325,125 @@ fn binary_kind_of(node: NodeRef<'_>) -> Option<BinaryOperatorKind> {
 
 // MARK: node predicates
 
-/// Whether a node is a register that stands for one of the constants `false`
-/// and `true`.
-fn is_constant_slot(node: NodeRef<'_>) -> bool {
-    matches!(&*node.borrow(), Node::Identifier(identifier)
-        if identifier.kind == IdentifierKind::Slot
-            && (identifier.slot == SLOT_FALSE || identifier.slot == SLOT_TRUE))
-}
-
-/// Whether a value has to be wrapped before it can be indexed or called.
-fn neighbours_a_constructor(node: NodeRef<'_>) -> bool {
-    match &*node.borrow() {
-        Node::TableConstructor(_)
-        | Node::BinaryOperator(_)
-        | Node::UnaryOperator(_)
-        | Node::FunctionDefinition(_) => true,
-        Node::Constant(constant) => matches!(constant.value, ConstantValue::String(_)),
-        _ => false,
+/// Questions the writer asks of a node that come from how Lua source is
+/// written rather than from the shape of the graph.
+///
+/// They live with the writer rather than with the node model because they lean
+/// on the writer's own idea of what can be written: [`decode_string`] to read a
+/// key, [`RESERVED_WORDS`] and [`is_valid_identifier`] to decide a name. The
+/// bound is [`AsNode`], so the same question can be asked of a [`ArenaNode`], of
+/// an `Option` of one, or of a node itself.
+trait WriterNodeExt<'a>: AsNode<'a> + Sized {
+    /// Whether this is a register that stands for one of the constants `false`
+    /// and `true`.
+    fn is_constant_slot(&self) -> bool {
+        self.is_identifier_and(|identifier| {
+            identifier.kind == IdentifierKind::Slot
+                && (identifier.slot == SLOT_FALSE || identifier.slot == SLOT_TRUE)
+        })
     }
-}
 
-/// Whether a destination can be written as the name of a function.
-fn is_variable(node: NodeRef<'_>) -> bool {
-    matches!(&*node.borrow(), Node::Identifier(_)) || is_global(node)
-}
-
-/// Whether the node reads a global through the function environment.
-fn is_global(node: NodeRef<'_>) -> bool {
-    match &*node.borrow() {
-        Node::TableElement(inner) => is_builtin(inner.table),
-        _ => false,
+    /// Whether a value has to be wrapped before it can be indexed or called.
+    fn neighbours_a_constructor(&self) -> bool {
+        self.is_table_constructor()
+            || self.is_binary_operator()
+            || self.is_unary_operator()
+            || self.is_function_definition()
+            || self.is_constant_string()
     }
-}
 
-fn is_builtin(node: NodeRef<'_>) -> bool {
-    matches!(&*node.borrow(), Node::Identifier(identifier)
-        if identifier.kind == IdentifierKind::Builtin)
-}
+    /// Whether a destination can be written as the name of a function.
+    fn is_variable(&self) -> bool {
+        self.is_identifier() || self.is_global()
+    }
 
-/// Whether the destination can carry a `function name()` prefix.
-fn is_acceptable_function_destination(destination: NodeRef<'_>) -> bool {
-    match &*destination.borrow() {
-        Node::Identifier(_) => true,
-        Node::TableElement(element) => {
-            let Node::Constant(key) = &*element.key.borrow() else {
-                return false;
-            };
-            let ConstantValue::String(name) = &key.value else {
+    /// Whether the node reads a global through the function environment.
+    fn is_global(&self) -> bool {
+        self.is_table_element_and(|inner| inner.table.is_builtin())
+    }
+
+    /// Whether the node is the `_env` builtin global access goes through.
+    fn is_builtin(&self) -> bool {
+        self.is_identifier_and(|identifier| identifier.kind == IdentifierKind::Builtin)
+    }
+
+    /// Whether the destination can carry a `function name()` prefix.
+    ///
+    /// A plain name always can; an index expression can when every key on the
+    /// way down is a string that reads as an identifier, so that
+    /// `t.a.b` can be written as a name but `t["not a name"]` cannot.
+    fn is_acceptable_function_destination(&self) -> bool {
+        let Some(node) = self.as_node() else {
+            return false;
+        };
+        match &*node {
+            Node::Identifier(_) => true,
+            Node::TableElement(element) => {
+                let Node::Constant(key) = &*element.key.borrow() else {
+                    return false;
+                };
+                let ConstantValue::String(name) = &key.value else {
+                    return false;
+                };
+                let name = decode_string(name);
+
+                match name.chars().next() {
+                    None => return false,
+                    Some(first) if first.is_ascii_digit() => return false,
+                    Some(_) => {}
+                }
+                if !name
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+                {
+                    return false;
+                }
+
+                element.table.is_acceptable_function_destination()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a key can be written as a name.
+    fn is_valid_name(&self) -> bool {
+        self.is_constant_and(|constant| {
+            let ConstantValue::String(name) = &constant.value else {
                 return false;
             };
             let name = decode_string(name);
 
-            match name.chars().next() {
-                None => return false,
-                Some(first) if first.is_ascii_digit() => return false,
-                Some(_) => {}
-            }
-            if !name
-                .chars()
-                .all(|character| character.is_alphanumeric() || character == '_')
-            {
-                return false;
-            }
+            is_valid_identifier(&name) && !RESERVED_WORDS.contains(&name.as_str())
+        })
+    }
 
-            is_acceptable_function_destination(element.table)
+    /// Whether `function`'s first argument is the `self` a method takes, which
+    /// is what lets the definition be written with a `:`.
+    fn is_method(&self, function: impl AsNode<'a>) -> bool {
+        let Some(node) = self.as_node() else {
+            return false;
+        };
+        let Some(function) = function.as_node() else {
+            return false;
+        };
+
+        let arguments = match &*function {
+            Node::FunctionDefinition(inner) => inner.arguments.list_contents(),
+            _ => return false,
+        };
+        let Some(first) = arguments.first() else {
+            return false;
+        };
+        if !first.is_identifier_and(|identifier| identifier.name == Some("self")) {
+            return false;
         }
-        _ => false,
+
+        node.is_table_element()
     }
 }
-
-/// Whether the function's first argument is the `self` a method takes.
-fn is_method(destination: NodeRef<'_>, function: NodeRef<'_>) -> bool {
-    let arguments = match &*function.borrow() {
-        Node::FunctionDefinition(inner) => traverse::list_contents(inner.arguments),
-        _ => return false,
-    };
-    let Some(first) = arguments.first() else {
-        return false;
-    };
-    let is_self = matches!(&*first.borrow(), Node::Identifier(identifier)
-        if identifier.name == Some("self"));
-    if !is_self {
-        return false;
-    }
-
-    matches!(&*destination.borrow(), Node::TableElement(_))
-}
+impl<'a, T: AsNode<'a>> WriterNodeExt<'a> for T {}
 
 // MARK: names
-
-/// Whether a key can be written as a name.
-fn is_valid_name(key: NodeRef<'_>) -> bool {
-    let Node::Constant(constant) = &*key.borrow() else {
-        return false;
-    };
-    let ConstantValue::String(name) = &constant.value else {
-        return false;
-    };
-    let name = decode_string(name);
-
-    is_valid_identifier(&name) && !RESERVED_WORDS.contains(&name.as_str())
-}
 
 /// Whether a string can be written as a Lua name.
 fn is_valid_identifier(name: &str) -> bool {
