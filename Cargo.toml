@@ -12,7 +12,7 @@ default = []
 cli = ["dep:clap", "dep:walkdir"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "wrap_help"], optional = true }
 oxc_allocator = "0.150.0"
 thiserror = "2"
 walkdir = { version = "2", optional = true }
