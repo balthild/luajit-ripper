@@ -170,7 +170,7 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
         // that writes, and it writes in the order the dumps were finished. The
         // report is built afterwards and in input order, so how many threads
         // ran the work still does not change what the run says.
-        let mut collected: Vec<Option<Outcome>> = (0..files.len()).map(|_| None).collect();
+        let mut collected = Vec::from_fn(files.len(), |_| None::<Outcome>);
         for (index, outcome) in receiver {
             // A dump that was left out says nothing: the whole point of leaving
             // it out is that there is nothing to report about it. Its turn is
