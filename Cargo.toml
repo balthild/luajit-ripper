@@ -9,12 +9,11 @@ edition = "2024"
 
 [features]
 default = []
-cli = ["dep:clap", "dep:rayon", "dep:walkdir"]
+cli = ["dep:clap", "dep:walkdir"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
 oxc_allocator = "0.150.0"
-rayon = { version = "1", optional = true }
 thiserror = "2"
 walkdir = { version = "2", optional = true }
 

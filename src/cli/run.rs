@@ -1,8 +1,8 @@
 //! Running the decompilation.
 //!
-//! Dumps are decompiled on a thread pool and written as they finish, but the
-//! report is printed once every worker is done and in input order, so what a
-//! run says does not depend on how many threads it used.
+//! Dumps are decompiled on a pool of worker threads and written as they finish,
+//! but the report is printed once every worker is done and in input order, so
+//! what a run says does not depend on how many threads it used.
 //!
 //! A run over a directory also says where it is as it goes: every dump that
 //! comes out is announced on stderr. The workers do not write anything
@@ -14,11 +14,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use luajit_ripper::ast::ext::*;
 use luajit_ripper::{Options, ast, bytecode, decompile_ast};
-use rayon::prelude::*;
 
 use crate::cli::allocator::with_allocator;
 use crate::cli::paths::{self, Job, Sink, Tree};
@@ -126,34 +126,45 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
     // not something a second writer can take back.
     let (sender, receiver) = mpsc::channel::<(usize, Outcome)>();
 
-    // The pool runs on a thread of its own so that building it, handing it the
-    // work and closing the channel are one step: the bridge owns the sender, and
-    // dropping it is what ends the loop below, which is why it is the bridge
-    // rather than the main thread that has to hold it. Installing the pool from
-    // the main thread would mean sending every outcome before the report can
-    // start, which is exactly what the report does not need.
-    let outcomes = std::thread::scope(|scope| {
-        // `dumps` is borrowed rather than moved, so that the main thread keeps
-        // the list it needs for the report.
-        let dumps = &files;
-        let bridge = scope.spawn(move || {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(Error::Pool)?;
+    // Every dump is one job and no job depends on another, so there is nothing
+    // to schedule beyond handing out the next index: a counter each worker
+    // advances on its own keeps the work spread out even when the dumps take
+    // very different amounts of time. It lives on this stack rather than behind
+    // an `Arc`, and outside the scope rather than in it, because whatever a
+    // spawned thread borrows has to outlive the scope's closure, which returns
+    // before the threads are joined. `Relaxed` is enough: the counter only has
+    // to hand each index out once, and the list was readable before the threads
+    // started.
+    let next = AtomicUsize::new(0);
 
-            pool.install(|| {
-                dumps.par_iter().enumerate().for_each(|(index, file)| {
+    let outcomes = std::thread::scope(|scope| {
+        for _ in 0..workers(threads, files.len()) {
+            // Each worker owns a sender, and the one made above is dropped
+            // below: the loop under this scope ends when the last clone goes.
+            let sender = sender.clone();
+            let next = &next;
+            // `files` is borrowed rather than moved, so that the main thread
+            // keeps the list it needs for the report.
+            let files = &files;
+
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else { break };
+
                     let outcome = work(file, input, tree, options);
+
                     // A closed channel means the receiver is gone, which can only
                     // happen after a failure to write the progress, and the run
                     // is ending anyway.
-                    let _ = sender.send((index, outcome));
-                });
+                    if sender.send((index, outcome)).is_err() {
+                        break;
+                    }
+                }
             });
+        }
 
-            Ok::<_, Error>(())
-        });
+        drop(sender);
 
         // The outcomes are named here, as they arrive: this is the only thread
         // that writes, and it writes in the order the dumps were finished. The
@@ -172,16 +183,9 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
             collected[index] = Some(outcome);
         }
 
-        // The channel is closed because the bridge dropped the sender, so there
-        // is nothing left to wait for but the pool itself.
-        let bridged = bridge.join().expect("the bridge thread does not panic");
-        bridged.inspect_err(|_| {
-            // The pool never ran, so there is no line to keep: it is cleared
-            // here so that the failure that follows is not reported on top of
-            // a name that never finished.
-            progress.finish().ok();
-        })?;
-
+        // The loop ended because the last worker dropped its sender, so the
+        // work is over and there is nothing left to wait for: the scope joins
+        // the workers on the way out.
         progress.finish().map_err(Error::Progress)?;
         Ok::<_, Error>(collected)
     })?;
@@ -198,6 +202,19 @@ fn to_tree(input: &Path, tree: &Tree, options: &Options, threads: usize) -> Resu
         delete_stale(tree, &outcomes, &mut summary)?;
     }
     Ok(summary)
+}
+
+/// How many workers to start.
+///
+/// `--threads 0` asks for one per CPU, which has to be turned into a count
+/// before threads can be spawned; and starting more workers than there are
+/// dumps would only have them find the counter already past the end.
+fn workers(threads: usize, dumps: usize) -> usize {
+    let asked = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |cpus| cpus.get()),
+        asked => asked,
+    };
+    asked.min(dumps)
 }
 
 /// Removes the outputs below the root that this run did not produce.

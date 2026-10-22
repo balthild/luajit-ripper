@@ -48,10 +48,6 @@ pub enum Error {
         source: walkdir::Error,
     },
 
-    /// The thread pool could not be created.
-    #[error("cannot start the thread pool: {0}")]
-    Pool(#[source] rayon::ThreadPoolBuildError),
-
     /// The source could not be written to stdout.
     #[error("cannot write to stdout: {0}")]
     Stdout(io::Error),
