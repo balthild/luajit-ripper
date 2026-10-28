@@ -32,7 +32,7 @@ pub struct Progress<W: Write> {
     /// How many of them are done.
     done: usize,
     /// Whether a line that is still on screen may be rewritten.
-    in_place: bool,
+    rewrite: bool,
     /// Whether the last thing written was such a line.
     live: bool,
 }
@@ -43,10 +43,10 @@ impl Progress<io::Stderr> {
     /// Rewriting the line is only attempted when stderr is a terminal: escapes
     /// written into a pipe or a file would be read as text. `TERM=dumb` is a
     /// terminal that cannot be moved around either, so it is left alone as well.
-    pub fn stderr(total: usize) -> Progress<io::Stderr> {
-        let in_place = io::stderr().is_terminal()
+    pub fn stderr(total: usize) -> Self {
+        let rewrite = io::stderr().is_terminal()
             && std::env::var_os("TERM").is_none_or(|term| term != "dumb");
-        Progress::new(io::stderr(), in_place, total)
+        Progress::new(io::stderr(), rewrite, total)
     }
 }
 
@@ -55,12 +55,12 @@ impl<W: Write> Progress<W> {
     ///
     /// `in_place` asks for each line to take the place of the one before it; a
     /// sink that cannot show that, such as a test's buffer, is given `false`.
-    pub fn new(out: W, in_place: bool, total: usize) -> Progress<W> {
+    pub fn new(out: W, rewrite: bool, total: usize) -> Progress<W> {
         Progress {
             out,
             total,
             done: 0,
-            in_place,
+            rewrite,
             live: false,
         }
     }
@@ -90,7 +90,7 @@ impl<W: Write> Progress<W> {
     /// Whatever is written next starts on a clean line, so a report does not
     /// share a line with the progress of the last dump.
     pub fn finish(&mut self) -> io::Result<()> {
-        if self.live && self.in_place {
+        if self.live && self.rewrite {
             self.out.write_all(REWRITE.as_bytes())?;
             self.live = false;
         }
@@ -103,7 +103,7 @@ impl<W: Write> Progress<W> {
     /// very first line, and every line of a sink that cannot be moved around, is
     /// written where the cursor already is.
     fn begin_line(&mut self) -> io::Result<()> {
-        if self.live && self.in_place {
+        if self.live && self.rewrite {
             self.out.write_all(REWRITE.as_bytes())?;
         }
         self.live = false;
