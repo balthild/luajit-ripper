@@ -1083,11 +1083,22 @@ impl<'a, 'c> Writer<'a, 'c> {
 
     /// Writes a string the way ljd does: long strings for anything with more
     /// than two newlines, an escaped literal otherwise.
+    ///
+    /// ljd closes every long string with a bare `]]`, which the text can
+    /// contain itself once the delimiter is appended (a text ending in `]`
+    /// gains one). The delimiter here takes `=` signs until the text cannot
+    /// close it, so the string is never cut short.
     fn write_string_literal(&mut self, text: &str) {
         if text.matches('\n').count() > 2 {
-            self.write("[[\n");
+            let level = long_string_level(text);
+
+            self.write("[");
+            self.write("=".repeat(level));
+            self.write("[\n");
             self.write(text.to_string());
-            self.write("]]");
+            self.write("]");
+            self.write("=".repeat(level));
+            self.write("]");
             return;
         }
 
@@ -1495,6 +1506,30 @@ fn decode_string(bytes: &[u8]) -> String {
     }
 
     out
+}
+
+/// The number of `=` signs a long string needs so that only its own closing
+/// delimiter can end it.
+///
+/// A long string opened as `[` + `=` * n + `[` ends at the first
+/// `]` + `=` * n + `]` after it. That occurrence can also be built out of a
+/// trailing `]` of the text and the closing delimiter that follows it, which is
+/// why the whole written text is searched rather than the text alone. The
+/// smallest level whose only occurrence is the closing delimiter is the one to
+/// use.
+fn long_string_level(text: &str) -> usize {
+    let mut level = 0;
+    loop {
+        let closing = format!("]{}]", "=".repeat(level));
+        let mut written = String::with_capacity(text.len() + closing.len());
+        written.push_str(text);
+        written.push_str(&closing);
+
+        if written.find(&closing) == Some(text.len()) {
+            return level;
+        }
+        level += 1;
+    }
 }
 
 /// Formats a number so that Lua reads back the same value.
