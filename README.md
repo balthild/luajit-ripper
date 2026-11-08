@@ -115,6 +115,6 @@ The bytecode dump format implemented here is the one documented in LuaJIT's `lj_
 
 This project is my first fully vibe-coded project. I do not understand what the program does in detail and I let LLM agents to do almost all the work. However, I did my best effort to guide them and review the parts I can understand. I also required them to do cross-validation with the original LJD decompiler, which is human-coded.
 
-I did this primarily for my own needs. I have been using it in reverse-engineering work over a real-world LuaJIT application containing ~20000 files. It works reasonably well.
+I did this primarily for my own needs. I have been using it in reverse-engineering work over a real-world LuaJIT application containing about 20000 files. It works reasonably well.
 
 Anyway, use it at your own risk.
